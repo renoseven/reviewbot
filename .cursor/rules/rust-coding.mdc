@@ -1,0 +1,76 @@
+---
+description: reviewbot 的 Rust 分层、类型归属与硬约束写法
+globs: **/*.rs
+alwaysApply: false
+---
+
+# Rust 编码规范
+
+## 分层
+
+依赖单向向下，反向禁止：
+
+`stage::*` → 适配器（`platform` / `worktree` / `protocol` / `tool`）→ 设施（`config` / `security` / `budget` / `record`）→ `domain`
+
+- 五个阶段互不依赖，谁也不知道前后是谁。**顺序只出现在 `lib.rs` 的 `review()` / `resume()`**
+- 禁止 `pipeline` / `runner` / `orchestrator` 模块
+- `lib.rs`：那两个入口 + 模块声明 + 再导出。禁止往里塞编排以外的逻辑
+- `main.rs`：只做参数解析、加载配置、渲染输出，不写业务逻辑
+- 扩展点只有三个 trait：`platform`、`protocol`、`tool`。配置不是扩展点。`worktree` 不是扩展点
+
+## 类型跟主人走
+
+- `domain` 只有 `ChangeSet` / `Comment` / `Confidence`，不含逻辑。新类型先证明没有主人再放进去
+- `Request` / `Response` → `protocol`；`Trace` → `record`；`RunResult` → `lib.rs`
+- `ValidatedPath` 只有 `security` 能构造；`RepoSource` / `WorktreeSource` 定义在 `security`，读取方法只收它
+- `WorktreeSource` 只有读方法，没有写方法
+- 核心禁止 `match tool_name`；走 registry 取 trait 对象。厂商 JSON 停在 `protocol`，不外泄
+
+## 实体对象化
+
+数据与属于它的行为放在一起；模块之间只靠公开方法与 trait 说话，做到高内聚、低耦合。
+
+- 能找到主人的操作写成该类型的 `impl`，不要拆成 `utils` 里掏字段的自由函数
+- 变化点用 trait，调用方依赖接口、不依赖具体类型
+- 一个类型只为一件事存在：字段互相配合、方法共用同一组不变式。无关能力另起类型，禁止往现有 struct 上堆
+- 函数参数不超过 5 个（不含 `self`）。超出才收成 context：只装这一次调用用到的依赖，字段私有、默认只读。禁止把全局状态塞进一个 context
+- 跨模块不直接读写别人的字段
+- `domain` 的三个类型是例外：它们是共享词汇，不含逻辑；行为仍跟主人走
+
+```rust
+// ❌ 对齐写在 ChangeSet 上（domain 不含逻辑）；或自由函数掏字段
+impl ChangeSet {
+    pub fn align(&self, line: u32) -> Option<u32> { ... }
+}
+
+// ✅ 行号集合是 ChangeSet 上的数据；对齐是 merge 的 impl
+impl Merge {
+    pub fn align(&self, lines: &BTreeSet<u32>, line: u32) -> Option<u32> { ... }
+}
+```
+
+## 命名
+
+- 用常见英文词。禁止生僻词、口语化名字、自造缩写、为已有名字再造同义词
+- 模块名跟分层走：`stage` / `platform` / `worktree` / `protocol` / `tool` / `config` / `security` / `budget` / `record`，不要另起别名
+
+```rust
+// ❌ orchestrator, provenance（生僻）；stuff, dump, grab, do_it, helper（口语）
+// ✅ review, merge, record, trace
+```
+
+## 错误
+
+- 库内用 `thiserror` 定义可匹配的错误类型，调用方靠类型分支（退出码、是否重试）
+- **最外层**（`main.rs`）可以用 `anyhow` 收口、补上下文；`anyhow::Error` 不进 `lib`、不进阶段与适配器
+
+## 硬约束的代码形状
+
+- **不改模型给的数**：`confidence_score` / `overall_score` 原样存、原样发；拿不到就 `None`，禁止填 `0`
+- **不静默降级**：禁止换便宜模型、超支后继续、401 改成只出报告、从 `base_url` 形状猜 `kind`
+- **全程串行**：阶段与分片都不并发（并发会让调用前预算检查失效）
+- prompt 用 `include_str!` 随二进制走，配置不得有改 prompt 的字段
+- 密钥只在内存；不写 checkpoint / trace / 指纹 / 日志；子进程环境剔除 `*_API_KEY` / `*_TOKEN`
+- 本地只写 run 目录、`--out-dir`、`scratch/`；外部命令 argv 是数组，直接 `execve`，一个占位符一个元素，不经 shell
+- 瞬时故障才重试（超时 / 5xx / 429 / 空 body）；401/403/400/越界/预算不足首次即失败
+- checkpoint 原子写 JSON（tmp + rename）；损坏回退上一份完整快照，禁止 catch 之后整次重跑
