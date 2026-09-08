@@ -1,5 +1,5 @@
 ---
-description: reviewbot 的 Rust 分层、类型归属与硬约束写法
+description: reviewbot 的 Rust 分层、类型归属、文件切分与硬约束写法
 globs: **/*.rs
 alwaysApply: false
 ---
@@ -18,12 +18,18 @@ alwaysApply: false
 - `main.rs`：只做参数解析、加载配置、渲染输出，不写业务逻辑
 - 扩展点只有三个 trait：`platform`、`protocol`、`tool`。配置不是扩展点。`worktree` 不是扩展点
 
+## 文件与模块
+
+- 一个文件一件事：**不是一个类型一个文件**。同一实现的类型放一起；同一份词汇的纯数据也放一起。不相干的才另起文件
+- 只作别人字段或变体载荷、自己没有独立行为面的，跟主类型同文件
+
 ## 类型跟主人走
 
-- `domain` 只有 `ChangeSet` / `Comment` / `Confidence`，不含逻辑。新类型先证明没有主人再放进去
+- `domain` 是共享词汇，不含逻辑。现在是 `ChangeSet` / `Comment` / `Confidence`；新类型先证明没有主人再放进去，不要为了「看起来像数据」往里堆
 - `Request` / `Response` → `protocol`；`Trace` → `record`；`RunResult` → `lib.rs`
-- `ValidatedPath` 只有 `security` 能构造；`RepoSource` / `WorktreeSource` 定义在 `security`，读取方法只收它
-- `WorktreeSource` 只有读方法，没有写方法
+- 一次 run 只有一个 worktree：它一定存在，且是一个本地目录。命令行给的检出就是它；没给就在这次 run 目录下开一份。平台 API 是它的可选属性（缺文件时取回并落盘），不是第二种模式，也不再有 scratch
+- `tool` 认这一个来源，不按来源分成两套具名工具。同层仍然只许这一条依赖
+- 命令行给的检出只读，没有写方法可走；取文件落盘只发生在这次 run 自己的目录里
 - 核心禁止 `match tool_name`；走 registry 取 trait 对象。厂商 JSON 停在 `protocol`，不外泄
 
 ## 实体对象化
@@ -35,7 +41,7 @@ alwaysApply: false
 - 一个类型只为一件事存在：字段互相配合、方法共用同一组不变式。无关能力另起类型，禁止往现有 struct 上堆
 - 函数参数不超过 5 个（不含 `self`）。超出才收成 context：只装这一次调用用到的依赖，字段私有、默认只读。禁止把全局状态塞进一个 context
 - 跨模块不直接读写别人的字段
-- `domain` 的三个类型是例外：它们是共享词汇，不含逻辑；行为仍跟主人走
+- `domain` 的共享词汇是例外：它们不含逻辑，不实例化来干活；行为仍跟主人走
 
 ```rust
 // ❌ 对齐写在 ChangeSet 上（domain 不含逻辑）；或自由函数掏字段
@@ -53,6 +59,7 @@ impl Merge {
 
 - 用常见英文词。禁止生僻词、口语化名字、自造缩写、为已有名字再造同义词
 - 模块名跟分层走：`stage` / `platform` / `worktree` / `protocol` / `tool` / `config` / `security` / `budget` / `record`，不要另起别名
+- 配置字段名说清量纲与主语：带单位的写进名字（`_bytes` / `_ms` / `_tokens`），布尔用肯定式，别用同一个词指两件事
 
 ```rust
 // ❌ orchestrator, provenance（生僻）；stuff, dump, grab, do_it, helper（口语）
@@ -71,6 +78,7 @@ impl Merge {
 - **全程串行**：阶段与分片都不并发（并发会让调用前预算检查失效）
 - prompt 用 `include_str!` 随二进制走，配置不得有改 prompt 的字段
 - 密钥只在内存；不写 checkpoint / trace / 指纹 / 日志；子进程环境剔除 `*_API_KEY` / `*_TOKEN`
-- 本地只写 run 目录、`--out-dir`、`scratch/`；外部命令 argv 是数组，直接 `execve`，一个占位符一个元素，不经 shell
+- 本地只写 run 目录和 `--out-dir`；命令行给的检出只读。外部命令 argv 是数组，直接 `execve`，一个占位符一个元素，不经 shell
+- **安全靠实现保证，不靠类型强制**：`security` 只提供检查函数；每个内建 tool 在调用来源之前先过路径校验，拒绝理由回传模型
 - 瞬时故障才重试（超时 / 5xx / 429 / 空 body）；401/403/400/越界/预算不足首次即失败
 - checkpoint 原子写 JSON（tmp + rename）；损坏回退上一份完整快照，禁止 catch 之后整次重跑
