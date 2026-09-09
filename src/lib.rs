@@ -1,9 +1,10 @@
-//! reviewbot as a library. `review` and `resume` are the only model-calling
-//! entries. `publish_run` and `render_report` replay checkpoints.
+//! reviewbot as a library. `review` is the only entry: the same call starts a
+//! run and re-enters one, because a run that already finished a stage keeps
+//! that stage's checkpoint and is never charged for it twice.
 //!
 //! `stage::*` -> adapters (`platform` / `worktree` / `protocol` / `tool`) ->
 //! infrastructure (`common` / `config` / `security` / `budget` / `record`) ->
-//! `domain`. The order of the five stages exists only in `review` and `resume`.
+//! `domain`. The order of the five stages exists only in `review`.
 
 pub mod budget;
 pub(crate) mod common;
@@ -27,7 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use budget::{Budget, BudgetError, Limit};
 use config::{ConfigError, Settings};
-use domain::{ChangeSet, Comment, Confidence, Severity};
+use domain::{Comment, Confidence, Severity};
 use platform::PlatformError;
 use protocol::ProtocolError;
 use record::{DirLock, LocalStorage, Meta, RecordError, Recorder, RunIdentity, Storage, layout};
@@ -115,18 +116,12 @@ pub enum Error {
     Platform(#[from] PlatformError),
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
-    #[error("the config changed since run {run_id} started, so it cannot be resumed")]
+    #[error("the config changed since run {run_id} started, so it cannot be continued")]
     FingerprintMismatch { run_id: String },
     #[error("--publish needs a merge request or pull request URL, not a diff")]
     PublishNeedsPlatform,
-    #[error("run {run_id} has not finished {stage}, so {command} cannot run")]
-    Incomplete {
-        run_id: String,
-        stage: &'static str,
-        command: &'static str,
-    },
     /// Wraps a failure that happened after the run directory existed, so the
-    /// caller can print the `resume` command.
+    /// caller can name the run the next attempt would go back into.
     #[error("{source}")]
     InRun {
         run_id: String,
@@ -171,7 +166,6 @@ impl Error {
         match self {
             Error::InRun { run_id, .. } => Some(run_id),
             Error::FingerprintMismatch { run_id } => Some(run_id),
-            Error::Incomplete { run_id, .. } => Some(run_id),
             Error::Record(RecordError::RunNotFound { run_id, .. }) => Some(run_id),
             Error::Stage(StageError::Record(RecordError::RunNotFound { run_id, .. })) => {
                 Some(run_id)
@@ -186,120 +180,6 @@ impl Error {
 pub fn review(settings: &Settings, source: &Source) -> Result<RunResult, Error> {
     let adapters = Adapters::real(settings, source.host().as_deref())?;
     review_with(settings, source, &adapters)
-}
-
-/// Continue a run from its first unfinished stage, using the current config
-/// and the publish intent recorded in `meta.json`.
-pub fn resume(settings: &Settings, run_id: &str) -> Result<RunResult, Error> {
-    let (_, meta) = open_existing(settings, run_id)?;
-    let host = match &meta.input.identity {
-        record::InputIdentity::Platform { host, .. } => Some(host.clone()),
-        record::InputIdentity::Diff { .. } => None,
-    };
-    let adapters = Adapters::real(settings, host.as_deref())?;
-    resume_with(settings, run_id, &adapters)
-}
-
-/// Post leftover comments from a finished run. Does not call the model.
-/// Posts even when `meta.publish` was false: the user is asking now.
-pub fn publish_run(settings: &Settings, run_id: &str) -> Result<RunResult, Error> {
-    let result = publish_run_inner(settings, run_id);
-    result.map_err(|error| error.in_run(run_id))
-}
-
-fn publish_run_inner(settings: &Settings, run_id: &str) -> Result<RunResult, Error> {
-    let (storage, meta) = open_existing(settings, run_id)?;
-    if matches!(meta.input.identity, record::InputIdentity::Diff { .. }) {
-        return Err(Error::PublishNeedsPlatform);
-    }
-    let run = LockedRun::take(storage)?;
-    let host = match &meta.input.identity {
-        record::InputIdentity::Platform { host, .. } => Some(host.clone()),
-        record::InputIdentity::Diff { .. } => None,
-    };
-    let adapters = Adapters::without_model(settings, host.as_deref())?;
-    adapters.bind_repo(&meta.input);
-    let mut recorder = open_recorder(settings, run, meta)?;
-    recorder.set_publish_intent(true)?;
-    let mut budget = restore_budget(recorder.meta())?;
-    let (changeset, plan, reviewed, merged) = load_finished(&mut recorder, run_id, "publish")?;
-    let publish_input = PublishInput {
-        changeset: &changeset,
-        plan: &plan,
-        merged: &merged,
-        unreviewed: &reviewed.unreviewed,
-        cut_short: &reviewed.cut_short,
-        unavailable: &reviewed.unavailable,
-    };
-    let paths = stage::path_policy(settings)?;
-    let published = {
-        let mut context = StageContext {
-            settings,
-            adapters: &adapters,
-            recorder: &mut recorder,
-            budget: &mut budget,
-            redactor: &adapters.redactor,
-            paths: &paths,
-        };
-        Publish::run(&mut context, &publish_input)?
-    };
-    recorder.record_spend(budget.spent())?;
-    Ok(Finished {
-        meta: recorder.meta(),
-        merged: &merged,
-        plan: &plan,
-        reviewed: &reviewed,
-        published: published.published,
-        budget: &budget,
-        run_dir: recorder.run_dir(),
-    }
-    .result())
-}
-
-/// Rewrite `report.md` / `summary.json` (and `--output-dir` copies) from
-/// checkpoints. Does not call the model or the platform.
-pub fn render_report(settings: &Settings, run_id: &str) -> Result<RunResult, Error> {
-    render_report_inner(settings, run_id).map_err(|error| error.in_run(run_id))
-}
-
-fn render_report_inner(settings: &Settings, run_id: &str) -> Result<RunResult, Error> {
-    let (storage, meta) = open_existing(settings, run_id)?;
-    let run = LockedRun::take(storage)?;
-    let adapters = Adapters::without_model(settings, None)?;
-    let mut recorder = open_recorder(settings, run, meta)?;
-    let mut budget = restore_budget(recorder.meta())?;
-    let (changeset, plan, reviewed, merged) = load_finished(&mut recorder, run_id, "report")?;
-    let publish_input = PublishInput {
-        changeset: &changeset,
-        plan: &plan,
-        merged: &merged,
-        unreviewed: &reviewed.unreviewed,
-        cut_short: &reviewed.cut_short,
-        unavailable: &reviewed.unavailable,
-    };
-    let paths = stage::path_policy(settings)?;
-    {
-        let mut context = StageContext {
-            settings,
-            adapters: &adapters,
-            recorder: &mut recorder,
-            budget: &mut budget,
-            redactor: &adapters.redactor,
-            paths: &paths,
-        };
-        Publish::write_artifacts(&mut context, &publish_input)?;
-    }
-    let published = load_published_comments(&recorder)?;
-    Ok(Finished {
-        meta: recorder.meta(),
-        merged: &merged,
-        plan: &plan,
-        reviewed: &reviewed,
-        published,
-        budget: &budget,
-        run_dir: recorder.run_dir(),
-    }
-    .result())
 }
 
 /// The injection seam: tests hand in fake adapters and get the same
@@ -333,8 +213,10 @@ pub(crate) fn review_with(
     let selection = settings.selection()?;
     let frozen = Budget::freeze(&selection)?;
 
-    // An explicit --run-id that lands on an existing run faces the same
-    // fingerprint check as resume; otherwise it would be the way around it.
+    // Re-entering a run is only sound while it answers the same question, so
+    // an existing directory is refused when the config no longer matches the
+    // one its checkpoints were written under. Without the check an explicit
+    // --run-id would be the way around it.
     let meta = match Recorder::peek_meta(run.storage.as_ref())? {
         Some(existing) if existing.fingerprint != fingerprint => {
             return Err(Error::FingerprintMismatch { run_id });
@@ -364,28 +246,6 @@ pub(crate) fn review_with(
     result
 }
 
-pub(crate) fn resume_with(
-    settings: &Settings,
-    run_id: &str,
-    adapters: &Adapters,
-) -> Result<RunResult, Error> {
-    let (storage, meta) = open_existing(settings, run_id)?;
-    let run = LockedRun::take(storage)?;
-    if meta.fingerprint != settings.fingerprint() {
-        return Err(Error::FingerprintMismatch {
-            run_id: run_id.to_string(),
-        });
-    }
-    // A resumed run may skip `input` entirely, so the sha the content tools
-    // read at comes from what that stage recorded the first time round.
-    adapters.bind_repo(&meta.input);
-    adapters.open_worktree(&settings.options.runs_dir.join(run_id))?;
-    let source = Source::from_record(&meta.input)?;
-    let recorder = open_recorder(settings, run, meta)?;
-    let budget = restore_budget(recorder.meta())?;
-    finish(settings, adapters, recorder, budget, &source).map_err(|error| error.in_run(run_id))
-}
-
 /// A run directory this process has taken: where the run writes, and the
 /// lock that says it may. They are taken together and handed on together, so
 /// no part of a run can reach the directory holding only one of them.
@@ -396,29 +256,16 @@ struct LockedRun {
 
 impl LockedRun {
     /// Create the directory and lock it in one step, before the caller has
-    /// anything else it could do with it. The worktree waits for this: two
-    /// processes that both got as far as opening one would already have
-    /// written over each other, whichever of them lost the lock afterwards.
+    /// anything else it could do with it. The directory is often already
+    /// there: re-entering a run opens the one the last attempt left behind.
+    /// The worktree waits for this: two processes that both got as far as
+    /// opening one would already have written over each other, whichever of
+    /// them lost the lock afterwards.
     fn create(run_dir: PathBuf) -> Result<Self, Error> {
-        Self::take(Arc::new(LocalStorage::create(run_dir)?))
-    }
-
-    /// The same for a directory that is already there, which is what the
-    /// commands that re-enter a finished run start from.
-    fn take(storage: Arc<dyn Storage>) -> Result<Self, Error> {
+        let storage: Arc<dyn Storage> = Arc::new(LocalStorage::create(run_dir)?);
         let lock = storage.lock()?;
         Ok(Self { storage, lock })
     }
-}
-
-fn open_existing(settings: &Settings, run_id: &str) -> Result<(Arc<dyn Storage>, Meta), Error> {
-    let directory = settings.options.runs_dir.join(run_id);
-    let storage: Arc<dyn Storage> = Arc::new(LocalStorage::open(directory));
-    let meta = Recorder::peek_meta(storage.as_ref())?.ok_or_else(|| RecordError::RunNotFound {
-        run_id: run_id.to_string(),
-        runs_dir: settings.options.runs_dir.clone(),
-    })?;
-    Ok((storage, meta))
 }
 
 fn open_recorder(settings: &Settings, run: LockedRun, meta: Meta) -> Result<Recorder, Error> {
@@ -484,8 +331,8 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
     // One set of bytes for both stages: `review` sends them and `triage`
     // holds their measured size back from the window, and those two have to
     // agree. Assembled only when one of them is going to run, because the
-    // layout digest in the instructions goes to the network -- a resume into
-    // `publish` has no business fetching a tree.
+    // layout digest in the instructions goes to the network -- a run re-entered
+    // with only `publish` left has no business fetching a tree.
     let preamble = match planned.is_none() || reviewed_before.is_none() {
         true => {
             let orientation = Orientation::build(context, &changeset);
@@ -559,52 +406,6 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
         run_dir: context.recorder.run_dir(),
     }
     .result())
-}
-
-fn load_finished(
-    recorder: &mut Recorder,
-    run_id: &str,
-    command: &'static str,
-) -> Result<(ChangeSet, TriagePlan, ReviewOutput, MergeOutput), Error> {
-    let changeset = recorder
-        .completed(stage::input::NUMBER, stage::input::NAME)?
-        .ok_or_else(|| Error::Incomplete {
-            run_id: run_id.to_string(),
-            stage: stage::input::NAME,
-            command,
-        })?;
-    let plan = recorder
-        .completed(stage::triage::NUMBER, stage::triage::NAME)?
-        .ok_or_else(|| Error::Incomplete {
-            run_id: run_id.to_string(),
-            stage: stage::triage::NAME,
-            command,
-        })?;
-    let reviewed = recorder
-        .completed(stage::review::NUMBER, stage::review::NAME)?
-        .ok_or_else(|| Error::Incomplete {
-            run_id: run_id.to_string(),
-            stage: stage::review::NAME,
-            command,
-        })?;
-    let merged = recorder
-        .completed(stage::merge::NUMBER, stage::merge::NAME)?
-        .ok_or_else(|| Error::Incomplete {
-            run_id: run_id.to_string(),
-            stage: stage::merge::NAME,
-            command,
-        })?;
-    Ok((changeset, plan, reviewed, merged))
-}
-
-fn load_published_comments(recorder: &Recorder) -> Result<Vec<PublishedComment>, Error> {
-    let Some(bytes) = recorder.read_artifact(layout::PUBLISHED)? else {
-        return Ok(Vec::new());
-    };
-    if bytes.is_empty() {
-        return Ok(Vec::new());
-    }
-    Ok(serde_json::from_slice(&bytes).unwrap_or_default())
 }
 
 /// The four stage outputs a finished run is described from, gathered so the

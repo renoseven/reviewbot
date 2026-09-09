@@ -1,6 +1,6 @@
 //! Crate level tests. The fakes live here rather than in the adapters so a
-//! user config can never name one: adapters are injected through
-//! `review_with` / `resume_with`, which are crate visible.
+//! user config can never name one: adapters are injected through `review_with`,
+//! which is crate visible.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -71,8 +71,8 @@ api_token = "GITLAB_TOKEN"
 const URL: &str = "https://gitlab.com/acme/app/-/merge_requests/128";
 const HEAD_SHA: &str = "4b1e0d2c0000000000000000000000000000abcd";
 
-/// How often each fake was asked for something, so a resume can prove it did
-/// not repeat work.
+/// How often each fake was asked for something, so a second run over the same
+/// input can prove it did not repeat work.
 #[derive(Default)]
 struct Calls {
     head_sha: AtomicUsize,
@@ -309,9 +309,9 @@ impl Workspace {
         }
     }
 
-    /// A diff on disk. `resume` re-reads the file the run started from and
-    /// checks that it still holds the same content, so a diff run that is
-    /// going to be resumed needs a real path.
+    /// A diff on disk. A diff identifies a run by its content, so a run that
+    /// is going to be re-entered needs a file that is still there to be read
+    /// the second time round.
     fn diff_file(&self) -> Source {
         let path = self.root.path().join("change.diff");
         std::fs::write(&path, DIFF).expect("write diff");
@@ -411,8 +411,10 @@ fn a_full_run_writes_every_stage_and_releases_the_lock() {
     assert_eq!(Calls::get(&calls.fetch_change), 1);
 }
 
+/// The same command again is the only way back into a run, so it has to walk
+/// into the one it started rather than open a second one beside it.
 #[test]
-fn resume_after_input_leaves_the_input_stage_alone() {
+fn the_same_command_again_leaves_a_finished_input_stage_alone() {
     let workspace = Workspace::new();
     let first = review(&workspace, Arc::new(Calls::default())).expect("run completes");
     let run_dir = workspace.run_dir(&first.run_id);
@@ -423,14 +425,9 @@ fn resume_after_input_leaves_the_input_stage_alone() {
     assert!(!run_dir.join(layout::stage_file(2, "triage")).exists());
 
     let calls = Arc::new(Calls::default());
-    let resumed = crate::resume_with(
-        &workspace.settings(),
-        &first.run_id,
-        &adapters(Arc::clone(&calls)),
-    )
-    .expect("resume completes");
+    let second = review(&workspace, Arc::clone(&calls)).expect("the second run completes");
 
-    assert_eq!(resumed.run_id, first.run_id);
+    assert_eq!(second.run_id, first.run_id);
     assert_eq!(
         Calls::get(&calls.fetch_change),
         0,
@@ -446,8 +443,10 @@ fn resume_after_input_leaves_the_input_stage_alone() {
     }
 }
 
+/// The stage that costs money is the one that must not be repeated: a run
+/// re-entered past `review` sends nothing to the model.
 #[test]
-fn resume_after_review_leaves_the_first_three_stages_alone() {
+fn the_same_command_again_leaves_the_first_three_stages_alone() {
     let workspace = Workspace::new();
     let first = review(&workspace, Arc::new(Calls::default())).expect("run completes");
     let run_dir = workspace.run_dir(&first.run_id);
@@ -460,12 +459,7 @@ fn resume_after_review_leaves_the_first_three_stages_alone() {
     rewind_to(&run_dir, 3);
 
     let calls = Arc::new(Calls::default());
-    crate::resume_with(
-        &workspace.settings(),
-        &first.run_id,
-        &adapters(Arc::clone(&calls)),
-    )
-    .expect("resume completes");
+    review(&workspace, Arc::clone(&calls)).expect("the second run completes");
 
     assert_eq!(Calls::get(&calls.fetch_change), 0);
     assert_eq!(Calls::get(&calls.send), 0, "no model call is repeated");
@@ -487,14 +481,9 @@ fn an_unreadable_checkpoint_falls_back_to_the_previous_snapshot() {
     std::fs::write(run_dir.join(layout::stage_file(4, "merge")), b"{ not json")
         .expect("corrupt the merge checkpoint");
 
-    let resumed = crate::resume_with(
-        &workspace.settings(),
-        &first.run_id,
-        &adapters(Arc::new(Calls::default())),
-    )
-    .expect("resume completes");
+    let second = review(&workspace, Arc::new(Calls::default())).expect("the second run completes");
 
-    assert_eq!(resumed.run_id, first.run_id);
+    assert_eq!(second.run_id, first.run_id);
     let merged: serde_json::Value = serde_json::from_slice(
         &std::fs::read(run_dir.join(layout::stage_file(4, "merge"))).unwrap(),
     )
@@ -537,24 +526,28 @@ fn a_second_process_on_the_same_run_directory_fails_at_once() {
         .expect("the holder let go, so the next one gets in");
 }
 
+/// The config is in the run id, so the same command after a config change
+/// asks a different question and gets a run of its own. The old run keeps its
+/// checkpoints; nothing is half rewritten under the answers it already gave.
 #[test]
-fn resume_refuses_a_run_whose_config_has_changed() {
+fn a_changed_config_starts_a_new_run_rather_than_continuing_the_old_one() {
     let workspace = Workspace::new();
     let first = review(&workspace, Arc::new(Calls::default())).expect("run completes");
 
     let changed = CONFIG.replace("budget_per_run = 10.0", "budget_per_run = 20.0");
     std::fs::write(&workspace.config_path, changed).expect("rewrite config");
 
-    let error = crate::resume_with(
-        &workspace.settings(),
-        &first.run_id,
-        &adapters(Arc::new(Calls::default())),
-    )
-    .expect_err("the fingerprint no longer matches");
-    assert!(matches!(error, Error::FingerprintMismatch { .. }));
-    assert_eq!(error.exit_code(), 2);
+    let second = review(&workspace, Arc::new(Calls::default())).expect("a second run completes");
+
+    assert_ne!(second.run_id, first.run_id);
+    for path in stage_paths(&workspace.run_dir(&first.run_id)) {
+        assert!(path.is_file(), "{} is left alone", path.display());
+    }
 }
 
+/// Pinning the id is the one way to aim a run at a directory the config no
+/// longer agrees with, and it is refused there rather than allowed to write a
+/// second config's conclusions into the first one's run.
 #[test]
 fn an_explicit_run_id_does_not_get_around_the_fingerprint_check() {
     let workspace = Workspace::new();
@@ -575,6 +568,7 @@ fn an_explicit_run_id_does_not_get_around_the_fingerprint_check() {
     )
     .expect_err("the same check applies");
     assert!(matches!(error, Error::FingerprintMismatch { .. }));
+    assert_eq!(error.exit_code(), 2);
 }
 
 #[test]
@@ -953,7 +947,7 @@ const FINDING: &str = r#"{"comments":[{"path":"src/parse.c","line":11,
 const SCORE: &str = r#"{"overall_score":54,"summary":"one certain finding; read it first"}"#;
 
 #[test]
-fn a_scored_run_writes_the_report_and_resume_does_not_score_again() {
+fn a_scored_run_writes_the_report_and_a_second_run_does_not_score_again() {
     let workspace = Workspace::with_config(
         &CONFIG.replace("[triage]", "[triage]\nskip_paths = [\"vendor/**\"]"),
     );
@@ -1002,18 +996,19 @@ fn a_scored_run_writes_the_report_and_resume_does_not_score_again() {
 
     let run_dir = workspace.run_dir(&first.run_id);
     rewind_to(&run_dir, 4);
-    let resumed_calls = Arc::new(Calls::default());
-    let (resumed_adapters, _) = scripted_diff_adapters(Arc::clone(&resumed_calls), Vec::new());
-    let resumed = crate::resume_with(&workspace.settings(), &first.run_id, &resumed_adapters)
-        .expect("resume completes");
+    let second_calls = Arc::new(Calls::default());
+    let (second_adapters, _) = scripted_diff_adapters(Arc::clone(&second_calls), Vec::new());
+    let second = crate::review_with(&workspace.settings(), &source, &second_adapters)
+        .expect("the second run completes");
 
+    assert_eq!(second.run_id, first.run_id);
     assert_eq!(
-        Calls::get(&resumed_calls.send),
+        Calls::get(&second_calls.send),
         0,
         "the merge checkpoint already holds the score"
     );
-    assert_eq!(resumed.overall_score, Some(54));
-    assert_eq!(resumed.comments.len(), 1);
+    assert_eq!(second.overall_score, Some(54));
+    assert_eq!(second.comments.len(), 1);
 }
 
 const SECRET_KEY: &str = "sk-abcdefghijklmnopqrstuvwxyz";

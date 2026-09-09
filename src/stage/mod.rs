@@ -22,7 +22,7 @@ use serde::de::DeserializeOwned;
 use crate::budget::{Budget, BudgetError};
 use crate::common::{Secret, SecretSource};
 use crate::config::{ConfigError, Settings};
-use crate::platform::{Capabilities, ChangeRef, Platform, PlatformError};
+use crate::platform::{ChangeRef, Platform, PlatformError};
 use crate::protocol::{Protocol, ProtocolError, Request, Response};
 use crate::record::{InputIdentity, InputRecord, RecordError, Recorder};
 use crate::security::{PathPolicy, Redactor};
@@ -64,7 +64,9 @@ pub enum StageError {
         tokens: u32,
         context_window_tokens: u32,
     },
-    #[error("{posted} comments posted, {failed} failed; run `reviewbot publish` to finish")]
+    #[error(
+        "{posted} comments posted, {failed} failed; run the same `review` command again to post the rest"
+    )]
     PublishIncomplete { posted: usize, failed: usize },
 }
 
@@ -137,32 +139,6 @@ impl Adapters {
         })
     }
 
-    /// Platform and redactor only. Used by `publish` / `report`, which must
-    /// not construct a model client.
-    pub fn without_model(settings: &Settings, host: Option<&str>) -> Result<Self, StageError> {
-        let mut redactor = Redactor::new();
-        if let Some(host) = host {
-            hide_platform_token(&mut redactor, settings, host);
-        }
-        let platform = match host {
-            Some(host) => Some(crate::platform::resolve(
-                &settings.config,
-                host,
-                settings.options.backoff(),
-            )?),
-            None => None,
-        };
-        Ok(Self {
-            tools: Registry::new(),
-            platform,
-            protocol: Box::new(UnusedProtocol),
-            // Nothing to read: these commands replay checkpoints, so the
-            // worktree is there in shape only and registers no tool.
-            worktree: Arc::new(FetchedWorktree::new(None, Capabilities::default())),
-            redactor,
-        })
-    }
-
     /// Give the run's own worktree its directory, now that the run directory
     /// exists. A checkout was already open before the tools were registered;
     /// this is the other shape catching up, and it is why the run id could be
@@ -173,8 +149,9 @@ impl Adapters {
     }
 
     /// Point the repository reads at the commit under review. The head sha is
-    /// settled before any stage runs — this run resolved it, or `resume` read
-    /// it back out of `meta.json` — and every repository read is by that sha.
+    /// settled before any stage runs — this run resolved it, or read it back
+    /// out of the `meta.json` an earlier attempt left — and every repository
+    /// read is by that sha.
     pub fn bind_repo(&self, record: &InputRecord) {
         let Some(platform) = &self.platform else {
             return;
@@ -195,23 +172,6 @@ impl Adapters {
             },
             &record.head_sha,
         );
-    }
-}
-
-/// Stands in for the model client on commands that must not call one.
-struct UnusedProtocol;
-
-impl Protocol for UnusedProtocol {
-    fn name(&self) -> &'static str {
-        "unused"
-    }
-
-    fn send(&self, _request: &Request) -> Result<Response, ProtocolError> {
-        Err(ProtocolError::Fatal {
-            protocol: "unused",
-            reason: "this command does not call the model".to_string(),
-            status: None,
-        })
     }
 }
 
@@ -317,7 +277,7 @@ mod tests {
 
     use super::*;
     use crate::config::{RESERVED_TOOL_NAMES, RunOptions};
-    use crate::platform::{LineRange, Listing, RepoSource, SearchHit};
+    use crate::platform::{Capabilities, LineRange, Listing, RepoSource, SearchHit};
     use crate::tool::Purpose;
 
     /// Present or absent is the only thing these tests ask of a repository, so

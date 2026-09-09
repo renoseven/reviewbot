@@ -82,8 +82,9 @@ impl Recorder {
         Ok(recorder)
     }
 
-    /// Read `meta.json` without taking the lock, which is what `resume` needs
-    /// before it can decide whether the fingerprint still matches.
+    /// Read `meta.json` without taking the lock, which is what a run walking
+    /// into an existing directory needs before it can decide whether the
+    /// fingerprint still matches.
     pub fn peek_meta(storage: &dyn Storage) -> Result<Option<Meta>, RecordError> {
         let Some(bytes) = storage.read(layout::META)? else {
             return Ok(None);
@@ -192,7 +193,7 @@ impl Recorder {
     }
 
     /// `--publish` is not part of the fingerprint, so every `review` records
-    /// what it was asked to do and `resume` follows the last recording.
+    /// what it was asked to do and the run follows the last recording.
     pub fn set_publish_intent(&mut self, publish: bool) -> Result<(), RecordError> {
         if self.meta.publish != publish {
             self.meta.publish = publish;

@@ -22,7 +22,6 @@ use args::{
 pub fn run() -> i32 {
     let cli = Cli::parse();
     init_tracing(&cli.global);
-    let runs_dir = runs_dir(&cli.global);
 
     match dispatch(&cli) {
         Ok(finished) => {
@@ -35,7 +34,12 @@ pub fn run() -> i32 {
             finished.exit_code
         }
         Err(error) => {
-            eprint!("{}", render::failure(&error, &runs_dir));
+            // The environment is read here rather than in `render`, which only
+            // formats. Only `review` enters a run, so it is the only command
+            // whose failure can offer itself as the way back in.
+            let invocation: Option<Vec<std::ffi::OsString>> =
+                matches!(cli.command, Command::Review(_)).then(|| std::env::args_os().collect());
+            eprint!("{}", render::failure(&error, invocation.as_deref()));
             error.exit_code()
         }
     }
@@ -69,41 +73,11 @@ fn dispatch(cli: &Cli) -> Result<Finished, Error> {
                 exit_code: result.exit_code(),
             })
         }
-        Command::Resume { run_id } => {
-            let settings = load(&cli.global, base_options(&cli.global))?;
-            let result = reviewbot::resume(&settings, run_id)?;
-            Ok(Finished {
-                output: render::run_result(&result, cli.global.format),
-                exit_code: result.exit_code(),
-            })
-        }
         Command::Config(ConfigCommand::Check) => {
             let settings = load(&cli.global, base_options(&cli.global))?;
             // Reading the credential is part of the check; nothing is sent.
             settings.selected_api_key()?;
             render::config_check(&settings, cli.global.format).map(Finished::ok)
-        }
-        Command::Publish { run_id } => {
-            let settings = load(&cli.global, base_options(&cli.global))?;
-            let result = reviewbot::publish_run(&settings, run_id)?;
-            Ok(Finished {
-                output: render::run_result(&result, cli.global.format),
-                exit_code: result.exit_code(),
-            })
-        }
-        Command::Report(report) => {
-            let settings = load(
-                &cli.global,
-                RunOptions {
-                    output_dir: report.output_dir.clone(),
-                    ..base_options(&cli.global)
-                },
-            )?;
-            let result = reviewbot::render_report(&settings, &report.run_id)?;
-            Ok(Finished {
-                output: render::run_result(&result, cli.global.format),
-                exit_code: result.exit_code(),
-            })
         }
         Command::Run(RunCommand::List) => {
             render::run_list(&runs_dir(&cli.global), cli.global.format).map(Finished::ok)

@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 pub struct ChangeSet {
     pub locator: Locator,
     pub files: Vec<FileChange>,
-    /// `default` so a checkpoint written before this field existed still
-    /// resumes, as an unnarrated change.
+    /// `default` so a checkpoint written before this field existed can still be
+    /// read back, as an unnarrated change.
     #[serde(default)]
     pub narrative: Narrative,
 }

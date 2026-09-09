@@ -40,34 +40,6 @@ impl Source {
             Source::Diff { .. } => None,
         }
     }
-
-    /// Rebuild the input a run started from, which `resume` needs when the
-    /// input stage never finished. A diff is re-read from the recorded path
-    /// and checked against the content hash it was identified by.
-    pub fn from_record(record: &InputRecord) -> Result<Self, StageError> {
-        match record.kind {
-            InputKind::Url => Ok(Source::Url(record.source.clone())),
-            InputKind::Diff => {
-                let content = std::fs::read_to_string(&record.source).map_err(|error| {
-                    StageError::UnreadableInput {
-                        reason: format!("{}: {error}", record.source),
-                    }
-                })?;
-                if InputIdentity::diff(&content) != record.identity {
-                    return Err(StageError::UnreadableInput {
-                        reason: format!(
-                            "{} no longer holds the diff this run started from",
-                            record.source
-                        ),
-                    });
-                }
-                Ok(Source::Diff {
-                    origin: record.source.clone(),
-                    content,
-                })
-            }
-        }
-    }
 }
 
 pub struct Input;

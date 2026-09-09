@@ -80,36 +80,13 @@ pub enum Command {
                       - anything else is a path to a file holding a unified diff. A `git \
                       format-patch` mbox is refused rather than half understood; use `git diff`.\n\n\
                       A URL is the only target that can be published back to, and the only one \
-                      that comes with what the author wrote about the change.")]
+                      that comes with what the author wrote about the change.\n\n\
+                      Running the same command again continues the run it started rather than \
+                      opening a second one: the stages that finished keep their checkpoints and \
+                      are not paid for again, so a review that was interrupted, or one that has \
+                      to post its comments after all, is the same command over again. A config \
+                      that changed since the run started is refused instead of half applied.")]
     Review(ReviewArgs),
-
-    /// Continue a run from its first unfinished stage.
-    ///
-    /// Uses the current config and the publish intent recorded in the run, and
-    /// refuses a run whose config has changed since it started. Stages that
-    /// already finished are not paid for again.
-    Resume {
-        /// The run to continue, as `run list` prints it.
-        run_id: String,
-    },
-
-    /// Post comments that are final but not yet on the merge request.
-    ///
-    /// Calls no model: the comments come from the finished run. It posts even
-    /// when the original review was not asked to, because asking now is the
-    /// asking that counts, and it skips anything already on the request.
-    Publish {
-        /// The finished run whose comments should go out.
-        run_id: String,
-    },
-
-    /// Render the report again from the checkpoint. Calls no model.
-    #[command(
-        long_about = "Write `report.md` and `summary.json` again from the checkpoints of a \
-                      finished run. It calls no model and no platform, so it costs nothing and \
-                      always agrees with what that run concluded."
-    )]
-    Report(ReportArgs),
 
     /// Inspect and prune past runs.
     #[command(subcommand)]
@@ -168,16 +145,6 @@ pub struct ReviewArgs {
     pub run_id: Option<String>,
 
     /// Export the report and the summary here, for CI artifacts.
-    #[arg(long, value_name = "DIR")]
-    pub output_dir: Option<PathBuf>,
-}
-
-#[derive(Debug, Args)]
-pub struct ReportArgs {
-    /// The run to render again.
-    pub run_id: String,
-
-    /// Also copy the report and the summary here.
     #[arg(long, value_name = "DIR")]
     pub output_dir: Option<PathBuf>,
 }
@@ -350,14 +317,14 @@ mod tests {
                 ".",
                 "x.diff",
             ],
-            vec!["reviewbot", "resume", "7f3a9c1e"],
-            vec!["reviewbot", "publish", "7f3a9c1e"],
             vec![
                 "reviewbot",
-                "report",
+                "review",
+                "--run-id",
                 "7f3a9c1e",
                 "--output-dir",
                 "artifacts",
+                "x.diff",
             ],
             vec!["reviewbot", "run", "list"],
             vec!["reviewbot", "run", "show", "7f3a9c1e"],
@@ -391,6 +358,23 @@ mod tests {
             vec!["reviewbot", "runs", "list"],
             vec!["reviewbot", "models", "list"],
             vec!["reviewbot", "tools", "list"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&arguments).is_err(),
+                "{arguments:?} should no longer parse"
+            );
+        }
+    }
+
+    /// The three commands that existed only to re-enter a run are gone, and
+    /// not kept as aliases of `review`: `review` re-enters the run itself, and
+    /// a second spelling would be a second way to describe the same run.
+    #[test]
+    fn the_commands_that_only_re_entered_a_run_no_longer_parse() {
+        for arguments in [
+            vec!["reviewbot", "resume", "7f3a9c1e"],
+            vec!["reviewbot", "publish", "7f3a9c1e"],
+            vec!["reviewbot", "report", "7f3a9c1e"],
         ] {
             assert!(
                 Cli::try_parse_from(&arguments).is_err(),

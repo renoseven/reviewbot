@@ -38,10 +38,11 @@ pub struct Meta {
     pub currency: String,
     pub price: Price,
     pub spent: f64,
-    /// Whether this run should post to the MR/PR. `resume` reads this rather
-    /// than taking `--publish` of its own.
+    /// Whether this run should post to the MR/PR. Recorded rather than
+    /// recomputed, so a run re-entered without `--publish` still knows what it
+    /// was asked for.
     pub publish: bool,
-    /// Stage names that finished, so `review` and `resume` can skip them.
+    /// Stage names that finished, so a run re-entered can skip them.
     pub completed_stages: Vec<String>,
     pub created_at: u64,
     pub updated_at: u64,

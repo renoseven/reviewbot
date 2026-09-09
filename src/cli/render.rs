@@ -1,9 +1,10 @@
 //! Turning results and failures into text or JSON. Every string leaving here
 //! has been through the redactor.
 
+use std::ffi::OsString;
 use std::path::Path;
 
-use reviewbot::config::{Settings, paths};
+use reviewbot::config::Settings;
 use reviewbot::domain::{Confidence, Severity};
 use reviewbot::security::Redactor;
 use reviewbot::tool::Purpose;
@@ -75,22 +76,55 @@ fn text_summary(result: &RunResult) -> String {
     out
 }
 
-/// stderr for a failure. Carries the run id and a command that can be copied
-/// straight back into the shell.
-pub fn failure(error: &Error, runs_dir: &Path) -> String {
+/// stderr for a failure. Names the run, because a run that got as far as its
+/// own directory is the thing the next attempt goes back into, and prints the
+/// command that goes back in — which is this very invocation, now that
+/// re-entering a run is running the same command again. `invocation` is the
+/// argument list as the process received it, and `None` on the commands that
+/// enter no run, so nothing here claims that repeating one of those would
+/// continue anything.
+pub fn failure(error: &Error, invocation: Option<&[OsString]>) -> String {
     let mut out = format!("error: {error}\n");
     if let Some(run_id) = error.run_id() {
         out.push_str(&format!("run_id: {run_id}\n"));
-        let runs_flag = if runs_dir == paths::default_runs_dir() {
-            String::new()
-        } else {
-            format!("--runs-dir {} ", runs_dir.display())
-        };
-        out.push_str(&format!("next: reviewbot {runs_flag}resume {run_id}\n"));
-        out.push_str(&format!("      reviewbot {runs_flag}publish {run_id}\n"));
-        out.push_str(&format!("      reviewbot {runs_flag}report {run_id}\n"));
+        if let Some(invocation) = invocation.filter(|words| !words.is_empty()) {
+            // Echoed rather than rebuilt, so `--runs-dir` and everything else
+            // that decided which run this is comes back exactly as it went in.
+            out.push_str(&format!("next: {}\n", shell_command(invocation)));
+            out.push_str(&format!(
+                "      the same command again continues run {run_id}; \
+                 the stages it finished are not run again\n"
+            ));
+        }
     }
     Redactor::new().redact(&out)
+}
+
+/// The invocation as one line a shell would read back the same way, which is
+/// the point of printing it: a target with an `&` in it has to survive the
+/// paste.
+fn shell_command(invocation: &[OsString]) -> String {
+    invocation
+        .iter()
+        .map(|word| shell_quote(&word.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Single quotes are the whole of the escaping, because inside them every
+/// character but `'` stands for itself, and `'\''` closes, escapes and reopens
+/// for the one that does not. A word of nothing but characters no shell reads
+/// as syntax is left bare, so the usual line still looks like the one that was
+/// typed.
+fn shell_quote(word: &str) -> String {
+    let bare = !word.is_empty()
+        && word
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_./:=@%+,".contains(character));
+    match bare {
+        true => word.to_string(),
+        false => format!("'{}'", word.replace('\'', r"'\''")),
+    }
 }
 
 /// stdout for `config check`.
@@ -698,6 +732,52 @@ mod tests {
         assert!(text.contains("query"), "{text}");
         assert!(text.contains("What to search for"), "{text}");
         assert!(!text.contains("registered"), "{text}");
+    }
+
+    /// The line is printed to be pasted, so a word the shell would read as
+    /// syntax is quoted and everything else stays as it was typed: a hint the
+    /// reader has to edit before it runs is a hint they have to think about.
+    #[test]
+    fn an_invocation_is_echoed_as_one_line_a_shell_reads_back_the_same_way() {
+        let words = [
+            "reviewbot",
+            "--runs-dir",
+            "/tmp/a b/runs",
+            "review",
+            "https://host/x?a=1&b=2",
+        ]
+        .map(OsString::from);
+        assert_eq!(
+            shell_command(&words),
+            "reviewbot --runs-dir '/tmp/a b/runs' review 'https://host/x?a=1&b=2'"
+        );
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    /// The run id is required of every failure that has one. The command beside
+    /// it is the one that was just run, because running it again is what
+    /// re-enters the run — and a command that enters no run is not offered
+    /// back, since repeating it would continue nothing.
+    #[test]
+    fn a_failure_in_a_run_prints_the_run_id_and_the_command_that_goes_back_in() {
+        let error = Error::FingerprintMismatch {
+            run_id: "7f3a9c1e".to_string(),
+        };
+        let words =
+            ["reviewbot", "--runs-dir", "/tmp/runs", "review", "x.diff"].map(OsString::from);
+
+        let text = failure(&error, Some(&words[..]));
+        assert!(text.contains("run_id: 7f3a9c1e\n"), "{text}");
+        assert!(
+            text.contains("next: reviewbot --runs-dir /tmp/runs review x.diff\n"),
+            "{text}"
+        );
+        assert!(text.contains("continues run 7f3a9c1e"), "{text}");
+
+        let elsewhere = failure(&error, None);
+        assert!(elsewhere.contains("run_id: 7f3a9c1e\n"), "{elsewhere}");
+        assert!(!elsewhere.contains("next:"), "{elsewhere}");
     }
 
     #[test]
