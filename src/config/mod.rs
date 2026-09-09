@@ -236,7 +236,7 @@ pub struct Settings {
 
 impl Settings {
     /// Read and validate the file. `config_path` is the only path source;
-    /// `None` means the XDG default, never the current directory.
+    /// `None` means `~/.reviewbot/config.toml`, never the current directory.
     pub fn load(config_path: Option<&Path>, options: RunOptions) -> Result<Self, ConfigError> {
         let path = match config_path {
             Some(path) => std::path::absolute(path).map_err(|source| ConfigError::Unreadable {

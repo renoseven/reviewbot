@@ -15,8 +15,9 @@ use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
     long_about = "Review a merge request, a pull request or a raw unified diff with a language \
                   model, write a report, and optionally post the comments back.\n\n\
                   Nothing is read from the current directory: the config comes from --config or \
-                  from the XDG config path. Runs, checkpoints and traces live under --runs-dir, \
-                  and `run prune` is the only command that deletes any of it."
+                  from ~/.reviewbot/config.toml. Runs, checkpoints and traces live under \
+                  --runs-dir (default ~/.reviewbot/runs), and `run prune` is the only command \
+                  that deletes any of it."
 )]
 pub struct Cli {
     #[command(flatten)]
@@ -29,11 +30,11 @@ pub struct Cli {
 /// Recognized by every subcommand.
 #[derive(Debug, Args)]
 pub struct GlobalArgs {
-    /// The config file. The only source for this path.
+    /// The config file. The only source for this path. Default: ~/.reviewbot/config.toml
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<PathBuf>,
 
-    /// Where runs and checkpoints live. No config field for this.
+    /// Where runs and checkpoints live. No config field for this. Default: ~/.reviewbot/runs
     #[arg(long, global = true, value_name = "PATH")]
     pub runs_dir: Option<PathBuf>,
 

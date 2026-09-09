@@ -10,7 +10,7 @@ The design lives in [`docs/design.md`](docs/design.md). This file is how to run 
 cargo build
 ```
 
-The binary is `reviewbot`. Configuration is **not** read from the current directory. Pass `--config`, or put a file at `$XDG_CONFIG_HOME/reviewbot/reviewbot.toml` (else `~/.config/reviewbot/reviewbot.toml`).
+The binary is `reviewbot`. Configuration is **not** read from the current directory. Pass `--config`, or put a file at `~/.reviewbot/config.toml`.
 
 Copy [`examples/reviewbot.toml`](examples/reviewbot.toml) and point the `api_key` / `api_token` fields at environment variable names or files outside the repo. Never put a real key in the file.
 
@@ -56,7 +56,7 @@ A run always has exactly one worktree. With `--worktree` it is that checkout, wh
 
 | flag | what |
 |---|---|
-| `--runs-dir DIR` | checkpoints, traces and the run's own worktree. Default `$XDG_STATE_HOME/reviewbot/runs`. If you point this at the repo (CI does), add it to `.gitignore`. |
+| `--runs-dir DIR` | checkpoints, traces and the run's own worktree. Default `~/.reviewbot/runs`. If you point this at the repo (CI does), add it to `.gitignore`. |
 | `--out-dir DIR` | copies `report-<run_id>.md` and `summary-<run_id>.json` for CI artifacts. Do not archive the whole runs directory: `traces/` holds the internal view. |
 
 `--format json` makes stdout a JSON document (no progress mixed in). `-q` silences text; JSON still prints.
