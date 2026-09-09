@@ -584,7 +584,6 @@ impl Conversation {
             return None;
         }
         let names = usable.join(", ");
-        tracing::warn!(chunk = %path, tools = %names, "no external checker was called");
         self.trace.note(
             NAME,
             format!("external checkers were available ({names}) and the model called none of them"),
