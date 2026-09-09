@@ -57,12 +57,12 @@ A run always has exactly one worktree. With `--worktree` it is that checkout, wh
 | flag | what |
 |---|---|
 | `--runs-dir DIR` | checkpoints, traces and the run's own worktree. Default `~/.reviewbot/runs`. If you point this at the repo (CI does), add it to `.gitignore`. |
-| `--out-dir DIR` | copies `report-<run_id>.md` and `summary-<run_id>.json` for CI artifacts. Do not archive the whole runs directory: `traces/` holds the internal view. |
+| `--output-dir DIR` | copies `report-<run_id>.md` and `summary-<run_id>.json` for CI artifacts. Do not archive the whole runs directory: `traces/` holds the internal view. |
 
 `--format json` makes stdout a JSON document (no progress mixed in). `-q` silences text; JSON still prints.
 
 ```bash
-reviewbot --config examples/reviewbot.toml --format json -q review change.diff --out-dir artifacts/
+reviewbot --config examples/reviewbot.toml --format json -q review change.diff --output-dir artifacts/
 ```
 
 ## Resume, publish, report
@@ -72,7 +72,7 @@ If a run dies after it has a directory, stderr names the `run_id` and a command 
 ```bash
 reviewbot --runs-dir .reviewbot/runs resume 7f3a9c1e
 reviewbot --runs-dir .reviewbot/runs publish 7f3a9c1e   # leftover comments only; no model
-reviewbot --runs-dir .reviewbot/runs report 7f3a9c1e --out-dir artifacts/
+reviewbot --runs-dir .reviewbot/runs report 7f3a9c1e --output-dir artifacts/
 ```
 
 `publish` posts even if the original `review` did not pass `--publish`. It skips markers already on the MR or in `published.json`.
@@ -115,7 +115,7 @@ There is no `--fail-on`. Gate a pipeline on `summary.json` yourself.
 
 ## CI
 
-See [`examples/gitlab-ci.yml`](examples/gitlab-ci.yml) and [`examples/github-actions.yml`](examples/github-actions.yml). Copy them to `.gitlab-ci.yml` / `.github/workflows/reviewbot.yml` in the repo you want reviewed. The shape is: `config check`, then `review` with `--out-dir` and (on GitLab) `--runs-dir` inside the project so cache can see it, then `run prune`. Artifacts come from `--out-dir` only.
+See [`examples/gitlab-ci.yml`](examples/gitlab-ci.yml) and [`examples/github-actions.yml`](examples/github-actions.yml). Copy them to `.gitlab-ci.yml` / `.github/workflows/reviewbot.yml` in the repo you want reviewed. The shape is: `config check`, then `review` with `--output-dir` and (on GitLab) `--runs-dir` inside the project so cache can see it, then `run prune`. Artifacts come from `--output-dir` only.
 
 ## Demo report
 
@@ -139,7 +139,7 @@ This repo does not ship a canned PR report. Produce one by pointing `review` at 
 - Both submissions are function calls: `submit_comment` for a finding, `submit_summary` for the overall score. No stage reads JSON out of a chat message, so nothing strips markdown fences. Each tool is offered on the rounds it belongs to and no others — investigation, the concluding turn, or the scoring call — and `tool list` prints those rounds. A blank or whitespace-only summary is refused and re-asked rather than published as a score with nothing behind it.
 - A score written as `"92"` is read as 92. The schema says integer and no vendor enforces it, so re-asking buys a round trip and the same number back. Nothing is rounded or clamped: `"45.7"`, `"high"` and `101` are still refused.
 - Everything sent to the model is in English — both prompts, the capability paragraph, tool descriptions, and the notes and refusals in tool output. So are the two badges reviewbot puts on a comment (`found by tool`, `quote unverified`). The report body and comment text come from the model, in whatever language it chooses.
-- reviewbot never writes the checkout you name with `--worktree`; the only local writes are the run directory (including the run's own worktree) and `--out-dir`. A subprocess cannot be stopped from writing the checkout on a bare machine; that only holds in an isolated environment (container, or a user with no write permission).
+- reviewbot never writes the checkout you name with `--worktree`; the only local writes are the run directory (including the run's own worktree) and `--output-dir`. A subprocess cannot be stopped from writing the checkout on a bare machine; that only holds in an isolated environment (container, or a user with no write permission).
 - `requires_build` needs `allow_build_tools` and a sandbox.
 - Suppression-style prompt injection (persuading the model to report nothing) is undetectable: an empty list is a legal review.
 - On GitLab, nothing answers `search_code` until Advanced Search can be known without guessing. The tool is still offered to the model, and both its description and its refusal say that a miss there would have been the run's limit rather than evidence of absence.

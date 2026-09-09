@@ -573,7 +573,7 @@ fn run_parameters_do_not_change_identity_but_conclusions_do() {
 
     let noisy = workspace.settings_with(RunOptions {
         runs_dir: workspace.runs_dir.join("elsewhere"),
-        out_dir: Some(PathBuf::from("artifacts")),
+        output_dir: Some(PathBuf::from("artifacts")),
         retries: 7,
         publish: true,
         ..RunOptions::default()

@@ -38,7 +38,7 @@ pub struct PathPolicy {
 
 impl PathPolicy {
     /// Builtin denials are always present: `.git/**` plus whatever this run
-    /// writes (the runs directory and `--out-dir`), expressed relative to
+    /// writes (the runs directory and `--output-dir`), expressed relative to
     /// `repo_root` when they land inside it.
     pub fn new(
         settings: &SecuritySettings,

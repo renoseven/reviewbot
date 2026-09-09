@@ -169,7 +169,7 @@ pub struct ReviewArgs {
 
     /// Export the report and the summary here, for CI artifacts.
     #[arg(long, value_name = "DIR")]
-    pub out_dir: Option<PathBuf>,
+    pub output_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -179,7 +179,7 @@ pub struct ReportArgs {
 
     /// Also copy the report and the summary here.
     #[arg(long, value_name = "DIR")]
-    pub out_dir: Option<PathBuf>,
+    pub output_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -352,7 +352,7 @@ mod tests {
             ],
             vec!["reviewbot", "resume", "7f3a9c1e"],
             vec!["reviewbot", "publish", "7f3a9c1e"],
-            vec!["reviewbot", "report", "7f3a9c1e", "--out-dir", "artifacts"],
+            vec!["reviewbot", "report", "7f3a9c1e", "--output-dir", "artifacts"],
             vec!["reviewbot", "run", "list"],
             vec!["reviewbot", "run", "show", "7f3a9c1e"],
             vec!["reviewbot", "run", "prune"],

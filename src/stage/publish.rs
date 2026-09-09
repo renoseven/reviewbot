@@ -457,24 +457,24 @@ impl Publish {
         report
     }
 
-    /// `--out-dir` gets the two artifacts that may leave the machine. The run
+    /// `--output-dir` gets the two artifacts that may leave the machine. The run
     /// directory as a whole may not: it holds the internal trace view.
     fn export(
         context: &StageContext<'_>,
         report: &str,
         summary_bytes: &[u8],
     ) -> Result<(), StageError> {
-        let Some(out_dir) = &context.settings.options.out_dir else {
+        let Some(output_dir) = &context.settings.options.output_dir else {
             return Ok(());
         };
         let run_id = &context.recorder.meta().run_id;
         let io = |path: std::path::PathBuf| {
             move |source| crate::record::RecordError::Io { path, source }
         };
-        std::fs::create_dir_all(out_dir).map_err(io(out_dir.clone()))?;
-        let report_path = out_dir.join(layout::exported_report(run_id));
+        std::fs::create_dir_all(output_dir).map_err(io(output_dir.clone()))?;
+        let report_path = output_dir.join(layout::exported_report(run_id));
         std::fs::write(&report_path, report).map_err(io(report_path.clone()))?;
-        let summary_path = out_dir.join(layout::exported_summary(run_id));
+        let summary_path = output_dir.join(layout::exported_summary(run_id));
         std::fs::write(&summary_path, summary_bytes).map_err(io(summary_path.clone()))?;
         Ok(())
     }

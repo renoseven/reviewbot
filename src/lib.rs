@@ -255,7 +255,7 @@ fn publish_run_inner(settings: &Settings, run_id: &str) -> Result<RunResult, Err
     .result())
 }
 
-/// Rewrite `report.md` / `summary.json` (and `--out-dir` copies) from
+/// Rewrite `report.md` / `summary.json` (and `--output-dir` copies) from
 /// checkpoints. Does not call the model or the platform.
 pub fn render_report(settings: &Settings, run_id: &str) -> Result<RunResult, Error> {
     render_report_inner(settings, run_id).map_err(|error| error.in_run(run_id))

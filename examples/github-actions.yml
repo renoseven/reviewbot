@@ -1,5 +1,5 @@
 # GitHub Actions: cache may live outside the workspace; still collect
-# --out-dir only, prune after review. config check first.
+# --output-dir only, prune after review. config check first.
 
 # .github/workflows/reviewbot.yml
 name: reviewbot
@@ -27,7 +27,7 @@ jobs:
           reviewbot --config /etc/reviewbot/reviewbot.toml
           review --publish --worktree .
           --runs-dir "${{ runner.temp }}/reviewbot-runs"
-          --out-dir artifacts/
+          --output-dir artifacts/
           "${{ github.event.pull_request.html_url }}"
       - name: prune
         run: reviewbot run prune --runs-dir "${{ runner.temp }}/reviewbot-runs"

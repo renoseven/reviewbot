@@ -16,7 +16,7 @@ pub fn trace_file(trace_id: &str) -> String {
     format!("traces/{trace_id}.json")
 }
 
-/// The two artifacts `--out-dir` exports carry the run id in their names,
+/// The two artifacts `--output-dir` exports carry the run id in their names,
 /// because that directory may hold several runs.
 pub fn exported_report(run_id: &str) -> String {
     format!("report-{run_id}.md")

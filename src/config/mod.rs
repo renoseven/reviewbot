@@ -198,7 +198,7 @@ impl SelectionReason {
 #[derive(Clone, Debug)]
 pub struct RunOptions {
     pub runs_dir: PathBuf,
-    pub out_dir: Option<PathBuf>,
+    pub output_dir: Option<PathBuf>,
     pub model: Option<String>,
     pub worktree: Option<PathBuf>,
     pub publish: bool,
@@ -210,7 +210,7 @@ impl Default for RunOptions {
     fn default() -> Self {
         Self {
             runs_dir: paths::default_runs_dir(),
-            out_dir: None,
+            output_dir: None,
             model: None,
             worktree: None,
             publish: false,
@@ -310,8 +310,8 @@ impl Settings {
             })
         };
         let mut written = vec![to_abs(&self.options.runs_dir)?];
-        if let Some(out_dir) = &self.options.out_dir {
-            written.push(to_abs(out_dir)?);
+        if let Some(output_dir) = &self.options.output_dir {
+            written.push(to_abs(output_dir)?);
         }
         Ok(written)
     }

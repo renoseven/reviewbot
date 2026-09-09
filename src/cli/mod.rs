@@ -95,7 +95,7 @@ fn dispatch(cli: &Cli) -> Result<Finished, Error> {
             let settings = load(
                 &cli.global,
                 RunOptions {
-                    out_dir: report.out_dir.clone(),
+                    output_dir: report.output_dir.clone(),
                     ..base_options(&cli.global)
                 },
             )?;
@@ -148,7 +148,7 @@ fn base_options(global: &GlobalArgs) -> RunOptions {
 
 fn review_options(global: &GlobalArgs, review: &ReviewArgs) -> RunOptions {
     RunOptions {
-        out_dir: review.out_dir.clone(),
+        output_dir: review.output_dir.clone(),
         model: review.model.clone(),
         worktree: review.worktree.clone(),
         publish: review.publish,
