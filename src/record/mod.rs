@@ -35,10 +35,10 @@ pub enum RecordError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("{path} already exists")]
-    AlreadyExists { path: PathBuf },
-    #[error("another process is already running this run ({path} exists)")]
-    LockHeld { path: PathBuf },
+    /// Names no file on purpose. The lock is the kernel's; a user shown a
+    /// path would delete it, and deleting it would win nothing.
+    #[error("another process is running this run")]
+    LockHeld,
     #[error("no run {run_id} under {runs_dir}")]
     RunNotFound { run_id: String, runs_dir: PathBuf },
     #[error("cannot read {file}: {source}")]
@@ -59,14 +59,19 @@ pub struct Recorder {
     storage: Arc<dyn Storage>,
     meta: Meta,
     max_tool_output_bytes: usize,
-    _lock: DirLock,
+    _lock: Box<dyn DirLock>,
 }
 
 impl Recorder {
-    /// Take the lock, then write `meta.json`. An existing `meta.json` is
-    /// kept, so completed stages survive into the next process.
-    pub fn open(storage: Arc<dyn Storage>, meta: Meta) -> Result<Self, RecordError> {
-        let lock = DirLock::take(Arc::clone(&storage))?;
+    /// The lock arrives already taken, because the caller had to hold it
+    /// before it touched anything else in the run directory; the recorder
+    /// only keeps it alive until the run ends. Writes `meta.json`, keeping
+    /// an existing one so completed stages survive into the next process.
+    pub fn open(
+        storage: Arc<dyn Storage>,
+        lock: Box<dyn DirLock>,
+        meta: Meta,
+    ) -> Result<Self, RecordError> {
         let recorder = Self {
             storage,
             meta,

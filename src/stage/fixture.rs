@@ -242,7 +242,8 @@ impl StageFixture {
             &budget,
             false,
         );
-        let recorder = Recorder::open(storage, meta).expect("run directory");
+        let lock = storage.lock().expect("run directory lock");
+        let recorder = Recorder::open(storage, lock, meta).expect("run directory");
         let paths = PathPolicy::new(
             &settings.config.security,
             &settings.written_paths().expect("cwd"),

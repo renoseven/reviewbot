@@ -14,7 +14,7 @@ use crate::platform::{
     Platform, PlatformChange, PlatformError, RepoSource, SearchHit,
 };
 use crate::protocol::{OutputItem, Protocol, ProtocolError, Request, Response};
-use crate::record::{DirLock, LocalStorage, Storage, layout};
+use crate::record::{LocalStorage, Storage, layout};
 use crate::security::Redactor;
 use crate::stage::Adapters;
 use crate::tool::{FinishReview, Registry, SubmitComment, SubmitSummary};
@@ -395,10 +395,12 @@ fn a_full_run_writes_every_stage_and_releases_the_lock() {
     );
     assert!(run_dir.join(layout::SUMMARY).is_file());
     assert!(run_dir.join(layout::PUBLISHED).is_file());
-    assert!(
-        !run_dir.join(layout::LOCK).exists(),
-        "the lock is gone after a clean exit"
-    );
+    // The `lock` file outlives the run that wrote it, and says nothing: the
+    // next holder walks straight in.
+    assert!(run_dir.join(layout::LOCK).is_file());
+    LocalStorage::open(run_dir.clone())
+        .lock()
+        .expect("the finished run let go of the lock");
 
     assert!(result.comments.is_empty());
     assert_eq!(
@@ -512,7 +514,7 @@ fn a_second_process_on_the_same_run_directory_fails_at_once() {
     let run_dir = workspace.run_dir("fixed-run");
     let storage: Arc<dyn Storage> =
         Arc::new(LocalStorage::create(run_dir.clone()).expect("run directory"));
-    let held = DirLock::take(Arc::clone(&storage)).expect("first lock");
+    let held = storage.lock().expect("first lock");
 
     let error = crate::review_with(
         &settings,
@@ -520,10 +522,19 @@ fn a_second_process_on_the_same_run_directory_fails_at_once() {
         &adapters(Arc::new(Calls::default())),
     )
     .expect_err("the second open fails");
-    assert!(error.to_string().contains("already running"), "got {error}");
+    assert!(
+        error.to_string().contains("another process is running"),
+        "got {error}"
+    );
+    assert!(
+        !run_dir.join(crate::worktree::DIRECTORY).exists(),
+        "the lock comes before the worktree, so the loser wrote nothing"
+    );
 
     drop(held);
-    assert!(!run_dir.join(layout::LOCK).exists());
+    LocalStorage::open(run_dir)
+        .lock()
+        .expect("the holder let go, so the next one gets in");
 }
 
 #[test]

@@ -30,7 +30,7 @@ use config::{ConfigError, Settings};
 use domain::{ChangeSet, Comment, Confidence, Severity};
 use platform::PlatformError;
 use protocol::ProtocolError;
-use record::{LocalStorage, Meta, RecordError, Recorder, RunIdentity, Storage, layout};
+use record::{DirLock, LocalStorage, Meta, RecordError, Recorder, RunIdentity, Storage, layout};
 use stage::input::Input;
 use stage::merge::{Merge, MergeOutput};
 use stage::orient::Orientation;
@@ -212,13 +212,14 @@ fn publish_run_inner(settings: &Settings, run_id: &str) -> Result<RunResult, Err
     if matches!(meta.input.identity, record::InputIdentity::Diff { .. }) {
         return Err(Error::PublishNeedsPlatform);
     }
+    let run = LockedRun::take(storage)?;
     let host = match &meta.input.identity {
         record::InputIdentity::Platform { host, .. } => Some(host.clone()),
         record::InputIdentity::Diff { .. } => None,
     };
     let adapters = Adapters::without_model(settings, host.as_deref())?;
     adapters.bind_repo(&meta.input);
-    let mut recorder = open_recorder(settings, storage, meta)?;
+    let mut recorder = open_recorder(settings, run, meta)?;
     recorder.set_publish_intent(true)?;
     let mut budget = restore_budget(recorder.meta())?;
     let (changeset, plan, reviewed, merged) = load_finished(&mut recorder, run_id, "publish")?;
@@ -263,8 +264,9 @@ pub fn render_report(settings: &Settings, run_id: &str) -> Result<RunResult, Err
 
 fn render_report_inner(settings: &Settings, run_id: &str) -> Result<RunResult, Error> {
     let (storage, meta) = open_existing(settings, run_id)?;
+    let run = LockedRun::take(storage)?;
     let adapters = Adapters::without_model(settings, None)?;
-    let mut recorder = open_recorder(settings, storage, meta)?;
+    let mut recorder = open_recorder(settings, run, meta)?;
     let mut budget = restore_budget(recorder.meta())?;
     let (changeset, plan, reviewed, merged) = load_finished(&mut recorder, run_id, "report")?;
     let publish_input = PublishInput {
@@ -321,7 +323,9 @@ pub(crate) fn review_with(
         .unwrap_or_else(|| record::run_id(&input.identity, &input.head_sha, &fingerprint));
 
     let run_dir = settings.options.runs_dir.join(&run_id);
-    let storage: Arc<dyn Storage> = Arc::new(LocalStorage::create(run_dir.clone())?);
+    // Nothing below may run without the lock, which is why it is taken with
+    // the directory rather than later on with the recorder.
+    let run = LockedRun::create(run_dir.clone())?;
     // The run's own worktree lives here, and is deleted with the run. A
     // checkout named on the command line ignores this: it was open before the
     // run id existed, which is why the id could be computed first.
@@ -331,7 +335,7 @@ pub(crate) fn review_with(
 
     // An explicit --run-id that lands on an existing run faces the same
     // fingerprint check as resume; otherwise it would be the way around it.
-    let meta = match Recorder::peek_meta(storage.as_ref())? {
+    let meta = match Recorder::peek_meta(run.storage.as_ref())? {
         Some(existing) if existing.fingerprint != fingerprint => {
             return Err(Error::FingerprintMismatch { run_id });
         }
@@ -349,7 +353,7 @@ pub(crate) fn review_with(
         ),
     };
 
-    let mut recorder = open_recorder(settings, storage, meta)?;
+    let mut recorder = open_recorder(settings, run, meta)?;
     recorder.set_publish_intent(settings.options.publish)?;
     let budget = restore_budget(recorder.meta())?;
     let result =
@@ -366,6 +370,7 @@ pub(crate) fn resume_with(
     adapters: &Adapters,
 ) -> Result<RunResult, Error> {
     let (storage, meta) = open_existing(settings, run_id)?;
+    let run = LockedRun::take(storage)?;
     if meta.fingerprint != settings.fingerprint() {
         return Err(Error::FingerprintMismatch {
             run_id: run_id.to_string(),
@@ -376,9 +381,34 @@ pub(crate) fn resume_with(
     adapters.bind_repo(&meta.input);
     adapters.open_worktree(&settings.options.runs_dir.join(run_id))?;
     let source = Source::from_record(&meta.input)?;
-    let recorder = open_recorder(settings, storage, meta)?;
+    let recorder = open_recorder(settings, run, meta)?;
     let budget = restore_budget(recorder.meta())?;
     finish(settings, adapters, recorder, budget, &source).map_err(|error| error.in_run(run_id))
+}
+
+/// A run directory this process has taken: where the run writes, and the
+/// lock that says it may. They are taken together and handed on together, so
+/// no part of a run can reach the directory holding only one of them.
+struct LockedRun {
+    storage: Arc<dyn Storage>,
+    lock: Box<dyn DirLock>,
+}
+
+impl LockedRun {
+    /// Create the directory and lock it in one step, before the caller has
+    /// anything else it could do with it. The worktree waits for this: two
+    /// processes that both got as far as opening one would already have
+    /// written over each other, whichever of them lost the lock afterwards.
+    fn create(run_dir: PathBuf) -> Result<Self, Error> {
+        Self::take(Arc::new(LocalStorage::create(run_dir)?))
+    }
+
+    /// The same for a directory that is already there, which is what the
+    /// commands that re-enter a finished run start from.
+    fn take(storage: Arc<dyn Storage>) -> Result<Self, Error> {
+        let lock = storage.lock()?;
+        Ok(Self { storage, lock })
+    }
 }
 
 fn open_existing(settings: &Settings, run_id: &str) -> Result<(Arc<dyn Storage>, Meta), Error> {
@@ -391,12 +421,8 @@ fn open_existing(settings: &Settings, run_id: &str) -> Result<(Arc<dyn Storage>,
     Ok((storage, meta))
 }
 
-fn open_recorder(
-    settings: &Settings,
-    storage: Arc<dyn Storage>,
-    meta: Meta,
-) -> Result<Recorder, Error> {
-    Ok(Recorder::open(storage, meta)?
+fn open_recorder(settings: &Settings, run: LockedRun, meta: Meta) -> Result<Recorder, Error> {
+    Ok(Recorder::open(run.storage, run.lock, meta)?
         .with_max_tool_output_bytes(settings.config.review.max_tool_output_bytes as usize))
 }
 

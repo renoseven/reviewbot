@@ -4,7 +4,8 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use super::RecordError;
+use super::lock::{DirLock, FileLock};
+use super::{RecordError, layout};
 
 /// Every write is atomic and every path is relative to the run directory.
 pub trait Storage: Send + Sync {
@@ -14,9 +15,10 @@ pub trait Storage: Send + Sync {
     /// Temporary file plus rename, so a reader never sees half a file.
     fn write(&self, relative: &str, bytes: &[u8]) -> Result<(), RecordError>;
 
-    /// Fails if the file already exists. This is how the directory lock is
-    /// taken: no waiting, no stealing.
-    fn create_new(&self, relative: &str, bytes: &[u8]) -> Result<(), RecordError>;
+    /// Take this run directory for the caller, or fail: no waiting, no
+    /// stealing. The lock lasts as long as the guard, and every write the
+    /// run makes belongs after this call.
+    fn lock(&self) -> Result<Box<dyn DirLock>, RecordError>;
 
     fn read(&self, relative: &str) -> Result<Option<Vec<u8>>, RecordError>;
 
@@ -81,23 +83,11 @@ impl Storage for LocalStorage {
         std::fs::rename(&temporary, &path).map_err(io)
     }
 
-    fn create_new(&self, relative: &str, bytes: &[u8]) -> Result<(), RecordError> {
-        let path = self.path(relative);
+    /// The kernel holds it, on the run directory's `lock` file.
+    fn lock(&self) -> Result<Box<dyn DirLock>, RecordError> {
+        let path = self.path(layout::LOCK);
         self.ensure_parent(&path)?;
-        let mut file = std::fs::File::create_new(&path).map_err(|source| {
-            if source.kind() == std::io::ErrorKind::AlreadyExists {
-                RecordError::AlreadyExists { path: path.clone() }
-            } else {
-                RecordError::Io {
-                    path: path.clone(),
-                    source,
-                }
-            }
-        })?;
-        file.write_all(bytes).map_err(|source| RecordError::Io {
-            path: path.clone(),
-            source,
-        })
+        Ok(Box::new(FileLock::take(&path)?))
     }
 
     fn read(&self, relative: &str) -> Result<Option<Vec<u8>>, RecordError> {
