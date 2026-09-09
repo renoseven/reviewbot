@@ -6,6 +6,7 @@ use std::path::Path;
 use reviewbot::config::{Settings, paths};
 use reviewbot::domain::Confidence;
 use reviewbot::security::Redactor;
+use reviewbot::tool::Purpose;
 use reviewbot::{Error, RunResult};
 
 use super::args::Format;
@@ -99,7 +100,7 @@ pub fn config_check(settings: &Settings, format: Format) -> Result<String, Error
             "provider": selection.provider.name,
             "protocol": selection.provider.protocol,
             "currency": selection.provider.currency,
-            "budget": selection.provider.budget,
+            "budget_per_run": selection.provider.budget_per_run,
             "platforms": settings.config.platforms.len(),
             "tools": settings.config.tools.len(),
             "ok": true,
@@ -118,7 +119,7 @@ pub fn config_check(settings: &Settings, format: Format) -> Result<String, Error
                 selection.provider.name,
                 selection.provider.protocol,
                 selection.provider.currency,
-                selection.provider.budget
+                selection.provider.budget_per_run
             ));
             out.push_str(&format!("platforms  {}\n", settings.config.platforms.len()));
             out.push_str(&format!("tools      {}\n", settings.config.tools.len()));
@@ -283,7 +284,7 @@ pub fn provider_list(settings: &Settings, format: Format) -> Result<String, Erro
                 "protocol": provider.protocol,
                 "base_url": provider.base_url,
                 "currency": provider.currency,
-                "budget": provider.budget,
+                "budget_per_run": provider.budget_per_run,
                 "api_key": provider.api_key,
             })
         })
@@ -300,7 +301,7 @@ pub fn provider_list(settings: &Settings, format: Format) -> Result<String, Erro
                         provider.name.clone(),
                         provider.protocol.clone(),
                         provider.base_url.clone(),
-                        budget(provider.budget, &provider.currency),
+                        budget(provider.budget_per_run, &provider.currency),
                         provider.api_key.clone(),
                     ]
                 })
@@ -343,10 +344,10 @@ pub fn model_list(settings: &Settings, format: Format) -> Result<String, Error> 
                 "alias": model.alias,
                 "provider": model.provider,
                 "currency": currency_of(settings, &model.provider),
-                "input_per_1m": model.input_per_1m,
-                "cached_input_per_1m": model.cached_input_per_1m,
-                "output_per_1m": model.output_per_1m,
-                "context_window": model.context_window,
+                "input_per_1m_tokens": model.input_per_1m_tokens,
+                "cached_input_per_1m_tokens": model.cached_input_per_1m_tokens,
+                "output_per_1m_tokens": model.output_per_1m_tokens,
+                "context_window_tokens": model.context_window_tokens,
                 "max_output_tokens": model.max_output_tokens,
                 "reasoning_effort": model.reasoning_effort,
                 "default": default_name == Some(model.name.as_str()),
@@ -363,7 +364,7 @@ pub fn model_list(settings: &Settings, format: Format) -> Result<String, Error> 
                 .map(|model| {
                     let currency = currency_of(settings, &model.provider);
                     let cached = model
-                        .cached_input_per_1m
+                        .cached_input_per_1m_tokens
                         .map(|value| money(value, currency, 2))
                         .unwrap_or_else(|| "-".to_string());
                     let is_default = default_name == Some(model.name.as_str());
@@ -371,10 +372,10 @@ pub fn model_list(settings: &Settings, format: Format) -> Result<String, Error> 
                         model.name.clone(),
                         model.alias.clone().unwrap_or_else(|| "-".to_string()),
                         model.provider.clone(),
-                        money(model.input_per_1m, currency, 2),
+                        money(model.input_per_1m_tokens, currency, 2),
                         cached,
-                        money(model.output_per_1m, currency, 2),
-                        model.context_window.to_string(),
+                        money(model.output_per_1m_tokens, currency, 2),
+                        model.context_window_tokens.to_string(),
                         model.max_output_tokens.to_string(),
                         if is_default { "yes" } else { "no" }.to_string(),
                     ]
@@ -399,43 +400,30 @@ pub fn model_list(settings: &Settings, format: Format) -> Result<String, Error> 
     Ok(Redactor::new().redact(&text))
 }
 
+/// The contract of every tool this config could offer: what it is for, how it
+/// is called, what each argument is, which rounds it appears on, and what has
+/// to be true of a run before it exists.
+///
+/// It does not say whether a tool is registered. Registration is a fact about
+/// one invocation of `review` — which worktree it got, which platform, what the
+/// config asked for — and this command reviews nothing and calls nothing, so it
+/// has no invocation to report on. It printed one anyway, which read as a
+/// verdict on the tool itself.
 pub fn tool_list(settings: &Settings, format: Format) -> Result<String, Error> {
     let rows = reviewbot::tool::inventory(settings);
     let text = match format {
-        Format::Json => {
-            let builtin: Vec<_> = rows
-                .iter()
-                .filter(|row| row.origin == reviewbot::tool::Origin::Builtin)
-                .collect();
-            let config: Vec<_> = rows
-                .iter()
-                .filter(|row| row.origin == reviewbot::tool::Origin::Config)
-                .collect();
-            serde_json::json!({
-                "builtin": builtin,
-                "config": config,
-            })
-            .to_string()
-        }
+        Format::Json => serde_json::json!({ "tools": rows }).to_string(),
         Format::Text => {
             let mut out = String::new();
-            out.push_str("builtin\n\n");
-            for row in rows
-                .iter()
-                .filter(|row| row.origin == reviewbot::tool::Origin::Builtin)
-            {
-                out.push_str(&format_tool_row(row));
-            }
-            out.push_str("config\n\n");
-            let config_rows: Vec<_> = rows
-                .iter()
-                .filter(|row| row.origin == reviewbot::tool::Origin::Config)
-                .collect();
-            if config_rows.is_empty() {
-                out.push_str("(none)\n");
-            }
-            for row in config_rows {
-                out.push_str(&format_tool_row(row));
+            for purpose in [Purpose::Content, Purpose::Check, Purpose::Delivery] {
+                out.push_str(&format!("{}\n\n", purpose.as_str()));
+                let group: Vec<_> = rows.iter().filter(|row| row.purpose == purpose).collect();
+                if group.is_empty() {
+                    out.push_str("(none)\n\n");
+                }
+                for row in group {
+                    out.push_str(&format_tool_row(row));
+                }
             }
             out
         }
@@ -444,50 +432,129 @@ pub fn tool_list(settings: &Settings, format: Format) -> Result<String, Error> {
 }
 
 fn format_tool_row(row: &reviewbot::tool::ToolListing) -> String {
-    // A reason on a registered tool is a qualification rather than an
-    // excuse: `submit_summary` is real and reachable, just not on a review
-    // round, and printing a bare "registered" would read as "the model can
-    // call this while looking at a file".
-    let status = match (row.registered, &row.reason) {
-        (true, None) => "registered".to_string(),
-        (true, Some(reason)) => format!("registered, {reason}"),
-        (false, Some(reason)) => format!("not registered, {reason}"),
-        (false, None) => "not registered".to_string(),
-    };
-    let mut out = format!("{:<22}  {status}\n", row.name);
+    let mut out = format!("{}({})\n", row.name, call_arguments(&row.parameters));
     out.push_str(&format!("  {}\n", row.description));
-    let params = param_summary(&row.parameters);
-    if !params.is_empty() {
-        out.push_str(&format!("  {params}\n"));
+    let rounds: Vec<&str> = row.rounds.iter().map(|round| round.as_str()).collect();
+    out.push_str(&format!("  rounds    {}\n", rounds.join(", ")));
+    if !row.preconditions.is_empty() {
+        out.push_str(&format!("  needs     {}\n", row.preconditions.join("; ")));
+    }
+    let declared = parameters_of(&row.parameters);
+    // Padded to the widest name in this tool, so a long one still gets a gap
+    // rather than running into its own type.
+    let width = declared
+        .iter()
+        .map(|parameter| parameter.name.chars().count())
+        .max()
+        .unwrap_or(0);
+    for parameter in &declared {
+        out.push_str(&format!(
+            "  {:<width$}  {}{}\n",
+            parameter.name,
+            parameter.kind,
+            match parameter.description.is_empty() {
+                true => String::new(),
+                false => format!("  {}", parameter.description),
+            }
+        ));
     }
     out.push('\n');
     out
 }
 
-/// Required names in schema order, then optionals in brackets.
-fn param_summary(parameters: &serde_json::Value) -> String {
+/// The call as the model writes it: required names, then optionals in brackets.
+fn call_arguments(parameters: &serde_json::Value) -> String {
+    let declared = parameters_of(parameters);
+    let required: Vec<&str> = declared
+        .iter()
+        .filter(|parameter| parameter.required)
+        .map(|parameter| parameter.name.as_str())
+        .collect();
+    let optional: Vec<&str> = declared
+        .iter()
+        .filter(|parameter| !parameter.required)
+        .map(|parameter| parameter.name.as_str())
+        .collect();
+    match (required.is_empty(), optional.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => required.join(", "),
+        (true, false) => format!("[{}]", optional.join(", ")),
+        (false, false) => format!("{}, [{}]", required.join(", "), optional.join(", ")),
+    }
+}
+
+/// One row per declared argument, read back out of the schema the tool
+/// published rather than out of a second list kept here.
+struct DeclaredParameter {
+    name: String,
+    kind: String,
+    required: bool,
+    description: String,
+}
+
+fn parameters_of(parameters: &serde_json::Value) -> Vec<DeclaredParameter> {
     let Some(properties) = parameters
         .get("properties")
         .and_then(|value| value.as_object())
     else {
-        return String::new();
+        return Vec::new();
     };
     let required: Vec<&str> = parameters
         .get("required")
         .and_then(|value| value.as_array())
         .map(|items| items.iter().filter_map(|item| item.as_str()).collect())
         .unwrap_or_default();
-    let optional: Vec<&str> = properties
-        .keys()
-        .map(String::as_str)
-        .filter(|name| !required.iter().any(|need| need == name))
+    let declare = |name: &String| DeclaredParameter {
+        name: name.clone(),
+        kind: properties
+            .get(name)
+            .map(describe_kind)
+            .unwrap_or_else(|| "value".to_string()),
+        required: required.iter().any(|need| need == name),
+        description: properties
+            .get(name)
+            .and_then(|property| property.get("description"))
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string(),
+    };
+    // Required ones first, in the order the tool declared them, so the rows
+    // read in the same order as the call signature above them.
+    let mut rows: Vec<DeclaredParameter> = required
+        .iter()
+        .filter(|name| properties.contains_key(**name))
+        .map(|name| declare(&name.to_string()))
         .collect();
-    match (required.is_empty(), optional.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => required.join(", "),
-        (true, false) => format!("[{}]", optional.join(", ")),
-        (false, false) => format!("{}  [{}]", required.join(", "), optional.join(", ")),
-    }
+    rows.extend(
+        properties
+            .keys()
+            .filter(|name| !required.iter().any(|need| need == *name))
+            .map(declare),
+    );
+    rows
+}
+
+fn describe_kind(property: &serde_json::Value) -> String {
+    let kind = property
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("value");
+    let inner = match kind {
+        "array" => property
+            .get("items")
+            .map(|items| format!(" of {}", describe_kind(items))),
+        _ => None,
+    };
+    let bounds = match (property.get("minimum"), property.get("maximum")) {
+        (Some(low), Some(high)) => Some(format!(" {low}-{high}")),
+        (Some(low), None) => Some(format!(" {low} or more")),
+        _ => None,
+    };
+    format!(
+        "{kind}{}{}",
+        inner.unwrap_or_default(),
+        bounds.unwrap_or_default()
+    )
 }
 
 fn currency_of<'a>(settings: &'a Settings, provider: &str) -> &'a str {
@@ -588,33 +655,44 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reviewbot::tool::{Origin, ToolListing};
+    use reviewbot::tool::{Round, ToolListing};
     use serde_json::json;
 
+    /// The row is the tool's contract: how it is called, what each argument
+    /// is, which rounds offer it, and what a run needs before it exists.
+    /// Never whether it is registered — that is a fact about one review, and
+    /// this command reviews nothing.
     #[test]
-    fn a_tool_row_is_a_block_without_nested_status_parentheses() {
+    fn a_tool_row_prints_the_contract_rather_than_a_registration_verdict() {
         let row = ToolListing {
-            name: "search_repo".to_string(),
-            origin: Origin::Builtin,
-            description: "Search the reviewed commit.".to_string(),
+            name: "search_code".to_string(),
+            purpose: Purpose::Content,
+            description: "Search the code of this run's worktree.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string"},
+                    "query": {"type": "string", "description": "What to search for"},
                     "glob": {"type": "string"},
                 },
                 "required": ["query"],
             }),
-            registered: false,
-            reason: Some("needs code_search".to_string()),
+            rounds: vec![Round::Investigation],
+            preconditions: vec!["the worktree can answer a search".to_string()],
         };
         let text = format_tool_row(&row);
-        assert!(text.starts_with("search_repo"), "{text}");
-        assert!(text.contains("not registered, needs code_search"), "{text}");
-        assert!(!text.contains("not registered ("), "{text}");
-        assert!(text.contains("Search the reviewed commit."), "{text}");
-        assert!(text.contains("query  [glob]"), "{text}");
-        assert!(!text.contains("params:"), "{text}");
+        assert!(text.starts_with("search_code(query, [glob])"), "{text}");
+        assert!(
+            text.contains("Search the code of this run's worktree."),
+            "{text}"
+        );
+        assert!(text.contains("rounds    investigation"), "{text}");
+        assert!(
+            text.contains("needs     the worktree can answer a search"),
+            "{text}"
+        );
+        assert!(text.contains("query"), "{text}");
+        assert!(text.contains("What to search for"), "{text}");
+        assert!(!text.contains("registered"), "{text}");
     }
 
     #[test]

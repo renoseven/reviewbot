@@ -14,16 +14,15 @@ use serde::{Deserialize, Serialize};
 use crate::domain::{ChangeSet, Comment, CommentTarget, Confidence, FileChange};
 use crate::protocol::{InputItem, Request, Role, ToolSchema};
 use crate::record::{ToolCall, Trace};
-use crate::tool::{SubmitSummary, whole_score};
+use crate::tool::{Round, SubmitSummary, whole_score};
+
+use super::prompt::Prompts;
 
 use super::review::{ChunkOutput, ReviewOutput};
 use super::{StageContext, StageError};
 
 pub const NUMBER: u8 = 4;
 pub const NAME: &str = "merge";
-
-/// The summary prompt ships with the binary, same as the review one.
-pub const SUMMARY_INSTRUCTIONS: &str = include_str!("../prompts/summary.md");
 
 /// The two badges reviewbot may put on a comment. They say what reviewbot
 /// checked, never what it thinks: the number beside them is the model's.
@@ -306,9 +305,12 @@ impl Merge {
             .recorder
             .read_trace(&chunk.trace_id)?
             .unwrap_or_else(|| Trace::new(chunk.trace_id.clone()));
-        // Merge owns the post-processing half of a trace, so running the
-        // stage twice rewrites those notes rather than filing a second copy.
-        trace.checks.clear();
+        // Merge owns the post-processing half of a trace, so running the stage
+        // twice rewrites its own notes. Only its own: the account of the
+        // conversation belongs to `review`, and clearing the lot used to erase
+        // it, so a comment whose evidence was never really looked for read
+        // exactly like one that was.
+        trace.forget(NAME);
 
         let entries = match parse_document(&chunk.raw_output) {
             Ok(entries) => entries,
@@ -317,9 +319,10 @@ impl Merge {
                 // `review` serialised from the tool calls it accepted, so an
                 // unreadable one is a damaged checkpoint rather than a badly
                 // behaved reply.
-                trace
-                    .checks
-                    .push(format!("the chunk document would not parse ({reason})"));
+                trace.note(
+                    NAME,
+                    format!("the chunk document would not parse ({reason})"),
+                );
                 context.recorder.write_trace(&trace)?;
                 return Err(ChunkError::Unproduced(format!(
                     "the submitted comments would not parse: {reason}"
@@ -335,6 +338,7 @@ impl Merge {
             .iter()
             .map(|file| file.path.clone())
             .collect();
+        let mut notes: Vec<String> = Vec::new();
         let findings = Self::findings_from(
             &entries,
             &ChunkFile {
@@ -346,8 +350,11 @@ impl Merge {
                 fetched: &fetched,
                 root: context.settings.options.worktree.as_deref(),
             },
-            &mut trace.checks,
+            &mut notes,
         );
+        for note in notes {
+            trace.note(NAME, note);
+        }
         context.recorder.write_trace(&trace)?;
         Ok(findings)
     }
@@ -363,7 +370,7 @@ impl Merge {
         let Some(mut trace) = context.recorder.read_trace(trace_id)? else {
             return Ok(());
         };
-        trace.checks.push(note);
+        trace.note(NAME, note);
         context.recorder.write_trace(&trace)?;
         Ok(())
     }
@@ -601,7 +608,7 @@ impl Merge {
     /// a finished review that found nothing, and still belongs here.
     fn score(context: &mut StageContext<'_>, comments: &[Comment]) -> Result<Score, StageError> {
         let selection = context.settings.selection()?;
-        let instructions = context.redactor.redact(SUMMARY_INSTRUCTIONS);
+        let instructions = context.redactor.redact(&Prompts::SUMMARY.text()?);
         let findings = context.redactor.redact(&findings_json(comments));
         let request = Request {
             model: selection.model.name.clone(),
@@ -610,11 +617,10 @@ impl Merge {
                 role: Role::User,
                 content: findings,
             }],
-            tools: vec![ToolSchema {
-                name: SubmitSummary::NAME.to_string(),
-                description: SubmitSummary::description_text().to_string(),
-                parameters: SubmitSummary::parameters_schema(),
-            }],
+            // From the registry, on the scoring round: this stage does not
+            // write out a schema of its own, and the round is what keeps
+            // `submit_comment` and the content tools off this turn.
+            tools: scoring_tools(context),
             max_output_tokens: selection.model.max_output_tokens,
             reasoning_effort: selection.model.reasoning_effort.clone(),
         };
@@ -635,7 +641,7 @@ impl Merge {
         trace.prompt = request.instructions.clone();
         let outcome = Self::ask_for_score(context, &request, &mut trace);
         context.recorder.write_trace(&trace)?;
-        Ok(outcome)
+        outcome
     }
 
     /// The call itself, plus the one re-ask a wrong shape earns. Two bad
@@ -644,17 +650,16 @@ impl Merge {
         context: &mut StageContext<'_>,
         request: &Request,
         trace: &mut Trace,
-    ) -> Score {
+    ) -> Result<Score, StageError> {
         let rejected = match Self::score_once(context, request, trace) {
-            Ok(score) => return score,
+            Ok(score) => return Ok(score),
             Err(rejected) => rejected,
         };
         let mut reason = rejected.reason;
-        let note = format!(
-            "That did not deliver a verdict: {reason}. Call `submit_summary` with \
-             overall_score, a whole number from 0 to 100, and summary. Text in the reply \
-             is not read."
-        );
+        let note = Prompts::RESCORE
+            .fill()
+            .set("reason", reason.clone())
+            .render()?;
         let mut retry = request.clone();
         // A call the model made and reviewbot refused has to go back out with
         // its refusal: the protocol is stateless, so an unanswered call left
@@ -674,30 +679,32 @@ impl Merge {
             role: Role::User,
             content: context.redactor.redact(&note),
         });
-        trace.checks.push(format!(
-            "the scoring call did not arrive ({reason}); asked once more"
-        ));
+        trace.note(
+            NAME,
+            format!("the scoring call did not arrive ({reason}); asked once more"),
+        );
 
         let estimate = context
             .budget
             .estimate(retry.estimated_input_tokens(), retry.max_output_tokens);
         if let Err(error) = context.budget.check(estimate) {
-            return Score::unscored(format!("not scored: {error}"));
+            return Ok(Score::unscored(format!("not scored: {error}")));
         }
-        match Self::score_once(context, &retry, trace) {
+        Ok(match Self::score_once(context, &retry, trace) {
             Ok(score) => score,
             Err(second) => {
                 let second = second.reason;
                 reason = format!("{reason}, then {second}");
-                trace
-                    .checks
-                    .push(format!("the second score reply would not read ({second})"));
+                trace.note(
+                    NAME,
+                    format!("the second score reply would not read ({second})"),
+                );
                 tracing::warn!("no overall score: {reason}");
                 Score::unscored(format!(
                     "not scored: the model's reply was unreadable ({reason})"
                 ))
             }
-        }
+        })
     }
 
     /// One request. A network failure that survived the protocol's own retry
@@ -756,7 +763,7 @@ impl Merge {
         })?;
         Ok(Score {
             overall_score: Some(score),
-            summary,
+            summary: Some(summary),
             unscored_reason: None,
         })
     }
@@ -787,7 +794,7 @@ impl Rejected {
 /// The arguments as the model wrote them, read through the tool that owns
 /// the schema. Malformed JSON and a bad score come back the same way: both
 /// mean "this call carried no verdict", and both earn the same re-ask.
-fn read_summary(arguments: &str) -> Result<(u8, Option<String>), String> {
+fn read_summary(arguments: &str) -> Result<(u8, String), String> {
     let parsed: serde_json::Value = serde_json::from_str(arguments)
         .map_err(|error| format!("its arguments are not JSON: {error}"))?;
     SubmitSummary::read(&parsed).map_err(|error| error.to_string())
@@ -832,6 +839,23 @@ fn score_of(value: Option<&serde_json::Value>) -> Result<u8, String> {
         return Err("no confidence_score".to_string());
     };
     whole_score(Some(value)).ok_or_else(|| format!("{value} is not an integer between 0 and 100"))
+}
+
+/// What the scoring round offers, straight from the registry: one tool, the
+/// one that takes a verdict. A round shows what it accepts and nothing else,
+/// so this list is also the whole of what this call will be answered with.
+fn scoring_tools(context: &StageContext<'_>) -> Vec<ToolSchema> {
+    context
+        .adapters
+        .tools
+        .schemas_for(Round::Scoring)
+        .into_iter()
+        .map(|schema| ToolSchema {
+            name: schema.name,
+            description: schema.description,
+            parameters: schema.parameters,
+        })
+        .collect()
 }
 
 /// Step 1. Not a model reply: `review` builds this document out of the
@@ -1125,6 +1149,49 @@ mod tests {
         format!(r#"{{"comments":[{}]}}"#, entries.join(","))
     }
 
+    /// A rerun rewrites what this stage said and leaves the rest alone. It
+    /// used to clear the whole list, taking `review`'s account of the
+    /// conversation with it — and a comment nobody really investigated then
+    /// read exactly like one that was investigated properly.
+    #[test]
+    fn running_twice_replaces_this_stages_notes_and_keeps_the_other_stages() {
+        let changeset = changeset(vec![file("src/parse.c", &[10, 11], &[11])]);
+        let raw = document(&[entry("src/parse.c", 11, "88", "[11]", "a finding")]);
+        let mut fixture = scoring(vec![
+            r#"{"overall_score":40,"summary":"first pass"}"#,
+            r#"{"overall_score":40,"summary":"second pass"}"#,
+        ]);
+        write_trace(&fixture, "review-src_parse.c");
+        {
+            let mut trace = fixture
+                .recorder()
+                .read_trace("review-src_parse.c")
+                .expect("readable")
+                .expect("written");
+            trace.note(
+                crate::stage::review::NAME,
+                "the tool loop reached its ceiling of 2 rounds",
+            );
+            fixture.recorder().write_trace(&trace).expect("written");
+        }
+        let review = review(vec![chunk("src/parse.c", &raw)]);
+
+        merge(&mut fixture, &changeset, &review);
+        let after_first = notes_by(&fixture, "review-src_parse.c", NAME).len();
+        merge(&mut fixture, &changeset, &review);
+
+        assert_eq!(
+            notes_by(&fixture, "review-src_parse.c", NAME).len(),
+            after_first,
+            "this stage's notes are rewritten, not doubled"
+        );
+        assert_eq!(
+            notes_by(&fixture, "review-src_parse.c", crate::stage::review::NAME),
+            vec!["the tool loop reached its ceiling of 2 rounds".to_string()],
+            "how far the investigation got is not this stage's to erase"
+        );
+    }
+
     /// The trace `review` would have left behind, which is where this stage
     /// writes its own notes.
     fn write_trace(fixture: &StageFixture, trace_id: &str) {
@@ -1138,13 +1205,22 @@ mod tests {
             .expect("the trace is written");
     }
 
-    fn checks_of(fixture: &StageFixture, trace_id: &str) -> Vec<String> {
+    /// What one stage wrote on a trace, which is the only thing a test about
+    /// that stage may assert on.
+    fn notes_by(fixture: &StageFixture, trace_id: &str, stage: &str) -> Vec<String> {
         fixture
             .recorder()
             .read_trace(trace_id)
             .expect("readable")
             .expect("the trace is on disk")
-            .checks
+            .notes_by(stage)
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn checks_of(fixture: &StageFixture, trace_id: &str) -> Vec<String> {
+        notes_by(fixture, trace_id, NAME)
     }
 
     fn merge(
@@ -1394,6 +1470,62 @@ mod tests {
                 InputItem::FunctionCallOutput { output, .. } if output.contains("overall_score"))),
             "the refusal goes back as that call's output: {second:?}"
         );
+    }
+
+    /// A summary of nothing but whitespace used to be accepted and stored as
+    /// "no summary", so the run published a score with nothing behind it. It
+    /// is refused like any other malformed verdict, which buys the re-ask.
+    #[test]
+    fn a_whitespace_only_summary_is_refused_and_re_asked() {
+        let changeset = changeset(vec![file("src/parse.c", &[10, 11], &[11])]);
+        let raw = document(&[entry("src/parse.c", 11, "88", "[11]", "a finding")]);
+        let mut fixture = scoring(vec![
+            r#"{"overall_score":80,"summary":"   "}"#,
+            r#"{"overall_score":80,"summary":"one finding worth reading"}"#,
+        ]);
+        write_trace(&fixture, "review-src_parse.c");
+
+        let output = merge(
+            &mut fixture,
+            &changeset,
+            &review(vec![chunk("src/parse.c", &raw)]),
+        );
+
+        assert_eq!(fixture.sent().len(), 2, "the blank summary was refused");
+        assert_eq!(output.overall_score, Some(80));
+        assert_eq!(output.summary.as_deref(), Some("one finding worth reading"));
+    }
+
+    /// Two blank summaries in a row leave the run unscored rather than
+    /// scored-with-no-words. `None`, never 0 and never an empty string.
+    #[test]
+    fn a_summary_that_stays_blank_leaves_the_run_unscored() {
+        let changeset = changeset(vec![file("src/parse.c", &[10, 11], &[11])]);
+        let raw = document(&[entry("src/parse.c", 11, "88", "[11]", "a finding")]);
+        let mut fixture = scoring(vec![
+            r#"{"overall_score":80,"summary":"  "}"#,
+            r#"{"overall_score":80,"summary":""}"#,
+        ]);
+        write_trace(&fixture, "review-src_parse.c");
+
+        let output = merge(
+            &mut fixture,
+            &changeset,
+            &review(vec![chunk("src/parse.c", &raw)]),
+        );
+
+        assert_eq!(output.overall_score, None);
+        assert!(output.summary.is_none());
+        assert!(
+            output
+                .unscored_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("summary"),
+            "{:?}",
+            output.unscored_reason
+        );
+        assert_eq!(output.comments.len(), 1, "the findings still go out");
     }
 
     #[test]

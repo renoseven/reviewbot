@@ -23,27 +23,27 @@ protocol = "openai"
 base_url = "https://api.deepseek.com"
 api_key = "~/.config/deepseek_api_key"
 currency = "CNY"
-budget = -1
+budget_per_run = -1
 
 # Model catalog. Prices and limits travel with the entry; --model switches all of them.
 [[model]]
 name = "deepseek-v4-flash"
 default = true
 provider = "deepseek"
-input_per_1m = 3.0
-cached_input_per_1m = 0.10
-output_per_1m = 9.0
-context_window = 1000000
+input_per_1m_tokens = 3.0
+cached_input_per_1m_tokens = 0.10
+output_per_1m_tokens = 9.0
+context_window_tokens = 1000000
 max_output_tokens = 384000
 reasoning_effort = "none"
 
 [[model]]
 name = "deepseek-v4-pro"
 provider = "deepseek"
-input_per_1m = 9.0
-cached_input_per_1m = 0.30
-output_per_1m = 27.0
-context_window = 1000000
+input_per_1m_tokens = 9.0
+cached_input_per_1m_tokens = 0.30
+output_per_1m_tokens = 27.0
+context_window_tokens = 1000000
 max_output_tokens = 384000
 
 # Every number below is required. None of them has an answer that holds
@@ -56,7 +56,7 @@ max_output_tokens = 384000
 # room for. The leftover context window is only a hard ceiling, not this.
 max_chunk_tokens = 24000
 # A file bigger than this is skipped and named in the report.
-skip_over_bytes = 262144
+skip_files_over_bytes = 262144
 skip_paths = ["**/*.lock", "vendor/**"]
 
 # Tool loop for the review stage: how many turns it gets, and how much content
@@ -70,13 +70,13 @@ max_tool_rounds = 12
 # How much one listing or one search may hand back. Both numbers appear in
 # the tool descriptions the model reads, so they cannot drift apart from
 # what the code enforces.
-max_files_listed = 200
-max_search_hits = 50
+max_files_per_listing = 200
+max_hits_per_search = 50
 # The most of one file a read may fetch. This bounds the fetch, not the
 # answer: the platform API has no range request, so reading part of a file
 # means downloading all of it, and a file past this cannot be read at all.
 # Not a permission -- whether a path may be read at all is [security].
-max_read_bytes = 262144
+max_file_bytes = 262144
 # What one tool answer may hand back, and what all the tool output of one
 # round may add up to. Paired with max_tool_rounds above: the two multiplied
 # together are held back from the context window. A file read that does not
@@ -103,6 +103,6 @@ description = "compile one C file with warnings, no object file (gcc -fsyntax-on
 bin = "/usr/bin/gcc"
 args = ["-Wall", "-Wextra", "-fsyntax-only", "--", "{path}"]
 params.path = { type = "path" }
-requires_worktree = true
+requires_checkout = true
 requires_build = false
 timeout_ms = 60000

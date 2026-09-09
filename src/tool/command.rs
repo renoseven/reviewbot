@@ -9,16 +9,19 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use regex::Regex;
 use serde_json::{Map, Value};
 
-use crate::config::{Backoff, ParamKind, ParamSpec, ToolEntry};
+use crate::config::{Backoff, ToolEntry};
 use crate::security::{EnvPolicy, Limits, PathPolicy, truncate};
+use crate::worktree::WorktreeSource;
 
-use super::{Origin, Tool, ToolError, ToolOutput};
+use super::signature::Signature;
+use super::{Purpose, Round, Tool, ToolError, ToolOutput};
 
 /// How often a running child is asked whether it is done.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -36,10 +39,14 @@ const WITHHELD_LINE: &str = "[one line withheld by deny_paths]";
 /// run, what it may inherit, which paths it may be pointed at, and how long
 /// it may take. Baked in when the tool is registered, so `Tool::execute`
 /// still takes nothing but the arguments the model wrote.
+///
+/// The worktree is held as the source rather than as a path: a run that opens
+/// its own worktree only knows where it is once the run directory exists, and
+/// that is later than the tools are registered.
 pub struct CommandContext {
     environment: EnvPolicy,
     paths: PathPolicy,
-    worktree: PathBuf,
+    worktree: Arc<dyn WorktreeSource>,
     max_output_bytes: u64,
     backoff: Backoff,
 }
@@ -48,7 +55,7 @@ impl CommandContext {
     pub fn new(
         environment: EnvPolicy,
         paths: PathPolicy,
-        worktree: PathBuf,
+        worktree: Arc<dyn WorktreeSource>,
         max_output_bytes: u64,
         backoff: Backoff,
     ) -> Self {
@@ -60,21 +67,30 @@ impl CommandContext {
             backoff,
         }
     }
+
+    fn root(&self) -> &Path {
+        self.worktree.root()
+    }
 }
 
 pub struct CommandTool {
     entry: ToolEntry,
     context: CommandContext,
     limits: Limits,
+    /// The `params` table, read as a declaration: the schema the model sees
+    /// and the check its call is put through both come from here.
+    signature: Signature,
 }
 
 impl CommandTool {
     pub fn new(entry: ToolEntry, context: CommandContext) -> Self {
         let limits = Limits::new(entry.timeout_ms, context.max_output_bytes);
+        let signature = Signature::from_entry(&entry);
         Self {
             entry,
             context,
             limits,
+            signature,
         }
     }
 
@@ -84,42 +100,6 @@ impl CommandTool {
 
     pub fn limits(&self) -> Limits {
         self.limits
-    }
-
-    /// Schema for `tool list`, without constructing a runnable tool.
-    pub fn parameters_for(entry: &ToolEntry) -> Value {
-        let mut properties = Map::new();
-        let mut required = Vec::new();
-        for (name, spec) in &entry.params {
-            let mut property = Map::new();
-            property.insert(
-                "type".to_string(),
-                Value::String(json_type(spec.kind).to_string()),
-            );
-            if let Some(description) = &spec.description {
-                property.insert(
-                    "description".to_string(),
-                    Value::String(description.clone()),
-                );
-            }
-            if let Some(pattern) = &spec.pattern {
-                property.insert("pattern".to_string(), Value::String(pattern.clone()));
-            }
-            if let Some(choices) = &spec.choices {
-                property.insert(
-                    "enum".to_string(),
-                    Value::Array(choices.iter().cloned().map(Value::String).collect()),
-                );
-            }
-            properties.insert(name.clone(), Value::Object(property));
-            required.push(Value::String(name.clone()));
-        }
-        serde_json::json!({
-            "type": "object",
-            "properties": Value::Object(properties),
-            "required": Value::Array(required),
-            "additionalProperties": false,
-        })
     }
 
     /// Expand `{name}` from the validated arguments. Each template element
@@ -157,106 +137,36 @@ impl CommandTool {
         Ok(out)
     }
 
-    /// Every argument against the schema the model was shown, before any
-    /// process exists. A rejection is an answer to the model, not a failure
-    /// of the review, so the reason has to read like one.
-    fn validated(&self, arguments: &Value) -> Result<Map<String, Value>, ToolError> {
-        let Some(given) = arguments.as_object() else {
-            return Err(self.invalid("the arguments have to be a JSON object"));
-        };
-        for name in given.keys() {
-            if !self.entry.params.contains_key(name) {
-                return Err(self.invalid(format!(
-                    "unknown argument {name:?}; this tool takes {}",
-                    self.parameter_names()
-                )));
+    /// The arguments the model wrote, checked against the declaration and then
+    /// put through the path check: a `path` reaches argv as what the check
+    /// approved rather than as what the model typed.
+    fn checked(&self, arguments: &Value) -> Result<Map<String, Value>, ToolError> {
+        let checked = self.signature.validate(&self.entry.name, arguments)?;
+        let mut values = checked.values().clone();
+        for parameter in self.signature.parameters() {
+            if !matches!(parameter.shape, crate::tool::Shape::Path) {
+                continue;
             }
-        }
-        let mut checked = Map::new();
-        for (name, spec) in &self.entry.params {
-            let Some(value) = given.get(name) else {
-                return Err(self.invalid(format!("missing argument {name:?}")));
+            let Some(given) = values.get(&parameter.name).and_then(Value::as_str) else {
+                continue;
             };
-            checked.insert(name.clone(), self.checked_value(name, spec, value)?);
+            let path = self
+                .context
+                .paths
+                .check_worktree_path(given, self.context.root())
+                .map_err(|rejection| ToolError::Rejected {
+                    tool: self.entry.name.clone(),
+                    reason: rejection.to_string(),
+                })?;
+            values.insert(parameter.name.clone(), Value::String(path));
         }
-        Ok(checked)
-    }
-
-    /// A `path` walks the full path check and comes back repository relative,
-    /// so what reaches argv is what the check approved rather than what the
-    /// model wrote.
-    fn checked_value(
-        &self,
-        name: &str,
-        spec: &ParamSpec,
-        value: &Value,
-    ) -> Result<Value, ToolError> {
-        match spec.kind {
-            ParamKind::Path => {
-                let given = self.text_of(name, value)?;
-                let path = self
-                    .context
-                    .paths
-                    .check_worktree_path(given, &self.context.worktree)
-                    .map_err(|rejection| ToolError::Rejected {
-                        tool: self.entry.name.clone(),
-                        reason: rejection.to_string(),
-                    })?;
-                self.check_shape(name, spec, &path)?;
-                Ok(Value::String(path))
-            }
-            ParamKind::String => {
-                let given = self.text_of(name, value)?;
-                self.check_shape(name, spec, given)?;
-                Ok(value.clone())
-            }
-            ParamKind::Integer if value.is_i64() || value.is_u64() => Ok(value.clone()),
-            ParamKind::Number if value.is_number() => Ok(value.clone()),
-            ParamKind::Boolean if value.is_boolean() => Ok(value.clone()),
-            other => Err(self.invalid(format!(
-                "argument {name:?} has to be {}",
-                match other {
-                    ParamKind::Integer => "an integer",
-                    ParamKind::Number => "a number",
-                    _ => "a boolean",
-                }
-            ))),
-        }
-    }
-
-    fn text_of<'a>(&self, name: &str, value: &'a Value) -> Result<&'a str, ToolError> {
-        value
-            .as_str()
-            .ok_or_else(|| self.invalid(format!("argument {name:?} has to be a string")))
-    }
-
-    fn check_shape(&self, name: &str, spec: &ParamSpec, value: &str) -> Result<(), ToolError> {
-        if let Some(choices) = &spec.choices
-            && !choices.iter().any(|choice| choice == value)
-        {
-            return Err(self.invalid(format!(
-                "argument {name:?} has to be one of {}",
-                choices.join(", ")
-            )));
-        }
-        if let Some(pattern) = &spec.pattern {
-            let compiled = Regex::new(pattern).map_err(|error| ToolError::Unavailable {
-                tool: self.entry.name.clone(),
-                reason: format!("the pattern configured for {name:?} will not compile: {error}"),
-            })?;
-            if !compiled.is_match(value) {
-                return Err(self.invalid(format!(
-                    "argument {name:?} does not match the pattern {pattern}"
-                )));
-            }
-        }
-        Ok(())
+        Ok(values)
     }
 
     /// The config already refused a `bin` inside the repository, but the
     /// worktree is only known now, so the same rule is applied again here.
     fn refuse_bin_inside_worktree(&self) -> Result<(), ToolError> {
-        let root = resolved(&self.context.worktree);
+        let root = resolved(self.context.root());
         let bin = resolved(&self.entry.bin);
         if bin.starts_with(&root) {
             return Err(ToolError::Rejected {
@@ -302,7 +212,7 @@ impl CommandTool {
     fn run_once(&self, argv: &[String]) -> Result<ToolOutput, ToolError> {
         let mut child = Command::new(&self.entry.bin)
             .args(argv)
-            .current_dir(&self.context.worktree)
+            .current_dir(self.context.root())
             .env_clear()
             .envs(self.context.environment.apply(std::env::vars()))
             .stdin(Stdio::null())
@@ -352,7 +262,7 @@ impl CommandTool {
     /// `deny_paths` applies to what comes back as well as to what goes in:
     /// a checker that lists files will hand paths over along with content.
     fn withhold_denied_lines(&self, text: &str) -> String {
-        let root = format!("{}/", self.context.worktree.display());
+        let root = format!("{}/", self.context.root().display());
         let withheld: Vec<&str> = text
             .lines()
             .map(|line| match self.names_a_denied_path(line, &root) {
@@ -375,15 +285,6 @@ impl CommandTool {
                 .unwrap_or(text);
             self.context.paths.is_denied(relative)
         })
-    }
-
-    fn parameter_names(&self) -> String {
-        self.entry
-            .params
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ")
     }
 
     fn invalid(&self, reason: impl Into<String>) -> ToolError {
@@ -476,18 +377,22 @@ impl Tool for CommandTool {
     }
 
     /// `params` is the schema the model sees, straight from the config.
-    fn parameters(&self) -> Value {
-        Self::parameters_for(&self.entry)
+    fn signature(&self) -> &Signature {
+        &self.signature
     }
 
-    fn origin(&self) -> Origin {
-        Origin::Config
+    /// A checker's answer means something even when it is silent: one that was
+    /// registered and never called says nobody scanned this chunk.
+    fn purpose(&self) -> Purpose {
+        Purpose::Check
     }
 
-    /// An external command runs with its cwd at the worktree root, so there
-    /// is nowhere to run one without a worktree, whatever the entry says.
-    fn requires_worktree(&self) -> bool {
-        true
+    fn rounds(&self) -> &'static [Round] {
+        &[Round::Investigation]
+    }
+
+    fn requires_checkout(&self) -> bool {
+        self.entry.requires_checkout
     }
 
     fn requires_build(&self) -> bool {
@@ -495,20 +400,10 @@ impl Tool for CommandTool {
     }
 
     fn execute(&self, arguments: &Value) -> Result<ToolOutput, ToolError> {
-        let checked = self.validated(arguments)?;
+        let checked = self.checked(arguments)?;
         self.refuse_bin_inside_worktree()?;
         let argv = self.argv(&checked)?;
         self.run(&argv)
-    }
-}
-
-/// `path` is a JSON string with the full path check applied on top.
-fn json_type(kind: ParamKind) -> &'static str {
-    match kind {
-        ParamKind::Path | ParamKind::String => "string",
-        ParamKind::Integer => "integer",
-        ParamKind::Number => "number",
-        ParamKind::Boolean => "boolean",
     }
 }
 
@@ -517,7 +412,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::config::{ParamSpec, SecuritySettings};
+    use crate::config::{ParamKind, ParamSpec, SecuritySettings};
 
     /// A worktree with one readable file, which is all these tests point at.
     fn worktree() -> tempfile::TempDir {
@@ -552,9 +447,63 @@ mod tests {
             bin: PathBuf::from(bin),
             args: args.iter().map(|arg| arg.to_string()).collect(),
             params,
-            requires_worktree: true,
+            requires_checkout: true,
             requires_build: false,
             timeout_ms: 5_000,
+        }
+    }
+
+    /// A command tool only ever asks the worktree where it is: the process it
+    /// spawns opens the files itself.
+    struct RootOnly {
+        root: PathBuf,
+    }
+
+    impl WorktreeSource for RootOnly {
+        fn root(&self) -> &Path {
+            &self.root
+        }
+
+        fn reach(&self) -> crate::worktree::Reach {
+            crate::worktree::Reach {
+                content: crate::worktree::Content::Checkout,
+                search: crate::worktree::Search::Regex,
+            }
+        }
+
+        fn open_in(&self, _run_dir: &Path) -> Result<(), crate::worktree::WorktreeError> {
+            Ok(())
+        }
+
+        fn head_sha(&self) -> Result<Option<String>, crate::worktree::WorktreeError> {
+            Ok(None)
+        }
+
+        fn supply(&self, _path: &str) -> Result<(), crate::worktree::WorktreeError> {
+            Ok(())
+        }
+
+        fn list_files(
+            &self,
+            _glob: &str,
+        ) -> Result<crate::worktree::Listing, crate::worktree::WorktreeError> {
+            Ok(crate::worktree::Listing::default())
+        }
+
+        fn read_file(
+            &self,
+            _path: &str,
+            _lines: Option<crate::worktree::LineRange>,
+        ) -> Result<String, crate::worktree::WorktreeError> {
+            Ok(String::new())
+        }
+
+        fn search(
+            &self,
+            _query: &str,
+            _glob: Option<&str>,
+        ) -> Result<Vec<crate::worktree::SearchHit>, crate::worktree::WorktreeError> {
+            Ok(Vec::new())
         }
     }
 
@@ -564,7 +513,9 @@ mod tests {
             CommandContext::new(
                 EnvPolicy::default(),
                 policy(root),
-                root.to_path_buf(),
+                Arc::new(RootOnly {
+                    root: root.to_path_buf(),
+                }) as Arc<dyn WorktreeSource>,
                 65_536,
                 Backoff::new(0),
             ),
@@ -595,7 +546,7 @@ mod tests {
 
     #[test]
     fn the_schema_shown_to_the_model_comes_from_params() {
-        let schema = tool().parameters();
+        let schema = tool().signature().schema();
         assert_eq!(schema["properties"]["path"]["type"], "string");
         assert_eq!(schema["required"][0], "path");
     }
@@ -729,7 +680,9 @@ mod tests {
             CommandContext::new(
                 EnvPolicy::default(),
                 policy(root.path()),
-                root.path().to_path_buf(),
+                Arc::new(RootOnly {
+                    root: root.path().to_path_buf(),
+                }) as Arc<dyn WorktreeSource>,
                 8,
                 Backoff::new(0),
             ),

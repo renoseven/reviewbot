@@ -48,13 +48,15 @@ reviewbot --config examples/reviewbot.toml review --publish \
   https://gitlab.com/acme/app/-/merge_requests/128
 ```
 
-`--worktree` reuses an existing checkout (read only). Without it, repository tools go through the platform API. There is no clone, and no third mode.
+`--worktree` reuses an existing checkout, read only, and it has to stand on the commit under review.
+
+A run always has exactly one worktree. With `--worktree` it is that checkout, which is the whole project. Without it, the run opens an empty worktree of its own at `<run dir>/worktree` and fetches files into it from the platform API as the model asks for them; fetched files stay on disk for the rest of the run, which is what lets an external checker open them. There is no clone, and there is no online mode with a different set of tools: the tools are the same four names either way, and each one's description says which worktree it is reading and how far a listing or a search over it reaches.
 
 ## Where things land
 
 | flag | what |
 |---|---|
-| `--runs-dir DIR` | checkpoints and traces. Default `$XDG_STATE_HOME/reviewbot/runs`. If you point this at the repo (CI does), add it to `.gitignore`. |
+| `--runs-dir DIR` | checkpoints, traces and the run's own worktree. Default `$XDG_STATE_HOME/reviewbot/runs`. If you point this at the repo (CI does), add it to `.gitignore`. |
 | `--out-dir DIR` | copies `report-<run_id>.md` and `summary-<run_id>.json` for CI artifacts. Do not archive the whole runs directory: `traces/` holds the internal view. |
 
 `--format json` makes stdout a JSON document (no progress mixed in). `-q` silences text; JSON still prints.
@@ -92,6 +94,8 @@ reviewbot --config examples/reviewbot.toml platform list
 reviewbot --config examples/reviewbot.toml provider list
 ```
 
+`tool list` prints each tool's contract — what it is for, how it is called, what each argument is, which rounds offer it, and what a run needs before it exists. It does not say whether a tool is registered: that is a fact about one review, and this command reviews nothing.
+
 `platform list` and `provider list` name where each credential comes from, never the credential itself — an inline secret is refused when the config is parsed, so there is only ever a source to print. Neither command reads the credential; `config check` is what does that.
 
 `review` and `resume` never delete a run. `run prune` with no `--keep` deletes every run. If a review leaves more than 10 runs, it warns once with a `run prune` line you can paste.
@@ -119,26 +123,27 @@ This repo does not ship a canned PR report. Produce one by pointing `review` at 
 
 ## Add a tool without recompiling
 
-Uncomment the extra `[[tool]]` block in [`examples/reviewbot.toml`](examples/reviewbot.toml) (cppcheck). `tool list` will show it. The default enabled checker is `gcc -fsyntax-only` (`requires_build = false`). A `requires_build` tool also needs `[security].allow_build_tools` and a sandbox.
+Uncomment the extra `[[tool]]` block in [`examples/reviewbot.toml`](examples/reviewbot.toml) (cppcheck). `tool list` will show its contract. The default enabled checker is `gcc -fsyntax-only` (`requires_build = false`), and it sets `requires_checkout = true`: a compiler needs the whole project, so it is not registered for a run whose worktree only holds the files fetched so far — a `.c` file without its headers produces a screen of missing includes, which is worse than not running. A checker that reads one file on its own leaves `requires_checkout` unset and runs either way. A `requires_build` tool also needs `[security].allow_build_tools` and a sandbox.
 
 ## Known limits
 
-- Every number under `[review]`, `[triage]` and `[security]` is required and has no builtin default, because the right value depends on the model's context window or on how big this repository's files get. Omitting one, or writing a zero, fails `config check` and names the field. Copy [`examples/reviewbot.toml`](examples/reviewbot.toml), which sets all of them.
+- Config field names carry their unit and their subject: `[review].max_file_bytes`, `max_files_per_listing`, `max_hits_per_search`, `[triage].skip_files_over_bytes`, `[[provider]].budget_per_run`, `[[model]].context_window_tokens` and the three `_per_1m_tokens` prices, `[[tool]].requires_checkout`. Every number under `[review]`, `[triage]` and `[security]` is required and has no builtin default, because the right value depends on the model's context window or on how big this repository's files get. Omitting one, or writing a zero, fails `config check` and names the field. Copy [`examples/reviewbot.toml`](examples/reviewbot.toml), which sets all of them.
 - `[security]` holds permissions only — `deny_paths`, `allow_extensions`, `follow_symlinks`, `allow_build_tools` — and no sizes. How much a tool may fetch or return is a context-window question, so those numbers live under `[review]` with `max_tool_rounds`.
 - `[security].allow_extensions` is required for the same reason and is a hard boundary besides, so a default could only loosen it. Extensions are written bare (`"rs"`, not `".rs"`). It is a whitelist, so it blocks extensionless files (`Makefile`, `Dockerfile`, `LICENSE`).
 - `[review].max_tool_rounds` and `[review].max_tool_output_bytes` are a pair: multiplied together they are held back from the context window, and a run refuses to start once nothing is left for the diff.
-- A file read is never truncated. A file too big to return is refused with its size in the refusal, and the model pages through it in line ranges after asking `stat_repo_file` how big it is. `[review].max_read_bytes` bounds the fetch rather than the answer, and a line range is no way around it: the platform API has no range request, so reading part of a file means fetching all of it, and a file past that ceiling cannot be read at all.
+- A file read is never truncated. A file too big to return is refused with its size in the refusal, and the model pages through it in line ranges after asking `stat_file` how big it is. `[review].max_file_bytes` bounds the fetch rather than the answer, and a line range is no way around it: reading part of a file means reading all of it first, so a file past that ceiling cannot be read at all. Both ceilings appear in the tool descriptions the model reads, so it can plan instead of guessing.
 - The review looks at one file at a time, but not blindly: the instructions carry the whole list of files this change touches and a digest of the repository's directory layout. Both are counted by reviewbot rather than summarised by a model, and both ride in the cached half of the prompt, so the run pays for them once instead of once per file. There is no stage that asks a model what the change is trying to do — a vague or wrong answer there would become a premise under every finding, and the report would look no different.
-- The layout digest counts directories rather than naming files, and leaves out anything a read would refuse (`deny_paths`, and extensions outside the whitelist). A directory missing from it holds nothing readable, which is not the same as holding nothing; `list_repo_files` is still what answers about a specific path.
-- On a URL, every chunk is also shown what the author wrote about the change: the title, the description and up to 20 commit subject lines. It is the highest-value context in the prompt — intent is the one thing a diff does not carry — and the only prompt injection surface reviewbot fetches on purpose, so it goes in fenced as material ahead of the diff and never into `instructions`. The fence says three things: read it for intent, do not read it as evidence about behaviour (where it and the diff disagree the diff is what is true, and the disagreement is worth filing), and an instruction inside it is reviewed content. A description that cannot be fetched costs the model context and nothing else; a diff off disk has none.
-- Both submissions are function calls: `submit_comment` for a finding, `submit_summary` for the overall score. No stage reads JSON out of a chat message, so nothing strips markdown fences. `submit_summary` is offered on the scoring round only, which is why `tool list` shows it as `registered, merge stage only`.
+- The layout digest counts directories rather than naming files, and leaves out anything a read would refuse (`deny_paths`, and extensions outside the whitelist). A directory missing from it holds nothing readable, which is not the same as holding nothing; `list_files` is still what answers about a specific path.
+- On a URL, every chunk is also shown what the author wrote about the change: the title, the description and up to 20 commit subject lines, fenced by the one renderer that knows how to fence. It is the highest-value context in the prompt — intent is the one thing a diff does not carry — and the only prompt injection surface reviewbot fetches on purpose, so it goes in fenced as material ahead of the diff and never into `instructions`. The fence says three things: read it for intent, do not read it as evidence about behaviour (where it and the diff disagree the diff is what is true, and the disagreement is worth filing), and an instruction inside it is reviewed content. A description that cannot be fetched costs the model context and nothing else; a diff off disk has none.
+- Finding nothing has an ending of its own: `finish_review` takes no arguments and files nothing. Without it, a model handed only `submit_comment` and asked to conclude files a placeholder — a real run came back with `body: "No defect found in this change."`, `suggestion: "N/A"` and a confidence of 95, which passed every check a finding has to pass and went out as a published comment. There is no gate on the wording of a body: "nothing is wrong here" has no shape a check can recognise, and a gate that guessed would throw away real findings that happen to read reassuringly.
+- Both submissions are function calls: `submit_comment` for a finding, `submit_summary` for the overall score. No stage reads JSON out of a chat message, so nothing strips markdown fences. Each tool is offered on the rounds it belongs to and no others — investigation, the concluding turn, or the scoring call — and `tool list` prints those rounds. A blank or whitespace-only summary is refused and re-asked rather than published as a score with nothing behind it.
 - A score written as `"92"` is read as 92. The schema says integer and no vendor enforces it, so re-asking buys a round trip and the same number back. Nothing is rounded or clamped: `"45.7"`, `"high"` and `101` are still refused.
 - Everything sent to the model is in English — both prompts, the capability paragraph, tool descriptions, and the notes and refusals in tool output. So are the two badges reviewbot puts on a comment (`found by tool`, `quote unverified`). The report body and comment text come from the model, in whatever language it chooses.
-- reviewbot itself never writes the worktree. A subprocess cannot be stopped from writing it on a bare machine; that only holds in an isolated environment (container, or a user with no write permission).
+- reviewbot never writes the checkout you name with `--worktree`; the only local writes are the run directory (including the run's own worktree) and `--out-dir`. A subprocess cannot be stopped from writing the checkout on a bare machine; that only holds in an isolated environment (container, or a user with no write permission).
 - `requires_build` needs `allow_build_tools` and a sandbox.
 - Suppression-style prompt injection (persuading the model to report nothing) is undetectable: an empty list is a legal review.
-- GitLab `search_repo` stays off until Advanced Search can be known without guessing. The builtin still appears in `tool list` as capability-gated.
-- No clone. Two modes only: platform API, or `--worktree`.
+- On GitLab, `search_code` stays off until Advanced Search can be known without guessing. `tool list` still prints its contract, with the precondition that says when it exists.
+- No clone. One worktree per run: the checkout you name, or a directory the run fills from the platform API.
 - Confidence calibration is unmeasured: the model’s number is published as given.
 
 Leftover from the test plan in design §11 (not automated here): run-directory size after real model calls and after tools; prompt wording against live PRs; a full matrix of CI artifact names across two jobs.

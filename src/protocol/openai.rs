@@ -715,7 +715,7 @@ mod tests {
 
     #[test]
     fn reasoning_effort_is_omitted_from_the_wire_when_unset() {
-        let body = serde_json::to_value(&VendorRequest::from(&sample_request())).unwrap();
+        let body = serde_json::to_value(VendorRequest::from(&sample_request())).unwrap();
         assert!(body.get("reasoning").is_none());
     }
 
@@ -723,7 +723,7 @@ mod tests {
     fn reasoning_effort_is_sent_when_the_model_entry_sets_it() {
         let mut request = sample_request();
         request.reasoning_effort = Some("low".to_string());
-        let body = serde_json::to_value(&VendorRequest::from(&request)).unwrap();
+        let body = serde_json::to_value(VendorRequest::from(&request)).unwrap();
         assert_eq!(body["reasoning"]["effort"], "low");
     }
 

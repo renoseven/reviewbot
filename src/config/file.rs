@@ -47,16 +47,16 @@ pub struct ReviewSettings {
     pub max_tool_rounds: u32,
     /// How many paths one listing may show before it says how many remain.
     #[serde(default)]
-    pub max_files_listed: u32,
+    pub max_files_per_listing: u32,
     /// How many hits one search may show.
     #[serde(default)]
-    pub max_search_hits: u32,
+    pub max_hits_per_search: u32,
     /// The most of one file a read-a-file tool may fetch. It bounds the
     /// fetch rather than the answer: the platform API has no range request,
     /// so reading part of a file means downloading all of it, and a file
     /// past this cannot be read at all, in whole or in part.
     #[serde(default)]
-    pub max_read_bytes: u64,
+    pub max_file_bytes: u64,
     /// What one tool answer may hand back, and what all the tool output of
     /// one round may add up to. Paired with `max_tool_rounds`: the two
     /// multiplied together are held back from the context window.
@@ -71,9 +71,9 @@ impl ReviewSettings {
     pub fn for_tests() -> Self {
         Self {
             max_tool_rounds: 12,
-            max_files_listed: 200,
-            max_search_hits: 50,
-            max_read_bytes: 262_144,
+            max_files_per_listing: 200,
+            max_hits_per_search: 50,
+            max_file_bytes: 262_144,
             max_tool_output_bytes: 32_768,
         }
     }
@@ -93,7 +93,7 @@ pub struct TriageSettings {
     #[serde(default = "default_true")]
     pub skip_generated: bool,
     #[serde(default)]
-    pub skip_over_bytes: u64,
+    pub skip_files_over_bytes: u64,
 }
 
 impl Default for TriageSettings {
@@ -102,7 +102,7 @@ impl Default for TriageSettings {
             max_chunk_tokens: 0,
             skip_paths: Vec::new(),
             skip_generated: default_true(),
-            skip_over_bytes: 0,
+            skip_files_over_bytes: 0,
         }
     }
 }
@@ -120,7 +120,7 @@ impl TriageSettings {
             max_chunk_tokens: 24_000,
             skip_paths: Vec::new(),
             skip_generated: true,
-            skip_over_bytes: 262_144,
+            skip_files_over_bytes: 262_144,
         }
     }
 }
@@ -171,8 +171,9 @@ pub struct Provider {
     pub base_url: String,
     pub api_key: String,
     pub currency: String,
-    /// `-1` unlimited, `0` spend nothing, positive is the cap. Required.
-    pub budget: f64,
+    /// The ceiling for one run, not a monthly allowance: `-1` unlimited,
+    /// `0` spend nothing, positive is the cap. Required.
+    pub budget_per_run: f64,
 }
 
 /// A model entry: the real vendor model name plus its prices and limits.
@@ -185,11 +186,11 @@ pub struct Model {
     #[serde(default)]
     pub default: bool,
     pub provider: String,
-    pub input_per_1m: f64,
+    pub input_per_1m_tokens: f64,
     #[serde(default)]
-    pub cached_input_per_1m: Option<f64>,
-    pub output_per_1m: f64,
-    pub context_window: u32,
+    pub cached_input_per_1m_tokens: Option<f64>,
+    pub output_per_1m_tokens: f64,
+    pub context_window_tokens: u32,
     pub max_output_tokens: u32,
     /// Sent as `reasoning.effort`. Omit to leave the vendor default.
     #[serde(default)]
@@ -259,8 +260,12 @@ pub struct ToolEntry {
     #[serde(default)]
     pub args: Vec<String>,
     pub params: BTreeMap<String, ParamSpec>,
+    /// Whether this checker needs a whole checkout on disk. The run always
+    /// has a worktree, so "does it need one" says nothing; what a compiler,
+    /// a history walk or a cross-file analysis needs is the whole project,
+    /// and a worktree holding the files fetched so far is not that.
     #[serde(default)]
-    pub requires_worktree: bool,
+    pub requires_checkout: bool,
     #[serde(default)]
     pub requires_build: bool,
     #[serde(default = "default_timeout_ms")]

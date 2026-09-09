@@ -107,7 +107,7 @@ pub fn count_runs(runs_dir: &Path) -> Result<usize, RecordError> {
 /// Newest first by directory mtime. Success and failure sit in one queue.
 pub fn runs_by_mtime(runs_dir: &Path) -> Result<Vec<PathBuf>, RecordError> {
     let mut dirs = list_run_dirs(runs_dir)?;
-    dirs.sort_by(|left, right| mtime(right).cmp(&mtime(left)));
+    dirs.sort_by_key(|directory| std::cmp::Reverse(mtime(directory)));
     Ok(dirs)
 }
 

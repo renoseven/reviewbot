@@ -25,30 +25,32 @@ impl TokenUsage {
 /// Per million token prices, in the currency of the model's provider.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Price {
-    pub input_per_1m: f64,
-    pub cached_input_per_1m: Option<f64>,
-    pub output_per_1m: f64,
+    pub input_per_1m_tokens: f64,
+    pub cached_input_per_1m_tokens: Option<f64>,
+    pub output_per_1m_tokens: f64,
 }
 
 impl Price {
     pub fn from_model(model: &Model) -> Self {
         Self {
-            input_per_1m: model.input_per_1m,
-            cached_input_per_1m: model.cached_input_per_1m,
-            output_per_1m: model.output_per_1m,
+            input_per_1m_tokens: model.input_per_1m_tokens,
+            cached_input_per_1m_tokens: model.cached_input_per_1m_tokens,
+            output_per_1m_tokens: model.output_per_1m_tokens,
         }
     }
 
-    /// Cached input is billed at `cached_input_per_1m` when the model entry
+    /// Cached input is billed at `cached_input_per_1m_tokens` when the model entry
     /// gives one; without one it costs the same as fresh input.
     pub fn cost(&self, usage: &TokenUsage) -> f64 {
         const PER_MILLION: f64 = 1_000_000.0;
         let cached = usage.cached_input_tokens.min(usage.input_tokens);
         let fresh = usage.input_tokens - cached;
-        let cached_rate = self.cached_input_per_1m.unwrap_or(self.input_per_1m);
-        (fresh as f64 * self.input_per_1m
+        let cached_rate = self
+            .cached_input_per_1m_tokens
+            .unwrap_or(self.input_per_1m_tokens);
+        (fresh as f64 * self.input_per_1m_tokens
             + cached as f64 * cached_rate
-            + usage.output_tokens as f64 * self.output_per_1m)
+            + usage.output_tokens as f64 * self.output_per_1m_tokens)
             / PER_MILLION
     }
 }
@@ -59,9 +61,9 @@ mod tests {
 
     fn price() -> Price {
         Price {
-            input_per_1m: 2.0,
-            cached_input_per_1m: Some(0.2),
-            output_per_1m: 3.0,
+            input_per_1m_tokens: 2.0,
+            cached_input_per_1m_tokens: Some(0.2),
+            output_per_1m_tokens: 3.0,
         }
     }
 
@@ -89,9 +91,9 @@ mod tests {
     #[test]
     fn a_model_without_a_cached_price_pays_full_rate() {
         let price = Price {
-            input_per_1m: 8.0,
-            cached_input_per_1m: None,
-            output_per_1m: 24.0,
+            input_per_1m_tokens: 8.0,
+            cached_input_per_1m_tokens: None,
+            output_per_1m_tokens: 24.0,
         };
         let usage = TokenUsage {
             input_tokens: 1_000_000,

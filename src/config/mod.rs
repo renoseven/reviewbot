@@ -32,18 +32,18 @@ pub const KNOWN_PROTOCOLS: [&str; 1] = ["openai"];
 pub const KNOWN_REASONING_EFFORTS: [&str; 7] =
     ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
-/// Names `tool` compiles in. A `[[tool]]` entry may not collide with them.
-pub const BUILTIN_TOOL_NAMES: [&str; 10] = [
+/// Names `tool` compiles in. A `[[tool]]` entry may not collide with them,
+/// which makes this list a security boundary rather than documentation: a name
+/// missing from it is a builtin a config entry could shadow. A test asserts it
+/// equals what a fully equipped run registers, because it has drifted before.
+pub const BUILTIN_TOOL_NAMES: [&str; 7] = [
     "submit_comment",
+    "finish_review",
     "submit_summary",
-    "stat_repo_file",
-    "read_repo_file",
-    "list_repo_files",
-    "search_repo",
-    "stat_worktree_file",
-    "read_worktree_file",
-    "list_worktree_files",
-    "search_worktree",
+    "list_files",
+    "stat_file",
+    "read_file",
+    "search_code",
 ];
 
 /// What the startup check assumes the prompt body and the tool schemas
@@ -60,6 +60,7 @@ pub const BUILTIN_TOOL_NAMES: [&str; 10] = [
 pub const PROMPT_SKELETON_TOKENS: u32 = 4_096;
 
 /// Placeholders `[[tool]].args` may use without declaring them in `params`.
+/// One run, one worktree, so there is one path worth naming.
 const BUILTIN_PLACEHOLDERS: [&str; 1] = ["worktree"];
 
 #[derive(Debug, thiserror::Error)]
@@ -71,10 +72,15 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// The parser's own error is boxed: it is a hundred bytes of span and
+    /// message, and left inline it makes every `Result<_, Error>` in the crate
+    /// wide enough for clippy to object. Nothing suppresses that lint here —
+    /// there is not one suppression in this repository, on purpose — so the
+    /// type is small instead.
     #[error("cannot parse config at {path}: {source}")]
     Parse {
         path: PathBuf,
-        source: toml::de::Error,
+        source: Box<toml::de::Error>,
     },
     #[error("duplicate {table} name {name:?}")]
     DuplicateName { table: &'static str, name: String },
@@ -103,20 +109,20 @@ pub enum ConfigError {
         allowed: String,
     },
     #[error(
-        "model {model:?} has context_window {context_window} but needs more than max_output_tokens {max_output_tokens} plus {skeleton} tokens of prompt skeleton"
+        "model {model:?} has context_window_tokens {context_window_tokens} but needs more than max_output_tokens {max_output_tokens} plus {skeleton} tokens of prompt skeleton"
     )]
     ContextTooSmall {
         model: String,
-        context_window: u32,
+        context_window_tokens: u32,
         max_output_tokens: u32,
         skeleton: u32,
     },
     #[error(
-        "model {model:?} has context_window {context_window}, and holding {allowance} tokens back for {rounds} rounds of tool output leaves {left} for the diff; lower [review].max_tool_rounds or [review].max_tool_output_bytes"
+        "model {model:?} has context_window_tokens {context_window_tokens}, and holding {allowance} tokens back for {rounds} rounds of tool output leaves {left} for the diff; lower [review].max_tool_rounds or [review].max_tool_output_bytes"
     )]
     ToolAllowanceTooLarge {
         model: String,
-        context_window: u32,
+        context_window_tokens: u32,
         rounds: u32,
         allowance: u32,
         left: u32,
@@ -255,7 +261,7 @@ impl Settings {
         })?;
         let config: Config = toml::from_str(&text).map_err(|source| ConfigError::Parse {
             path: path.clone(),
-            source,
+            source: Box::new(source),
         })?;
         let settings = Settings {
             config,
@@ -390,13 +396,13 @@ impl Config {
                     known: KNOWN_PROTOCOLS.join(", "),
                 });
             }
-            if provider.budget < 0.0 && provider.budget != -1.0 {
+            if provider.budget_per_run < 0.0 && provider.budget_per_run != -1.0 {
                 return Err(ConfigError::InvalidBudget {
                     provider: provider.name.clone(),
-                    value: provider.budget,
+                    value: provider.budget_per_run,
                 });
             }
-            if provider.budget == -1.0 {
+            if provider.budget_per_run == -1.0 {
                 tracing::debug!(provider = %provider.name, "no budget ceiling for this run");
             }
         }
@@ -425,10 +431,10 @@ impl Config {
             let floor = model
                 .max_output_tokens
                 .saturating_add(PROMPT_SKELETON_TOKENS);
-            if model.context_window <= floor {
+            if model.context_window_tokens <= floor {
                 return Err(ConfigError::ContextTooSmall {
                     model: model.name.clone(),
-                    context_window: model.context_window,
+                    context_window_tokens: model.context_window_tokens,
                     max_output_tokens: model.max_output_tokens,
                     skeleton: PROMPT_SKELETON_TOKENS,
                 });
@@ -493,19 +499,22 @@ impl Config {
                 u64::from(self.review.max_tool_rounds),
             ),
             (
-                "[review].max_files_listed",
-                u64::from(self.review.max_files_listed),
+                "[review].max_files_per_listing",
+                u64::from(self.review.max_files_per_listing),
             ),
             (
-                "[review].max_search_hits",
-                u64::from(self.review.max_search_hits),
+                "[review].max_hits_per_search",
+                u64::from(self.review.max_hits_per_search),
             ),
             (
                 "[triage].max_chunk_tokens",
                 u64::from(self.triage.max_chunk_tokens),
             ),
-            ("[triage].skip_over_bytes", self.triage.skip_over_bytes),
-            ("[review].max_read_bytes", self.review.max_read_bytes),
+            (
+                "[triage].skip_files_over_bytes",
+                self.triage.skip_files_over_bytes,
+            ),
+            ("[review].max_file_bytes", self.review.max_file_bytes),
             (
                 "[review].max_tool_output_bytes",
                 self.review.max_tool_output_bytes,
@@ -670,14 +679,14 @@ mod tests {
     const MINIMAL: &str = r#"
 [review]
 max_tool_rounds = 12
-max_files_listed = 200
-max_search_hits = 50
-max_read_bytes = 262144
+max_files_per_listing = 200
+max_hits_per_search = 50
+max_file_bytes = 262144
 max_tool_output_bytes = 32768
 
 [triage]
 max_chunk_tokens = 24000
-skip_over_bytes = 262144
+skip_files_over_bytes = 262144
 
 [security]
 allow_extensions = ["rs", "toml"]
@@ -688,14 +697,14 @@ protocol = "openai"
 base_url = "https://api.deepseek.com"
 api_key = "DEEPSEEK_API_KEY"
 currency = "CNY"
-budget = 10.0
+budget_per_run = 10.0
 
 [[model]]
 name = "deepseek-v4-flash"
 provider = "deepseek"
-input_per_1m = 2.0
-output_per_1m = 3.0
-context_window = 131072
+input_per_1m_tokens = 2.0
+output_per_1m_tokens = 3.0
+context_window_tokens = 131072
 max_output_tokens = 4096
 "#;
 
@@ -719,7 +728,7 @@ protocol = "openai"
 base_url = "https://other.example.com"
 api_key = "OTHER_KEY"
 currency = "USD"
-budget = 1.0
+budget_per_run = 1.0
 "#,
         );
         assert!(matches!(
@@ -740,9 +749,9 @@ budget = 1.0
 name = "deepseek-v4-pro"
 alias = "deepseek-v4-flash"
 provider = "deepseek"
-input_per_1m = 4.0
-output_per_1m = 12.0
-context_window = 131072
+input_per_1m_tokens = 4.0
+output_per_1m_tokens = 12.0
+context_window_tokens = 131072
 max_output_tokens = 8192
 "#,
         );
@@ -800,14 +809,14 @@ api_token = "GITHUB_TOKEN"
 
     #[test]
     fn negative_budgets_other_than_minus_one_fail() {
-        let text = MINIMAL.replace("budget = 10.0", "budget = -2.0");
+        let text = MINIMAL.replace("budget_per_run = 10.0", "budget_per_run = -2.0");
         assert!(matches!(
             parse(&text).validate(),
             Err(ConfigError::InvalidBudget { .. })
         ));
-        let unlimited = MINIMAL.replace("budget = 10.0", "budget = -1.0");
+        let unlimited = MINIMAL.replace("budget_per_run = 10.0", "budget_per_run = -1.0");
         parse(&unlimited).validate().expect("-1 is unlimited");
-        let nothing = MINIMAL.replace("budget = 10.0", "budget = 0.0");
+        let nothing = MINIMAL.replace("budget_per_run = 10.0", "budget_per_run = 0.0");
         parse(&nothing).validate().expect("0 spends nothing");
     }
 
@@ -845,11 +854,17 @@ api_token = "GITHUB_TOKEN"
     fn every_sizing_number_is_required_rather_than_defaulted() {
         for (field, line) in [
             ("[review].max_tool_rounds", "max_tool_rounds = 12"),
-            ("[review].max_files_listed", "max_files_listed = 200"),
-            ("[review].max_search_hits", "max_search_hits = 50"),
+            (
+                "[review].max_files_per_listing",
+                "max_files_per_listing = 200",
+            ),
+            ("[review].max_hits_per_search", "max_hits_per_search = 50"),
             ("[triage].max_chunk_tokens", "max_chunk_tokens = 24000"),
-            ("[triage].skip_over_bytes", "skip_over_bytes = 262144"),
-            ("[review].max_read_bytes", "max_read_bytes = 262144"),
+            (
+                "[triage].skip_files_over_bytes",
+                "skip_files_over_bytes = 262144",
+            ),
+            ("[review].max_file_bytes", "max_file_bytes = 262144"),
             (
                 "[review].max_tool_output_bytes",
                 "max_tool_output_bytes = 32768",
@@ -883,7 +898,10 @@ api_token = "GITHUB_TOKEN"
 
     #[test]
     fn context_window_must_leave_room_for_output_and_skeleton() {
-        let text = MINIMAL.replace("context_window = 131072", "context_window = 4096");
+        let text = MINIMAL.replace(
+            "context_window_tokens = 131072",
+            "context_window_tokens = 4096",
+        );
         assert!(matches!(
             parse(&text).validate(),
             Err(ConfigError::ContextTooSmall { .. })
@@ -948,7 +966,7 @@ params.flag = { type = "string" }
         text.push_str(
             r#"
 [[tool]]
-name = "search_repo"
+name = "search_code"
 description = "shadows the builtin"
 bin = "/usr/bin/rg"
 args = ["{query}"]
@@ -969,9 +987,9 @@ params.query = { type = "string", pattern = ".*" }
 [[model]]
 name = "deepseek-v4-pro"
 provider = "deepseek"
-input_per_1m = 4.0
-output_per_1m = 12.0
-context_window = 131072
+input_per_1m_tokens = 4.0
+output_per_1m_tokens = 12.0
+context_window_tokens = 131072
 max_output_tokens = 8192
 "#,
         );

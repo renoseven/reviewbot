@@ -260,7 +260,7 @@ fn run_list_text_aligns_spent_with_currency_and_utc() {
             "fingerprint": "fp",
             "budget_limit": 10.0,
             "currency": "CNY",
-            "price": {"input_per_1m": 3.0, "cached_input_per_1m": 0.1, "output_per_1m": 9.0},
+            "price": {"input_per_1m_tokens": 3.0, "cached_input_per_1m_tokens": 0.1, "output_per_1m_tokens": 9.0},
             "spent": 0.0316,
             "publish": false,
             "completed_stages": ["input", "triage", "review", "merge", "publish"],
@@ -303,13 +303,24 @@ fn tool_list_exits_zero_on_a_valid_config() {
     assert!(output.status.success(), "{output:?}");
     assert!(output.stderr.is_empty(), "success writes no stderr");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("builtin"), "{stdout}");
-    assert!(stdout.contains("search_repo"), "{stdout}");
-    assert!(stdout.contains("gcc"), "{stdout}");
-    assert!(stdout.contains("not registered, no URL"), "{stdout}");
+    // Grouped by what a tool is for, and each row is a contract: the call, the
+    // description, the rounds that offer it, what a run needs first.
+    for heading in ["content", "check", "delivery"] {
+        assert!(stdout.contains(heading), "{stdout}");
+    }
+    assert!(stdout.contains("search_code(query, [glob])"), "{stdout}");
+    assert!(
+        stdout.contains("read_file(path, [first_line, last_line])"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("gcc(path)"), "{stdout}");
     assert!(stdout.contains("Submit one finding"), "{stdout}");
-    assert!(!stdout.contains("this invocation"), "{stdout}");
-    assert!(!stdout.contains("params:"), "{stdout}");
+    assert!(stdout.contains("rounds    investigation"), "{stdout}");
+    assert!(stdout.contains("rounds    scoring"), "{stdout}");
+    assert!(stdout.contains("needs     the worktree"), "{stdout}");
+    // Whether a tool registered is a fact about one review, and this command
+    // reviews nothing.
+    assert!(!stdout.contains("registered"), "{stdout}");
 }
 
 #[test]

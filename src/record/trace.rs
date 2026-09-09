@@ -23,9 +23,35 @@ pub struct Trace {
     /// Chain of thought. Internal only; the published view omits it.
     #[serde(default)]
     pub reasoning: String,
-    /// Parsing, out-of-range removal, alignment offsets, quote checks.
-    pub checks: Vec<String>,
+    /// What each stage wrote down about this comment: how the conversation
+    /// went, what was dropped, how far a line moved, whether a quotation held
+    /// up. Every line says which stage wrote it, because a reader has to be
+    /// able to tell "the model only looked half way" from "the line number
+    /// moved by one" — those say very different things about the same comment.
+    pub checks: Vec<Check>,
     pub usage: TokenUsage,
+}
+
+/// One line of a stage's account of a comment, tagged with the stage that
+/// wrote it.
+///
+/// The tag is a field rather than a prefix on the text: rerunning a stage has
+/// to clear what that stage said last time and nothing else, and matching a
+/// string prefix to decide would make the tag part of the note's wording,
+/// where the next edit breaks the clearing.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct Check {
+    pub stage: String,
+    pub note: String,
+}
+
+impl Check {
+    pub fn new(stage: &str, note: impl Into<String>) -> Self {
+        Self {
+            stage: stage.to_string(),
+            note: note.into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -60,7 +86,7 @@ pub struct PublishedView {
     pub context_files: Vec<ContextRange>,
     pub prompt: String,
     pub model_output: String,
-    pub checks: Vec<String>,
+    pub checks: Vec<Check>,
     pub usage: TokenUsage,
 }
 
@@ -81,6 +107,36 @@ impl Trace {
 
     pub fn internal(&self) -> InternalView<'_> {
         self
+    }
+
+    /// Write one line down, in the name of the stage writing it.
+    pub fn note(&mut self, stage: &str, note: impl Into<String>) {
+        self.checks.push(Check::new(stage, note));
+    }
+
+    /// Whether this stage already said this. Used where a note would otherwise
+    /// be written twice by the same stage.
+    pub fn has_note(&self, stage: &str, note: &str) -> bool {
+        self.checks
+            .iter()
+            .any(|check| check.stage == stage && check.note == note)
+    }
+
+    /// Forget what one stage said, because it is about to say it again. Only
+    /// that stage: the account of the conversation belongs to `review`, and a
+    /// second `merge` used to wipe it, leaving a comment whose evidence looked
+    /// like it had never been investigated at all.
+    pub fn forget(&mut self, stage: &str) {
+        self.checks.retain(|check| check.stage != stage);
+    }
+
+    /// What one stage wrote, in order.
+    pub fn notes_by(&self, stage: &str) -> Vec<&str> {
+        self.checks
+            .iter()
+            .filter(|check| check.stage == stage)
+            .map(|check| check.note.as_str())
+            .collect()
     }
 
     /// `max_tool_output_bytes` bounds each tool call's output; the prompt

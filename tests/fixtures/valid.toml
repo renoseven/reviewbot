@@ -1,8 +1,8 @@
 [review]
 max_tool_rounds = 12
-max_files_listed = 200
-max_search_hits = 50
-max_read_bytes = 262144
+max_files_per_listing = 200
+max_hits_per_search = 50
+max_file_bytes = 262144
 max_tool_output_bytes = 65536
 
 [[provider]]
@@ -11,25 +11,25 @@ protocol = "openai"
 base_url = "https://api.deepseek.com"
 api_key = "DEEPSEEK_API_KEY"
 currency = "CNY"
-budget = 10.0
+budget_per_run = 10.0
 
 [[model]]
 name = "deepseek-v4-flash"
 default = true
 provider = "deepseek"
-input_per_1m = 3.0
-cached_input_per_1m = 0.10
-output_per_1m = 9.0
-context_window = 1000000
+input_per_1m_tokens = 3.0
+cached_input_per_1m_tokens = 0.10
+output_per_1m_tokens = 9.0
+context_window_tokens = 1000000
 max_output_tokens = 384000
 
 [[model]]
 name = "deepseek-v4-pro"
 provider = "deepseek"
-input_per_1m = 9.0
-cached_input_per_1m = 0.30
-output_per_1m = 27.0
-context_window = 1000000
+input_per_1m_tokens = 9.0
+cached_input_per_1m_tokens = 0.30
+output_per_1m_tokens = 27.0
+context_window_tokens = 1000000
 max_output_tokens = 384000
 
 [[platform]]
@@ -39,7 +39,7 @@ api_token = "GITLAB_TOKEN"
 
 [triage]
 max_chunk_tokens = 24000
-skip_over_bytes = 262144
+skip_files_over_bytes = 262144
 skip_paths = ["**/*.lock", "vendor/**"]
 
 [security]
@@ -52,5 +52,5 @@ description = "compile one C file with warnings, no object file (gcc -fsyntax-on
 bin = "/usr/bin/gcc"
 args = ["-Wall", "-Wextra", "-fsyntax-only", "--", "{path}"]
 params.path = { type = "path" }
-requires_worktree = true
+requires_checkout = true
 timeout_ms = 60000

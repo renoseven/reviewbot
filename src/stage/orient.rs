@@ -28,6 +28,7 @@ use std::collections::BTreeMap;
 use crate::domain::{ChangeSet, DEV_NULL, FileChange};
 use crate::security::PathPolicy;
 
+use super::prompt::{CappedList, Keep, Overflow};
 use super::{StageContext, StageError};
 
 /// How many changed files the manifest names before it starts counting. A
@@ -89,15 +90,15 @@ fn manifest(changeset: &ChangeSet) -> String {
          diff in front of you:",
         changeset.files.len()
     )];
-    for file in changeset.files.iter().take(MANIFEST_FILES) {
-        lines.push(format!("- {}", describe(file)));
-    }
-    if changeset.files.len() > MANIFEST_FILES {
-        lines.push(format!(
-            "- ... and {} more files",
-            changeset.files.len() - MANIFEST_FILES
-        ));
-    }
+    lines.push(
+        CappedList::new(
+            changeset.files.iter().map(describe).collect(),
+            MANIFEST_FILES,
+            Keep::First,
+            Overflow::Counted("files"),
+        )
+        .render(),
+    );
     lines.push(String::new());
     lines.push(
         "Two things follow. A file on this list already carries its change at the commit you \
@@ -185,22 +186,24 @@ fn digest(paths: Vec<String>, complete: bool, policy: &PathPolicy) -> String {
             .cmp(&left.1.files)
             .then_with(|| left.0.cmp(&right.0))
     });
-    let shown = ranked.len().min(LAYOUT_DIRS);
 
     let mut lines = vec![format!(
         "The shape of this repository at the commit under review: the {} you could read, \
          counted by directory to {LAYOUT_DEPTH} levels. Counts include subdirectories.",
         files(readable.len())
     )];
-    for (path, directory) in ranked.iter().take(shown) {
-        lines.push(format!("- {path} — {}", directory.describe()));
-    }
-    if ranked.len() > shown {
-        lines.push(format!(
-            "- ... and {} more directories",
-            ranked.len() - shown
-        ));
-    }
+    lines.push(
+        CappedList::new(
+            ranked
+                .iter()
+                .map(|(path, directory)| format!("{path} — {}", directory.describe()))
+                .collect(),
+            LAYOUT_DIRS,
+            Keep::First,
+            Overflow::Counted("directories"),
+        )
+        .render(),
+    );
     lines.push(String::new());
     lines.push(
         "This is a digest, not a listing, and it is the answer to \"where would that live\" \
@@ -219,19 +222,16 @@ fn digest(paths: Vec<String>, complete: bool, policy: &PathPolicy) -> String {
     lines.join("\n")
 }
 
-/// The repository first: it is the commit under review, and the prompt tells
-/// the model to judge against that rather than against the disk. The tree is
-/// cached for the run either way, so this is the same fetch the first
-/// `list_*_files` would have paid for.
+/// Straight through this run's worktree, which is the same listing the
+/// model's own first `list_files` would have paid for — a checkout scans the
+/// disk, a fetched worktree asks the platform about the reviewed commit. An
+/// empty worktree has no shape to describe.
 fn tree(context: &StageContext<'_>) -> Result<Option<(Vec<String>, bool)>, StageError> {
-    if let Some(platform) = &context.adapters.platform {
-        let listing = platform.repo_source().list_files("**")?;
-        return Ok(Some((listing.paths, listing.complete)));
+    if !context.adapters.worktree.reach().has_content() {
+        return Ok(None);
     }
-    if let Some(disk) = &context.adapters.worktree {
-        return Ok(Some((disk.list_files("**")?, true)));
-    }
-    Ok(None)
+    let listing = context.adapters.worktree.list_files("**")?;
+    Ok(Some((listing.paths, listing.complete)))
 }
 
 /// `src/net/http.c` at two levels is `src/` and `src/net/`. The file's own

@@ -1,0 +1,1 @@
+The investigation tools are no longer available. Submitting is: call submit_comment once per finding, or finish_review if you have none. Use what you already have — do not file a placeholder finding to end the round, and do not call anything else.

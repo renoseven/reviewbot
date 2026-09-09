@@ -232,16 +232,16 @@ fn publish_run_inner(settings: &Settings, run_id: &str) -> Result<RunResult, Err
         Publish::run(&mut context, &publish_input)?
     };
     recorder.record_spend(budget.spent())?;
-    Ok(run_result_from(
-        recorder.meta(),
-        &merged,
-        &plan,
-        &reviewed,
-        published.published,
-        budget.spent(),
-        budget.ceiling(),
-        recorder.run_dir(),
-    ))
+    Ok(Finished {
+        meta: recorder.meta(),
+        merged: &merged,
+        plan: &plan,
+        reviewed: &reviewed,
+        published: published.published,
+        budget: &budget,
+        run_dir: recorder.run_dir(),
+    }
+    .result())
 }
 
 /// Rewrite `report.md` / `summary.json` (and `--out-dir` copies) from
@@ -277,16 +277,16 @@ fn render_report_inner(settings: &Settings, run_id: &str) -> Result<RunResult, E
         Publish::write_artifacts(&mut context, &publish_input)?;
     }
     let published = load_published_comments(&recorder)?;
-    Ok(run_result_from(
-        recorder.meta(),
-        &merged,
-        &plan,
-        &reviewed,
+    Ok(Finished {
+        meta: recorder.meta(),
+        merged: &merged,
+        plan: &plan,
+        reviewed: &reviewed,
         published,
-        budget.spent(),
-        budget.ceiling(),
-        recorder.run_dir(),
-    ))
+        budget: &budget,
+        run_dir: recorder.run_dir(),
+    }
+    .result())
 }
 
 /// The injection seam: tests hand in fake adapters and get the same
@@ -309,9 +309,12 @@ pub(crate) fn review_with(
         .clone()
         .unwrap_or_else(|| record::run_id(&input.identity, &input.head_sha, &fingerprint));
 
-    let storage: Arc<dyn Storage> = Arc::new(LocalStorage::create(
-        settings.options.runs_dir.join(&run_id),
-    )?);
+    let run_dir = settings.options.runs_dir.join(&run_id);
+    let storage: Arc<dyn Storage> = Arc::new(LocalStorage::create(run_dir.clone())?);
+    // The run's own worktree lives here, and is deleted with the run. A
+    // checkout named on the command line ignores this: it was open before the
+    // run id existed, which is why the id could be computed first.
+    adapters.open_worktree(&run_dir)?;
     let selection = settings.selection()?;
     let frozen = Budget::freeze(&selection)?;
 
@@ -357,9 +360,10 @@ pub(crate) fn resume_with(
             run_id: run_id.to_string(),
         });
     }
-    // A resumed run may skip `input` entirely, so the sha the repository tools
+    // A resumed run may skip `input` entirely, so the sha the content tools
     // read at comes from what that stage recorded the first time round.
     adapters.bind_repo(&meta.input);
+    adapters.open_worktree(&settings.options.runs_dir.join(run_id))?;
     let source = Source::from_record(&meta.input)?;
     let recorder = open_recorder(settings, storage, meta)?;
     let budget = restore_budget(recorder.meta())?;
@@ -452,12 +456,12 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
                 &context.adapters.tools,
                 context.redactor,
                 &orientation,
-            );
+            )?;
             // The author's own account of the change, fenced as material.
             // Not part of `instructions`: it rides in `input` beside the
             // diff, because it is prose whoever wrote the change wrote.
             let narrative =
-                stage::review::narrative_preface(&changeset.narrative, context.redactor);
+                stage::review::narrative_preface(&changeset.narrative, context.redactor)?;
             let tokens = stage::review::prompt_tokens(
                 &instructions,
                 narrative.as_deref(),
@@ -507,16 +511,16 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
         None => Publish::run(context, &publish_input)?,
     };
 
-    Ok(run_result_from(
-        context.recorder.meta(),
-        &merged,
-        &plan,
-        &reviewed,
-        published.published,
-        context.budget.spent(),
-        context.budget.ceiling(),
-        context.recorder.run_dir(),
-    ))
+    Ok(Finished {
+        meta: context.recorder.meta(),
+        merged: &merged,
+        plan: &plan,
+        reviewed: &reviewed,
+        published: published.published,
+        budget: context.budget,
+        run_dir: context.recorder.run_dir(),
+    }
+    .result())
 }
 
 fn load_finished(
@@ -565,32 +569,38 @@ fn load_published_comments(recorder: &Recorder) -> Result<Vec<PublishedComment>,
     Ok(serde_json::from_slice(&bytes).unwrap_or_default())
 }
 
-fn run_result_from(
-    meta: &Meta,
-    merged: &MergeOutput,
-    plan: &TriagePlan,
-    reviewed: &ReviewOutput,
+/// The four stage outputs a finished run is described from, gathered so the
+/// description takes one argument rather than eight. It holds only what this
+/// one call reads.
+struct Finished<'a> {
+    meta: &'a Meta,
+    merged: &'a MergeOutput,
+    plan: &'a TriagePlan,
+    reviewed: &'a ReviewOutput,
     published: Vec<PublishedComment>,
-    spent: f64,
-    budget: Option<f64>,
-    run_dir: &Path,
-) -> RunResult {
-    RunResult {
-        run_id: meta.run_id.clone(),
-        model: meta.model.clone(),
-        comments: merged.comments.clone(),
-        overall_score: merged.overall_score,
-        summary: merged.summary.clone(),
-        unscored_reason: merged.unscored_reason.clone(),
-        skipped: plan.skipped.clone(),
-        unreviewed: reviewed.unreviewed.clone(),
-        stopped: reviewed.stopped.clone(),
-        published,
-        spent,
-        budget,
-        currency: meta.currency.clone(),
-        report_path: run_dir.join(layout::REPORT),
-        summary_path: run_dir.join(layout::SUMMARY),
+    budget: &'a Budget,
+    run_dir: &'a Path,
+}
+
+impl Finished<'_> {
+    fn result(self) -> RunResult {
+        RunResult {
+            run_id: self.meta.run_id.clone(),
+            model: self.meta.model.clone(),
+            comments: self.merged.comments.clone(),
+            overall_score: self.merged.overall_score,
+            summary: self.merged.summary.clone(),
+            unscored_reason: self.merged.unscored_reason.clone(),
+            skipped: self.plan.skipped.clone(),
+            unreviewed: self.reviewed.unreviewed.clone(),
+            stopped: self.reviewed.stopped.clone(),
+            published: self.published,
+            spent: self.budget.spent(),
+            budget: self.budget.ceiling(),
+            currency: self.meta.currency.clone(),
+            report_path: self.run_dir.join(layout::REPORT),
+            summary_path: self.run_dir.join(layout::SUMMARY),
+        }
     }
 }
 

@@ -317,8 +317,8 @@ impl Publish {
             return Ok(());
         };
         let note = "line is not commentable; posted as a file-level comment";
-        if !trace.checks.iter().any(|check| check == note) {
-            trace.checks.push(note.to_string());
+        if !trace.has_note(NAME, note) {
+            trace.note(NAME, note);
             context.recorder.write_trace(&trace)?;
         }
         Ok(())
@@ -627,7 +627,10 @@ mod tests {
         trace.diff = "@@ -10,2 +10,3 @@\n+buf[5] = 0;\n".to_string();
         trace.prompt = format!("instructions\n\ncontext of src/parse.h:\n{SECRET_BODY}\n");
         trace.model_output = r#"{"comments":[{"path":"src/parse.c"}]}"#.to_string();
-        trace.checks = vec!["line 12 is not commentable; moved -1 to 11".to_string()];
+        trace.note(
+            crate::stage::merge::NAME,
+            "line 12 is not commentable; moved -1 to 11",
+        );
         trace.context_files.push(ContextFile {
             path: "src/parse.h".to_string(),
             first_line: 1,

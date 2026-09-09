@@ -78,7 +78,7 @@ pub struct TriagePlan {
 ///
 /// The hard ceiling is whatever still fits in the window:
 ///
-/// `context_window − max_output_tokens − prompt skeleton − tool allowance − headroom`
+/// `context_window_tokens − max_output_tokens − prompt skeleton − tool allowance − headroom`
 ///
 /// The working size is `[triage].max_chunk_tokens`, clamped down to that
 /// ceiling. It has no builtin default: the leftover window is not itself a
@@ -108,7 +108,7 @@ impl ChunkLimit {
             .saturating_add(prompt_tokens.max(PROMPT_SKELETON_TOKENS))
             .saturating_add(allowance)
             .saturating_add(HEADROOM_TOKENS);
-        let fit = model.context_window.saturating_sub(reserved);
+        let fit = model.context_window_tokens.saturating_sub(reserved);
         // The allowance is the one term a config can raise without noticing
         // what it costs: rounds times output bytes grows fast enough to eat a
         // small window whole. Say so here, where the registry is known, rather
@@ -116,7 +116,7 @@ impl ChunkLimit {
         if allowance > 0 && fit < MIN_CHUNK_TOKENS {
             return Err(ConfigError::ToolAllowanceTooLarge {
                 model: model.name.clone(),
-                context_window: model.context_window,
+                context_window_tokens: model.context_window_tokens,
                 rounds: config.review.max_tool_rounds,
                 allowance,
                 left: fit,
@@ -135,7 +135,11 @@ impl ChunkLimit {
     /// Delivery-only tools do not grow the conversation with bulk output, so
     /// they do not reserve this.
     fn tool_allowance(config: &Config, tools: &Registry) -> u32 {
-        if !tools.schemas().iter().any(|schema| !schema.concluding) {
+        let investigates = tools
+            .schemas_for(crate::tool::Round::Investigation)
+            .iter()
+            .any(|schema| schema.purpose != crate::tool::Purpose::Delivery);
+        if !investigates {
             return 0;
         }
         estimate_ascii_tokens(config.review.max_tool_output_bytes)
@@ -148,7 +152,7 @@ impl ChunkLimit {
 pub struct FileFilter {
     skip_paths: GlobSet,
     skip_generated: bool,
-    skip_over_bytes: u64,
+    skip_files_over_bytes: u64,
 }
 
 impl FileFilter {
@@ -170,7 +174,7 @@ impl FileFilter {
                 reason: error.to_string(),
             })?,
             skip_generated: triage.skip_generated,
-            skip_over_bytes: triage.skip_over_bytes,
+            skip_files_over_bytes: triage.skip_files_over_bytes,
         })
     }
 
@@ -198,10 +202,10 @@ impl FileFilter {
             return Some("generated".to_string());
         }
         let size = diff.new_side_bytes();
-        if size > self.skip_over_bytes {
+        if size > self.skip_files_over_bytes {
             return Some(format!(
-                "larger than [triage].skip_over_bytes ({size} > {})",
-                self.skip_over_bytes
+                "larger than [triage].skip_files_over_bytes ({size} > {})",
+                self.skip_files_over_bytes
             ));
         }
         None
@@ -387,9 +391,22 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
+    /// The fakes below are about the loop, not about arguments, so they share
+    /// one declaration: a single path, which is all any of them reads.
+    fn one_path() -> &'static Signature {
+        static SIGNATURE: std::sync::OnceLock<Signature> = std::sync::OnceLock::new();
+        SIGNATURE.get_or_init(|| {
+            Signature::new(vec![crate::tool::Parameter::optional(
+                "path",
+                crate::tool::Shape::Path,
+                "the file to look at",
+            )])
+        })
+    }
+
     use crate::config::SecuritySettings;
     use crate::domain::Hunk;
-    use crate::tool::{Origin, Tool, ToolError, ToolOutput};
+    use crate::tool::{Purpose, Round, Signature, Tool, ToolError, ToolOutput};
 
     use super::*;
 
@@ -400,14 +417,14 @@ mod tests {
     const CONFIG: &str = r#"
 [review]
 max_tool_rounds = 12
-max_files_listed = 200
-max_search_hits = 50
-max_read_bytes = 262144
+max_files_per_listing = 200
+max_hits_per_search = 50
+max_file_bytes = 262144
 max_tool_output_bytes = 32768
 
 [triage]
 max_chunk_tokens = 20000
-skip_over_bytes = 262144
+skip_files_over_bytes = 262144
 
 [security]
 allow_extensions = ["c", "h", "rs"]
@@ -418,23 +435,23 @@ protocol = "openai"
 base_url = "https://api.deepseek.com"
 api_key = "DEEPSEEK_API_KEY"
 currency = "CNY"
-budget = 10.0
+budget_per_run = 10.0
 
 [[model]]
 name = "small"
 default = true
 provider = "deepseek"
-input_per_1m = 2.0
-output_per_1m = 3.0
-context_window = 32768
+input_per_1m_tokens = 2.0
+output_per_1m_tokens = 3.0
+context_window_tokens = 32768
 max_output_tokens = 4096
 
 [[model]]
 name = "large"
 provider = "deepseek"
-input_per_1m = 4.0
-output_per_1m = 12.0
-context_window = 131072
+input_per_1m_tokens = 4.0
+output_per_1m_tokens = 12.0
+context_window_tokens = 131072
 max_output_tokens = 4096
 "#;
 
@@ -449,12 +466,16 @@ max_output_tokens = 4096
             "returns its argument"
         }
 
-        fn parameters(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object", "properties": {}})
+        fn signature(&self) -> &Signature {
+            one_path()
         }
 
-        fn origin(&self) -> Origin {
-            Origin::Builtin
+        fn purpose(&self) -> Purpose {
+            Purpose::Content
+        }
+
+        fn rounds(&self) -> &'static [Round] {
+            &[Round::Investigation]
         }
 
         fn execute(&self, _arguments: &serde_json::Value) -> Result<ToolOutput, ToolError> {
@@ -613,7 +634,7 @@ max_output_tokens = 4096
 
         let settings = TriageSettings {
             skip_paths: vec!["vendor/**".to_string()],
-            skip_over_bytes: 1_024,
+            skip_files_over_bytes: 1_024,
             ..TriageSettings::for_tests()
         };
         let files = vec![
@@ -656,11 +677,9 @@ max_output_tokens = 4096
                 .iter()
                 .any(|(path, reason)| *path == "src/api.pb.c" && *reason == "generated")
         );
-        assert!(
-            reasons
-                .iter()
-                .any(|(path, reason)| *path == "src/huge.c" && reason.contains("skip_over_bytes"))
-        );
+        assert!(reasons.iter().any(
+            |(path, reason)| *path == "src/huge.c" && reason.contains("skip_files_over_bytes")
+        ));
         assert!(
             reasons
                 .iter()
@@ -739,7 +758,10 @@ max_output_tokens = 4096
 
     #[test]
     fn a_window_too_tight_for_the_working_size_uses_what_fits() {
-        let text = CONFIG.replace("context_window = 32768", "context_window = 20000");
+        let text = CONFIG.replace(
+            "context_window_tokens = 32768",
+            "context_window_tokens = 20000",
+        );
         let config = config(&text);
         let tight = limit(model(&config, "small"), &config, &registry(false));
         let fit = 20_000 - 4_096 - PROMPT_SKELETON_TOKENS - HEADROOM_TOKENS;

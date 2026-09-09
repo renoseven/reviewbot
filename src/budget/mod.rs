@@ -71,7 +71,7 @@ impl Budget {
     /// Freeze from the selected model and the provider it hangs off.
     pub fn freeze(selection: &Selection<'_>) -> Result<Self, BudgetError> {
         Ok(Self {
-            limit: Limit::from_value(selection.provider.budget)?,
+            limit: Limit::from_value(selection.provider.budget_per_run)?,
             currency: selection.provider.currency.clone(),
             price: Price::from_model(selection.model),
             spent: 0.0,
@@ -155,9 +155,9 @@ mod tests {
 
     fn price() -> Price {
         Price {
-            input_per_1m: 2.0,
-            cached_input_per_1m: Some(0.2),
-            output_per_1m: 3.0,
+            input_per_1m_tokens: 2.0,
+            cached_input_per_1m_tokens: Some(0.2),
+            output_per_1m_tokens: 3.0,
         }
     }
 

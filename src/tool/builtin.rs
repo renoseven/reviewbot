@@ -1,174 +1,216 @@
-//! The six builtin tools: three that read the repository through the platform
-//! API and three that read a local checkout. Ordinary `Tool` implementations,
-//! registered beside the configured commands, so nothing downstream has to ask
-//! which kind of tool it is holding.
+//! The four content tools: list, size, read, search. One group with one set of
+//! names, because there is one place code comes from — this run's worktree.
+//!
+//! There used to be two groups of the same four, one reading the platform API
+//! and one reading a checkout, and the model was expected to tell them apart
+//! by name. It cannot: a name says nothing about how deep an answer goes, and
+//! a name that changes with the run makes the prompt describe tools that are
+//! not registered. So the names are fixed and the *description* carries what
+//! varies — where the answer comes from, and what a miss means. It is written
+//! from `Reach` when the tool is registered.
 //!
 //! Every one of them does the same three things in the same order: read the
 //! model's arguments, put them through `PathPolicy`, and only then ask the
-//! source. The check comes first because this is the only place the model can
-//! reach either source, which is the whole of why the read boundary holds
-//! (§6 security). The sources themselves take plain repository relative paths.
-//!
-//! The two groups are deliberately six names rather than three: the same
-//! question is not equally answerable on a platform API and on a disk, and a
-//! shared name would hide which strength the answer came from.
+//! worktree. The check comes first because this is the only place the model
+//! can reach the worktree at all, which is the whole of why the read boundary
+//! holds (§6 security). The worktree takes plain repository relative paths.
 
 use std::sync::Arc;
 
 use globset::Glob;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::config::Config;
-use crate::platform::{Capabilities, LineRange as RepoRange, PlatformError, RepoSource};
+use crate::platform::LineRange;
 use crate::record::ContextFile;
 use crate::security::{PathPolicy, truncate};
-use crate::worktree::{WorktreeError, WorktreeSource};
+use crate::worktree::{Content, Reach, Search, WorktreeError, WorktreeSource};
 
-use super::{Origin, Tool, ToolError, ToolOutput};
+use super::signature::{Arguments, Parameter, Shape, Signature};
+use super::{Purpose, Round, Tool, ToolError, ToolOutput};
 
-/// Static facts about a builtin, for `tool list`. The real tools still
-/// need a source before they can run; this is only what the catalog prints.
+/// Static facts about a builtin, for `tool list`. The real tools still need a
+/// worktree before they can run; this is only what the catalog prints.
 pub struct BuiltinSpec {
     pub name: &'static str,
     pub description: String,
+    /// Derived from the same declaration the real tool publishes.
     pub parameters: Value,
-    pub requires_worktree: bool,
-    /// `Some("code_search")` when the platform must advertise that capability.
-    pub capability_gate: Option<&'static str>,
+    /// Whether the worktree has to be a whole checkout for this one.
+    pub requires_checkout: bool,
+    /// Whether a search has to be answerable at all.
+    pub requires_search: bool,
 }
 
 /// How much a content tool may fetch and how much it may hand back, all of it
-/// from `[review]`. Carried as one value so the two symmetric groups cannot
-/// drift apart in their caps, and so the descriptions quote the same numbers
-/// the code enforces.
+/// from `[review]`. Carried as one value so the four tools cannot drift apart
+/// in their caps, and so the descriptions quote the same numbers the code
+/// enforces.
 ///
-/// `max_read_bytes` lives here rather than on `PathPolicy` because it is not
-/// a permission: the policy answers whether a path may be read at all, this
+/// `max_file_bytes` lives here rather than on `PathPolicy` because it is not a
+/// permission: the policy answers whether a path may be read at all, this
 /// answers how much of it fits.
 #[derive(Clone, Copy, Debug)]
 pub struct ToolLimits {
-    pub max_read_bytes: u64,
+    pub max_file_bytes: u64,
     pub max_output_bytes: u64,
-    pub max_files_listed: usize,
-    pub max_search_hits: usize,
+    pub max_files_per_listing: usize,
+    pub max_hits_per_search: usize,
 }
 
 impl ToolLimits {
     pub fn from_config(config: &Config) -> Self {
         Self {
-            max_read_bytes: config.review.max_read_bytes,
+            max_file_bytes: config.review.max_file_bytes,
             max_output_bytes: config.review.max_tool_output_bytes,
-            max_files_listed: config.review.max_files_listed as usize,
-            max_search_hits: config.review.max_search_hits as usize,
+            max_files_per_listing: config.review.max_files_per_listing as usize,
+            max_hits_per_search: config.review.max_hits_per_search as usize,
         }
     }
 }
 
-const DESC_READ_REPO_FILE: &str = "Read a file on the reviewed commit (head_sha), via the platform API with no local checkout. Optional line range (first_line and last_line together); without one you get the whole file. Nothing is ever truncated: a read too big to return is refused with the file's size, so use stat_repo_file first when you do not know how big the file is, and page through a large one in line ranges. The path must be one the diff or a listing gave you: a guessed path that misses costs a whole round.";
-const DESC_READ_WORKTREE_FILE: &str = "Read a file in the local checkout (worktree). Optional line range (first_line and last_line together); without one you get the whole file. Nothing is ever truncated: a read too big to return is refused with the file's size, so use stat_worktree_file first when you do not know how big the file is, and page through a large one in line ranges. The path must be one the diff or a listing gave you: a guessed path that misses costs a whole round.";
-const DESC_STAT_REPO_FILE: &str = "Size of a file on the reviewed commit (head_sha), in bytes and lines, plus whether it fits in one read and how many lines to ask for at a time. Returns numbers only, never file content, so it is cheap. Ask this before reading a file whose size you do not know: it turns one refused read into a plan.";
-const DESC_STAT_WORKTREE_FILE: &str = "Size of a file in the local checkout (worktree), in bytes and lines, plus whether it fits in one read and how many lines to ask for at a time. Returns numbers only, never file content, so it is cheap. Ask this before reading a file whose size you do not know: it turns one refused read into a plan.";
-const EMPTY_KEYWORD_NOTE: &str = "A miss does not mean it is absent: this search used a keyword index that only covers the default branch, so something new on this branch may not be indexed. To confirm presence, use list_repo_files or read_repo_file.";
+/// What every content tool's description says first: what the worktree is,
+/// which is the one thing the names no longer carry.
+fn where_from(reach: Reach) -> &'static str {
+    match reach.content {
+        Content::Checkout => {
+            "The worktree is the checkout under review, standing on the reviewed commit, so it \
+             holds the whole project."
+        }
+        Content::Fetched => {
+            "The worktree is a directory of this run's own, which started empty and holds the \
+             files that have been fetched into it from the platform API at the reviewed commit. \
+             It is not a checkout: only what has been asked for is on disk."
+        }
+        Content::Empty => {
+            "The worktree is empty and has nothing behind it, so nothing can be read this run."
+        }
+    }
+}
 
-fn desc_list_repo_files(limits: ToolLimits) -> String {
+fn desc_read_file(reach: Reach, limits: ToolLimits) -> String {
+    let fetching = match reach.content {
+        Content::Fetched => {
+            " A file not on disk yet is fetched at the reviewed commit on the first read and \
+             kept, so reading it again is free."
+        }
+        _ => "",
+    };
     format!(
-        "List file paths on the reviewed commit (head_sha) matching a glob, via the platform API. No local checkout. At most {}; overflow says how many remain. An incomplete listing from the platform says so.",
-        limits.max_files_listed
+        "Read one file out of this run's worktree. {}{fetching} Optional line range (first_line \
+         and last_line together); without one you get the whole file. Nothing is ever truncated: \
+         a file over {} bytes cannot be read at all, and a single answer may carry at most {} \
+         bytes, so a read that would not fit is refused with the file's size. Ask stat_file \
+         first when you do not know how big a file is, and page through a large one in line \
+         ranges. The path must be one the diff or a listing gave you: a guessed path that misses \
+         costs a whole round.",
+        where_from(reach),
+        limits.max_file_bytes,
+        limits.max_output_bytes,
     )
 }
 
-fn desc_list_worktree_files(limits: ToolLimits) -> String {
+fn desc_stat_file(reach: Reach, limits: ToolLimits) -> String {
     format!(
-        "List file paths in the local checkout (worktree) matching a glob. Scans the disk; the listing is complete. At most {}; overflow says how many remain.",
-        limits.max_files_listed
+        "Size of one file in this run's worktree, in bytes and lines, plus whether it fits in one \
+         read and how many lines to ask for at a time. {} Returns numbers only, never file \
+         content, so it is cheap. Ask this before reading a file whose size you do not know: one \
+         call here turns one refused read into a plan, against the {} bytes a single answer may \
+         carry.",
+        where_from(reach),
+        limits.max_output_bytes,
     )
 }
 
-fn desc_search_repo() -> String {
-    "Search the reviewed commit (head_sha). Registered only when the platform advertises code_search; otherwise this entry exists but is not in the model's tool list.".to_string()
-}
-
-fn desc_search_worktree(limits: ToolLimits) -> String {
+fn desc_list_files(reach: Reach, limits: ToolLimits) -> String {
+    let source = match reach.content {
+        Content::Checkout => {
+            "It scans the checkout, so the listing is complete and a path missing from it is not \
+             there."
+        }
+        Content::Fetched => {
+            "It asks the platform API about the reviewed commit rather than about what has been \
+             fetched so far, so it answers for the whole repository. An answer the platform could \
+             not complete says so."
+        }
+        Content::Empty => "There is nothing to list.",
+    };
     format!(
-        "Search the local checkout (worktree). query is a regular expression over every file on disk, so a miss usually means it is not there. Optional glob to limit files. At most {} hits.",
-        limits.max_search_hits
+        "List the paths in this run's worktree matching a glob. {} {source} At most {} paths; \
+         overflow says how many remain.",
+        where_from(reach),
+        limits.max_files_per_listing,
     )
 }
 
-fn desc_search_repo_regex(limits: ToolLimits) -> String {
+fn desc_search_code(reach: Reach, limits: ToolLimits) -> String {
+    let strength = match reach.search {
+        Search::Regex => match reach.content {
+            Content::Checkout => {
+                "query is a regular expression matched over every file in the checkout, so a miss \
+                 usually means it is not there."
+            }
+            _ => {
+                "query is a regular expression, matched by the platform over the reviewed commit, \
+                 so a miss usually means it is not there."
+            }
+        },
+        Search::Keyword => {
+            "query is case-insensitive keyword matching against the platform's index; regex \
+             metacharacters are literal, not a regex. That index covers the default branch only, \
+             so a miss does not mean it is absent — confirm with list_files or read_file before \
+             concluding anything from an empty result."
+        }
+        // Not registered in this case, so nothing reads this arm; it stays
+        // truthful rather than unreachable.
+        Search::Unavailable => "No search is available this run.",
+    };
     format!(
-        "Search the reviewed commit (head_sha). query is a regular expression. Optional glob to limit files. At most {} hits.",
-        limits.max_search_hits
+        "Search the code of this run's worktree. {} {strength} Optional glob to limit the files. \
+         At most {} hits; overflow says how many remain.",
+        where_from(reach),
+        limits.max_hits_per_search,
     )
 }
 
-fn desc_search_repo_keyword(limits: ToolLimits) -> String {
-    format!(
-        "Search the reviewed commit (head_sha). query is case-insensitive keyword matching; regex metacharacters are literal, not a regex. The platform index covers the default branch only, so hits are candidate paths: the file is re-fetched at head_sha and rematched locally. Paths, line numbers, and text all come from head_sha. A miss does not mean it is absent. At most {} hits.",
-        limits.max_search_hits
-    )
-}
-
-pub fn builtin_specs(limits: ToolLimits) -> [BuiltinSpec; 8] {
+/// The catalog rows. `reach` decides the wording, exactly as it does at
+/// registration, so `tool list` prints the contract the model would be given.
+pub fn builtin_specs(reach: Reach, limits: ToolLimits) -> [BuiltinSpec; 4] {
     [
         BuiltinSpec {
-            name: "list_repo_files",
-            description: desc_list_repo_files(limits),
-            parameters: glob_schema(),
-            requires_worktree: false,
-            capability_gate: None,
+            name: ListFiles::NAME,
+            description: desc_list_files(reach, limits),
+            parameters: glob_signature().schema(),
+            requires_checkout: false,
+            requires_search: false,
         },
         BuiltinSpec {
-            name: "stat_repo_file",
-            description: DESC_STAT_REPO_FILE.to_string(),
-            parameters: stat_schema(),
-            requires_worktree: false,
-            capability_gate: None,
+            name: StatFile::NAME,
+            description: desc_stat_file(reach, limits),
+            parameters: path_signature(false).schema(),
+            requires_checkout: false,
+            requires_search: false,
         },
         BuiltinSpec {
-            name: "read_repo_file",
-            description: DESC_READ_REPO_FILE.to_string(),
-            parameters: path_schema(),
-            requires_worktree: false,
-            capability_gate: None,
+            name: ReadFile::NAME,
+            description: desc_read_file(reach, limits),
+            parameters: path_signature(true).schema(),
+            requires_checkout: false,
+            requires_search: false,
         },
         BuiltinSpec {
-            name: "search_repo",
-            description: desc_search_repo(),
-            parameters: search_schema(),
-            requires_worktree: false,
-            capability_gate: Some("code_search"),
-        },
-        BuiltinSpec {
-            name: "list_worktree_files",
-            description: desc_list_worktree_files(limits),
-            parameters: glob_schema(),
-            requires_worktree: true,
-            capability_gate: None,
-        },
-        BuiltinSpec {
-            name: "stat_worktree_file",
-            description: DESC_STAT_WORKTREE_FILE.to_string(),
-            parameters: stat_schema(),
-            requires_worktree: true,
-            capability_gate: None,
-        },
-        BuiltinSpec {
-            name: "read_worktree_file",
-            description: DESC_READ_WORKTREE_FILE.to_string(),
-            parameters: path_schema(),
-            requires_worktree: true,
-            capability_gate: None,
-        },
-        BuiltinSpec {
-            name: "search_worktree",
-            description: desc_search_worktree(limits),
-            parameters: search_schema(),
-            requires_worktree: true,
-            capability_gate: None,
+            name: SearchCode::NAME,
+            description: desc_search_code(reach, limits),
+            parameters: search_signature().schema(),
+            requires_checkout: false,
+            requires_search: true,
         },
     ]
 }
+
+/// Content is investigated, never concluded with: once the tools come off, the
+/// only thing left to do is hand over what was found.
+const INVESTIGATION: &[Round] = &[Round::Investigation];
 
 /// Said when the platform could not hand over the whole tree. It has to be
 /// said: a half list read as a whole one is how a reviewer concludes that
@@ -177,65 +219,14 @@ const INCOMPLETE: &str = "Note: this listing is incomplete. The platform would n
                           over the whole tree at once, so a path not listed here may still \
                           exist. Narrow the glob to a specific directory and try again.";
 
-/// Appended to a failed read. The platform's own words are usually a bare
-/// 404, which does not tell the model what to do next; most misses are a path
-/// it invented, and the next guess costs another round.
+/// Appended to a failed read. The worktree's own words are usually a bare
+/// "no such file", which does not tell the model what to do next; most misses
+/// are a path it invented, and the next guess costs another round.
 const READ_MISS_HINT: &str = "(If the path was wrong, list the files first to see what \
-                              this source actually has, rather than guessing again.)";
+                              the worktree actually has, rather than guessing again.)";
 
-/// What the three repository tools share. Cloned into each of them when they
-/// are registered, so `Tool::execute` still takes nothing but arguments.
-#[derive(Clone)]
-pub struct RepoContext {
-    source: Arc<dyn RepoSource>,
-    paths: PathPolicy,
-    limits: ToolLimits,
-}
-
-impl RepoContext {
-    pub fn new(source: Arc<dyn RepoSource>, paths: PathPolicy, limits: ToolLimits) -> Self {
-        Self {
-            source,
-            paths,
-            limits,
-        }
-    }
-
-    fn answer(&self) -> Answer<'_> {
-        Answer {
-            paths: &self.paths,
-            limits: self.limits,
-        }
-    }
-
-    /// API mode: normalize, deny list, extension whitelist. Nothing lands on
-    /// disk, so there is no symlink or root question to ask.
-    fn path(&self, tool: &str, given: &str) -> Result<String, ToolError> {
-        self.paths
-            .check_repo_path(given)
-            .map_err(|rejection| ToolError::Rejected {
-                tool: tool.to_string(),
-                reason: rejection.to_string(),
-            })
-    }
-
-    fn failed(tool: &str, error: PlatformError) -> ToolError {
-        ToolError::Unavailable {
-            tool: tool.to_string(),
-            reason: error.to_string(),
-        }
-    }
-
-    fn failed_read(tool: &str, error: PlatformError) -> ToolError {
-        ToolError::Unavailable {
-            tool: tool.to_string(),
-            reason: format!("{error} {READ_MISS_HINT}"),
-        }
-    }
-}
-
-/// What the three disk tools share. The root comes from the source rather than
-/// being carried twice.
+/// What the four content tools share. Cloned into each of them when they are
+/// registered, so `Tool::execute` still takes nothing but arguments.
 #[derive(Clone)]
 pub struct WorktreeContext {
     source: Arc<dyn WorktreeSource>,
@@ -252,6 +243,14 @@ impl WorktreeContext {
         }
     }
 
+    pub fn reach(&self) -> Reach {
+        self.source.reach()
+    }
+
+    pub fn limits(&self) -> ToolLimits {
+        self.limits
+    }
+
     fn answer(&self) -> Answer<'_> {
         Answer {
             paths: &self.paths,
@@ -259,8 +258,10 @@ impl WorktreeContext {
         }
     }
 
-    /// The same three checks as the API side plus the symlink rule, and the
-    /// resolved path still has to sit under the worktree root.
+    /// Normalize, deny list, extension whitelist, the symlink rule, and the
+    /// resolved path still has to sit under the worktree root. One check for
+    /// one worktree: a fetched file lands under that same root, so there is
+    /// no second kind of path to reason about.
     fn path(&self, tool: &str, given: &str) -> Result<String, ToolError> {
         self.paths
             .check_worktree_path(given, self.source.root())
@@ -285,56 +286,9 @@ impl WorktreeContext {
     }
 }
 
-/// The optional line range, as the model wrote it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Range {
-    first: u32,
-    last: u32,
-}
-
-impl Range {
-    /// The lines the model asked for, cut out of a body the size check has
-    /// already cleared. Both sources define a range the same way, so either
-    /// one of them can do the cutting for both.
-    fn slice(self, text: &str) -> String {
-        RepoRange {
-            first: self.first,
-            last: self.last,
-        }
-        .slice(text)
-    }
-}
-
-/// One search hit, whichever source found it.
-struct Hit {
-    path: String,
-    line: u32,
-    text: String,
-}
-
-impl From<crate::platform::SearchHit> for Hit {
-    fn from(hit: crate::platform::SearchHit) -> Self {
-        Self {
-            path: hit.path,
-            line: hit.line,
-            text: hit.text,
-        }
-    }
-}
-
-impl From<crate::worktree::SearchHit> for Hit {
-    fn from(hit: crate::worktree::SearchHit) -> Self {
-        Self {
-            path: hit.path,
-            line: hit.line,
-            text: hit.text,
-        }
-    }
-}
-
-/// What the model is shown for a listing, a search or a file. Both groups
-/// answer through this, so the two halves of a symmetric pair cannot drift
-/// apart in their caps or their wording.
+/// What the model is shown for a listing, a search or a file. Everything
+/// answers through this, so the caps and the wording cannot drift apart
+/// between the four.
 struct Answer<'a> {
     paths: &'a PathPolicy,
     limits: ToolLimits,
@@ -346,7 +300,7 @@ impl Answer<'_> {
     /// try to read. The extension whitelist is not applied here — that a
     /// `Makefile` exists is worth knowing, and reading it is refused later.
     fn listing(&self, found: Vec<String>, complete: bool) -> ToolOutput {
-        let ceiling = self.limits.max_files_listed;
+        let ceiling = self.limits.max_files_per_listing;
         let visible = self.paths.retain_visible(found.iter().map(String::as_str));
         let total = visible.len();
         let mut lines: Vec<String> = visible.into_iter().take(ceiling).collect();
@@ -365,12 +319,12 @@ impl Answer<'_> {
         self.text(lines.join("\n"))
     }
 
-    fn hits(&self, found: Vec<Hit>, empty_note: Option<&str>) -> ToolOutput {
-        let kept: Vec<&Hit> = found
+    fn hits(&self, found: Vec<crate::worktree::SearchHit>, empty_note: Option<&str>) -> ToolOutput {
+        let kept: Vec<&crate::worktree::SearchHit> = found
             .iter()
             .filter(|hit| !self.paths.is_denied(&hit.path))
             .collect();
-        let ceiling = self.limits.max_search_hits;
+        let ceiling = self.limits.max_hits_per_search;
         let mut lines: Vec<String> = kept
             .iter()
             .take(ceiling)
@@ -391,29 +345,29 @@ impl Answer<'_> {
         self.text(lines.join("\n"))
     }
 
-    /// A file body, and the record that this run really fetched it.
+    /// A file body, and the record that this run really read it.
     ///
     /// Nothing here is ever truncated. Part of a file reads exactly like all
     /// of it, and a caller who does not know a line is missing will conclude
     /// the thing on that line does not exist. So both ceilings answer with a
     /// refusal carrying the numbers, and choosing what to leave out is left
-    /// to whoever asked: `stat_*_file` says how big the file is, and a line
+    /// to whoever asked: `stat_file` says how big the file is, and a line
     /// range says which part of it to hand back.
     fn file(
         &self,
         tool: &str,
         path: &str,
-        range: Option<Range>,
+        range: Option<LineRange>,
         body: String,
     ) -> Result<ToolOutput, ToolError> {
         let stat = Stat::of(&body);
-        let fetch_ceiling = self.limits.max_read_bytes;
+        let fetch_ceiling = self.limits.max_file_bytes;
         if stat.bytes > fetch_ceiling {
             return Err(ToolError::Rejected {
                 tool: tool.to_string(),
                 reason: format!(
-                    "{path} is {} bytes over {} lines, past max_read_bytes ({fetch_ceiling}); \
-                     no part of it can be read, because reading any part means fetching all of it. \
+                    "{path} is {} bytes over {} lines, past max_file_bytes ({fetch_ceiling}); \
+                     no part of it can be read, because reading any part means reading all of it. \
                      Use a search to find what you need instead",
                     stat.bytes, stat.lines
                 ),
@@ -456,16 +410,16 @@ impl Answer<'_> {
         )
     }
 
-    /// What `stat_*_file` answers: the numbers needed to plan reads, and
+    /// What `stat_file` answers: the numbers needed to plan reads, and
     /// nothing else. Deliberately tiny, so asking is always cheaper than
     /// finding out by being refused.
     fn stat(&self, path: &str, body: &str) -> ToolOutput {
         let stat = Stat::of(body);
         let room = self.limits.max_output_bytes;
-        let fetch_ceiling = self.limits.max_read_bytes;
+        let fetch_ceiling = self.limits.max_file_bytes;
         let verdict = match () {
             _ if stat.bytes > fetch_ceiling => format!(
-                "past max_read_bytes ({fetch_ceiling}), so no read of this file can succeed, \
+                "past max_file_bytes ({fetch_ceiling}), so no read of this file can succeed, \
                  in whole or in part"
             ),
             _ if stat.bytes > room => format!(
@@ -545,174 +499,131 @@ fn check_glob(paths: &PathPolicy, tool: &str, given: &str) -> Result<String, Too
     Ok(given.to_string())
 }
 
-/// The model's arguments, read with the tool's name attached so a refusal says
-/// which call it is answering.
-struct Arguments<'a> {
-    tool: &'a str,
-    value: &'a Value,
+/// The three declarations the four content tools share. Written once each:
+/// what the model is shown and what its call is checked against both come out
+/// of these.
+fn glob_signature() -> Signature {
+    Signature::new(vec![Parameter::required(
+        "glob",
+        Shape::text(),
+        "Repository-relative glob, same syntax as deny_paths, e.g. src/**/*.c",
+    )])
 }
 
-impl<'a> Arguments<'a> {
-    fn new(tool: &'a str, value: &'a Value) -> Self {
-        Self { tool, value }
+/// `ranged` is false for a size, which is a fact about the whole file and has
+/// no range to ask about.
+fn path_signature(ranged: bool) -> Signature {
+    let mut parameters = vec![Parameter::required(
+        "path",
+        Shape::Path,
+        "Repository-relative path, e.g. src/parse.c",
+    )];
+    if ranged {
+        parameters.push(Parameter::optional(
+            "first_line",
+            Shape::counting(),
+            "Start of the line range; supply with last_line",
+        ));
+        parameters.push(Parameter::optional(
+            "last_line",
+            Shape::counting(),
+            "End of the line range; supply with first_line",
+        ));
     }
+    Signature::new(parameters)
+}
 
-    fn text(&self, name: &str) -> Result<&'a str, ToolError> {
-        let given = self
-            .value
-            .get(name)
-            .ok_or_else(|| self.invalid(format!("missing argument {name:?}")))?;
-        let text = given
-            .as_str()
-            .ok_or_else(|| self.invalid(format!("argument {name:?} has to be a string")))?;
-        if text.is_empty() {
-            return Err(self.invalid(format!("argument {name:?} is empty")));
-        }
-        Ok(text)
-    }
+fn search_signature() -> Signature {
+    Signature::new(vec![
+        Parameter::required("query", Shape::text(), "What to search for"),
+        Parameter::optional(
+            "glob",
+            Shape::text(),
+            "Optional. Limit the search to files matching this glob",
+        ),
+    ])
+}
 
-    fn optional_text(&self, name: &str) -> Result<Option<&'a str>, ToolError> {
-        match self.value.get(name) {
-            None | Some(Value::Null) => Ok(None),
-            Some(_) => self.text(name).map(Some),
-        }
-    }
-
-    /// Both ends of a range come together. Half a range would have to be
-    /// guessed at, and a guess about how much of a file the model wanted is
-    /// the kind of thing it cannot notice going wrong.
-    fn range(&self) -> Result<Option<Range>, ToolError> {
-        match (self.number("first_line")?, self.number("last_line")?) {
-            (None, None) => Ok(None),
-            (Some(first), Some(last)) if first >= 1 && last >= first => {
-                Ok(Some(Range { first, last }))
-            }
-            (Some(first), Some(last)) => Err(self.invalid(format!(
-                "first_line {first} and last_line {last} are not a range: \
-                 lines start at 1 and last_line cannot be smaller than first_line"
-            ))),
-            _ => Err(self
-                .invalid("first_line and last_line go together; give both or neither".to_string())),
-        }
-    }
-
-    fn number(&self, name: &str) -> Result<Option<u32>, ToolError> {
-        match self.value.get(name) {
-            None | Some(Value::Null) => Ok(None),
-            Some(value) => value
-                .as_u64()
-                .and_then(|number| u32::try_from(number).ok())
-                .map(Some)
-                .ok_or_else(|| {
-                    self.invalid(format!(
-                        "argument {name:?} has to be a positive whole number"
-                    ))
-                }),
-        }
-    }
-
-    fn invalid(&self, reason: impl Into<String>) -> ToolError {
-        ToolError::InvalidArguments {
-            tool: self.tool.to_string(),
-            reason: reason.into(),
-        }
+/// Both ends of a range come together. Half a range would have to be guessed
+/// at, and a guess about how much of a file the model wanted is the kind of
+/// thing it cannot notice going wrong.
+fn range_of(tool: &str, arguments: &Arguments) -> Result<Option<LineRange>, ToolError> {
+    let first = arguments.integer("first_line");
+    let last = arguments.integer("last_line");
+    match (first, last) {
+        (None, None) => Ok(None),
+        (Some(first), Some(last)) if last >= first => Ok(Some(LineRange {
+            first: first as u32,
+            last: last as u32,
+        })),
+        (Some(first), Some(last)) => Err(ToolError::InvalidArguments {
+            tool: tool.to_string(),
+            reason: format!(
+                "first_line {first} and last_line {last} are not a range: last_line cannot be \
+                 smaller than first_line"
+            ),
+        }),
+        _ => Err(ToolError::InvalidArguments {
+            tool: tool.to_string(),
+            reason: "first_line and last_line go together; give both or neither".to_string(),
+        }),
     }
 }
 
-fn glob_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "glob": {
-                "type": "string",
-                "description": "Repository-relative glob, same syntax as deny_paths, e.g. src/**/*.c",
-            },
-        },
-        "required": ["glob"],
-        "additionalProperties": false,
-    })
-}
-
-fn path_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "path": {"type": "string", "description": "Repository-relative path, e.g. src/parse.c"},
-            "first_line": {"type": "integer", "minimum": 1, "description": "Start of the line range; supply with last_line"},
-            "last_line": {"type": "integer", "minimum": 1, "description": "End of the line range; supply with first_line"},
-        },
-        "required": ["path"],
-        "additionalProperties": false,
-    })
-}
-
-/// A path and nothing else: a size is a fact about the whole file, so there
-/// is no range to ask about.
-fn stat_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "path": {"type": "string", "description": "Repository-relative path, e.g. src/parse.c"},
-        },
-        "required": ["path"],
-        "additionalProperties": false,
-    })
-}
-
-fn search_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "What to search for"},
-            "glob": {"type": "string", "description": "Optional. Limit the search to files matching this glob"},
-        },
-        "required": ["query"],
-        "additionalProperties": false,
-    })
-}
-
-pub struct ListRepoFiles {
-    context: RepoContext,
-    /// Written from the limits rather than fixed, so the ceiling the model is
-    /// told about is the one the answer enforces.
+pub struct ListFiles {
+    context: WorktreeContext,
+    /// Written from the worktree's reach and the limits rather than fixed, so
+    /// what the model is told is what this run's answer will actually be.
     description: String,
+    signature: Signature,
 }
 
-impl ListRepoFiles {
-    pub fn new(context: RepoContext) -> Self {
-        let description = desc_list_repo_files(context.limits);
+impl ListFiles {
+    pub const NAME: &'static str = "list_files";
+
+    pub fn new(context: WorktreeContext) -> Self {
+        let description = desc_list_files(context.reach(), context.limits());
         Self {
             context,
             description,
+            signature: glob_signature(),
         }
     }
 }
 
-impl Tool for ListRepoFiles {
+impl Tool for ListFiles {
     fn name(&self) -> &str {
-        "list_repo_files"
+        Self::NAME
     }
 
     fn description(&self) -> &str {
         &self.description
     }
 
-    fn parameters(&self) -> Value {
-        glob_schema()
+    fn signature(&self) -> &Signature {
+        &self.signature
     }
 
-    fn origin(&self) -> Origin {
-        Origin::Builtin
+    fn purpose(&self) -> Purpose {
+        Purpose::Content
+    }
+
+    fn rounds(&self) -> &'static [Round] {
+        INVESTIGATION
     }
 
     fn execute(&self, arguments: &Value) -> Result<ToolOutput, ToolError> {
-        let arguments = Arguments::new(self.name(), arguments);
-        let glob = check_glob(&self.context.paths, self.name(), arguments.text("glob")?)?;
+        let checked = self.signature.validate(self.name(), arguments)?;
+        let glob = check_glob(
+            &self.context.paths,
+            self.name(),
+            checked.text("glob").unwrap_or_default(),
+        )?;
         let listing = self
             .context
             .source
             .list_files(&glob)
-            .map_err(|error| RepoContext::failed(self.name(), error))?;
+            .map_err(|error| WorktreeContext::failed(self.name(), error))?;
         Ok(self
             .context
             .answer()
@@ -720,325 +631,183 @@ impl Tool for ListRepoFiles {
     }
 }
 
-/// Size without content. The body still has to be fetched to count lines —
-/// no platform reports those — but only the numbers come back, so this stays
+/// Size without content. The body still has to be read to count lines — no
+/// platform reports those — but only the numbers come back, so this stays
 /// affordable for a file far too big to read.
-pub struct StatRepoFile {
-    context: RepoContext,
+pub struct StatFile {
+    context: WorktreeContext,
+    description: String,
+    signature: Signature,
 }
 
-impl StatRepoFile {
-    pub fn new(context: RepoContext) -> Self {
-        Self { context }
+impl StatFile {
+    pub const NAME: &'static str = "stat_file";
+
+    pub fn new(context: WorktreeContext) -> Self {
+        let description = desc_stat_file(context.reach(), context.limits());
+        Self {
+            context,
+            description,
+            signature: path_signature(false),
+        }
     }
 }
 
-impl Tool for StatRepoFile {
+impl Tool for StatFile {
     fn name(&self) -> &str {
-        "stat_repo_file"
+        Self::NAME
     }
 
     fn description(&self) -> &str {
-        DESC_STAT_REPO_FILE
+        &self.description
     }
 
-    fn parameters(&self) -> Value {
-        stat_schema()
+    fn signature(&self) -> &Signature {
+        &self.signature
     }
 
-    fn origin(&self) -> Origin {
-        Origin::Builtin
+    fn purpose(&self) -> Purpose {
+        Purpose::Content
+    }
+
+    fn rounds(&self) -> &'static [Round] {
+        INVESTIGATION
     }
 
     fn execute(&self, arguments: &Value) -> Result<ToolOutput, ToolError> {
-        let arguments = Arguments::new(self.name(), arguments);
-        let path = self.context.path(self.name(), arguments.text("path")?)?;
+        let checked = self.signature.validate(self.name(), arguments)?;
+        let path = self
+            .context
+            .path(self.name(), checked.text("path").unwrap_or_default())?;
         let body = self
             .context
             .source
             .read_file(&path, None)
-            .map_err(|error| RepoContext::failed_read(self.name(), error))?;
+            .map_err(|error| WorktreeContext::failed_read(self.name(), error))?;
         Ok(self.context.answer().stat(&path, &body))
     }
 }
 
-pub struct ReadRepoFile {
-    context: RepoContext,
+pub struct ReadFile {
+    context: WorktreeContext,
+    description: String,
+    signature: Signature,
 }
 
-impl ReadRepoFile {
-    pub fn new(context: RepoContext) -> Self {
-        Self { context }
+impl ReadFile {
+    pub const NAME: &'static str = "read_file";
+
+    pub fn new(context: WorktreeContext) -> Self {
+        let description = desc_read_file(context.reach(), context.limits());
+        Self {
+            context,
+            description,
+            signature: path_signature(true),
+        }
     }
 }
 
-impl Tool for ReadRepoFile {
+impl Tool for ReadFile {
     fn name(&self) -> &str {
-        "read_repo_file"
+        Self::NAME
     }
 
     fn description(&self) -> &str {
-        DESC_READ_REPO_FILE
+        &self.description
     }
 
-    fn parameters(&self) -> Value {
-        path_schema()
+    fn signature(&self) -> &Signature {
+        &self.signature
     }
 
-    fn origin(&self) -> Origin {
-        Origin::Builtin
+    fn purpose(&self) -> Purpose {
+        Purpose::Content
+    }
+
+    fn rounds(&self) -> &'static [Round] {
+        INVESTIGATION
     }
 
     fn execute(&self, arguments: &Value) -> Result<ToolOutput, ToolError> {
-        let arguments = Arguments::new(self.name(), arguments);
-        let path = self.context.path(self.name(), arguments.text("path")?)?;
-        let range = arguments.range()?;
-        // The whole file first: `max_read_bytes` is a statement about the
+        let checked = self.signature.validate(self.name(), arguments)?;
+        let path = self
+            .context
+            .path(self.name(), checked.text("path").unwrap_or_default())?;
+        let range = range_of(self.name(), &checked)?;
+        // The whole file first: `max_file_bytes` is a statement about the
         // file, and a range must not become a way to read a slice of one that
         // is too big to read.
         let body = self
             .context
             .source
             .read_file(&path, None)
-            .map_err(|error| RepoContext::failed_read(self.name(), error))?;
+            .map_err(|error| WorktreeContext::failed_read(self.name(), error))?;
         self.context.answer().file(self.name(), &path, range, body)
     }
 }
 
-/// `search_repo`, whose description and empty-result note are written from
-/// `capabilities()` when it is registered. The same name is a regular
-/// expression search on one instance and a keyword index on another, and the
-/// model has no way to tell which one it got from the name alone.
-pub struct SearchRepo {
-    context: RepoContext,
+/// `search_code`, whose description and empty-result note are written from the
+/// worktree's reach when it is registered. The same name is a regular
+/// expression search on one run and a keyword index on another, and the model
+/// has no way to tell which one it got from the name alone.
+pub struct SearchCode {
+    context: WorktreeContext,
     description: String,
     empty_note: Option<String>,
+    signature: Signature,
 }
 
-impl SearchRepo {
-    pub fn new(context: RepoContext, capabilities: Capabilities) -> Self {
-        let (description, empty_note) = match capabilities.regex_search {
-            true => (desc_search_repo_regex(context.limits), None),
-            false => (
-                desc_search_repo_keyword(context.limits),
-                Some(EMPTY_KEYWORD_NOTE.to_string()),
-            ),
+impl SearchCode {
+    pub const NAME: &'static str = "search_code";
+
+    /// A miss from a keyword index over the default branch says nothing about
+    /// the branch under review, so an empty answer says that rather than just
+    /// being empty.
+    const EMPTY_KEYWORD_NOTE: &'static str = "A miss does not mean it is absent: this search used a keyword index that only covers \
+         the default branch, so something new on this branch may not be indexed. To confirm \
+         presence, use list_files or read_file.";
+
+    pub fn new(context: WorktreeContext) -> Self {
+        let reach = context.reach();
+        let description = desc_search_code(reach, context.limits());
+        let empty_note = match reach.search {
+            Search::Keyword => Some(Self::EMPTY_KEYWORD_NOTE.to_string()),
+            _ => None,
         };
         Self {
             context,
             description,
             empty_note,
+            signature: search_signature(),
         }
     }
 }
 
-impl Tool for SearchRepo {
+impl Tool for SearchCode {
     fn name(&self) -> &str {
-        "search_repo"
+        Self::NAME
     }
 
     fn description(&self) -> &str {
         &self.description
     }
 
-    fn parameters(&self) -> Value {
-        search_schema()
+    fn signature(&self) -> &Signature {
+        &self.signature
     }
 
-    fn origin(&self) -> Origin {
-        Origin::Builtin
+    fn purpose(&self) -> Purpose {
+        Purpose::Content
     }
 
-    fn execute(&self, arguments: &Value) -> Result<ToolOutput, ToolError> {
-        let arguments = Arguments::new(self.name(), arguments);
-        let query = arguments.text("query")?;
-        let glob = match arguments.optional_text("glob")? {
-            Some(given) => Some(check_glob(&self.context.paths, self.name(), given)?),
-            None => None,
-        };
-        let hits = self
-            .context
-            .source
-            .search(query, glob.as_deref())
-            .map_err(|error| RepoContext::failed(self.name(), error))?;
-        Ok(self.context.answer().hits(
-            hits.into_iter().map(Hit::from).collect(),
-            self.empty_note.as_deref(),
-        ))
-    }
-}
-
-pub struct ListWorktreeFiles {
-    context: WorktreeContext,
-    description: String,
-}
-
-impl ListWorktreeFiles {
-    pub fn new(context: WorktreeContext) -> Self {
-        let description = desc_list_worktree_files(context.limits);
-        Self {
-            context,
-            description,
-        }
-    }
-}
-
-impl Tool for ListWorktreeFiles {
-    fn name(&self) -> &str {
-        "list_worktree_files"
-    }
-
-    fn description(&self) -> &str {
-        &self.description
-    }
-
-    fn parameters(&self) -> Value {
-        glob_schema()
-    }
-
-    fn origin(&self) -> Origin {
-        Origin::Builtin
-    }
-
-    fn requires_worktree(&self) -> bool {
-        true
+    fn rounds(&self) -> &'static [Round] {
+        INVESTIGATION
     }
 
     fn execute(&self, arguments: &Value) -> Result<ToolOutput, ToolError> {
-        let arguments = Arguments::new(self.name(), arguments);
-        let glob = check_glob(&self.context.paths, self.name(), arguments.text("glob")?)?;
-        let found = self
-            .context
-            .source
-            .list_files(&glob)
-            .map_err(|error| WorktreeContext::failed(self.name(), error))?;
-        Ok(self.context.answer().listing(found, true))
-    }
-}
-
-pub struct StatWorktreeFile {
-    context: WorktreeContext,
-}
-
-impl StatWorktreeFile {
-    pub fn new(context: WorktreeContext) -> Self {
-        Self { context }
-    }
-}
-
-impl Tool for StatWorktreeFile {
-    fn name(&self) -> &str {
-        "stat_worktree_file"
-    }
-
-    fn description(&self) -> &str {
-        DESC_STAT_WORKTREE_FILE
-    }
-
-    fn parameters(&self) -> Value {
-        stat_schema()
-    }
-
-    fn origin(&self) -> Origin {
-        Origin::Builtin
-    }
-
-    fn execute(&self, arguments: &Value) -> Result<ToolOutput, ToolError> {
-        let arguments = Arguments::new(self.name(), arguments);
-        let path = self.context.path(self.name(), arguments.text("path")?)?;
-        let body = self
-            .context
-            .source
-            .read_file(&path, None)
-            .map_err(|error| WorktreeContext::failed_read(self.name(), error))?;
-        Ok(self.context.answer().stat(&path, &body))
-    }
-}
-
-pub struct ReadWorktreeFile {
-    context: WorktreeContext,
-}
-
-impl ReadWorktreeFile {
-    pub fn new(context: WorktreeContext) -> Self {
-        Self { context }
-    }
-}
-
-impl Tool for ReadWorktreeFile {
-    fn name(&self) -> &str {
-        "read_worktree_file"
-    }
-
-    fn description(&self) -> &str {
-        DESC_READ_WORKTREE_FILE
-    }
-
-    fn parameters(&self) -> Value {
-        path_schema()
-    }
-
-    fn origin(&self) -> Origin {
-        Origin::Builtin
-    }
-
-    fn requires_worktree(&self) -> bool {
-        true
-    }
-
-    fn execute(&self, arguments: &Value) -> Result<ToolOutput, ToolError> {
-        let arguments = Arguments::new(self.name(), arguments);
-        let path = self.context.path(self.name(), arguments.text("path")?)?;
-        let range = arguments.range()?;
-        let body = self
-            .context
-            .source
-            .read_file(&path, None)
-            .map_err(|error| WorktreeContext::failed_read(self.name(), error))?;
-        self.context.answer().file(self.name(), &path, range, body)
-    }
-}
-
-pub struct SearchWorktree {
-    context: WorktreeContext,
-    description: String,
-}
-
-impl SearchWorktree {
-    pub fn new(context: WorktreeContext) -> Self {
-        let description = desc_search_worktree(context.limits);
-        Self {
-            context,
-            description,
-        }
-    }
-}
-
-impl Tool for SearchWorktree {
-    fn name(&self) -> &str {
-        "search_worktree"
-    }
-
-    fn description(&self) -> &str {
-        &self.description
-    }
-
-    fn parameters(&self) -> Value {
-        search_schema()
-    }
-
-    fn origin(&self) -> Origin {
-        Origin::Builtin
-    }
-
-    fn requires_worktree(&self) -> bool {
-        true
-    }
-
-    fn execute(&self, arguments: &Value) -> Result<ToolOutput, ToolError> {
-        let arguments = Arguments::new(self.name(), arguments);
-        let query = arguments.text("query")?;
-        let glob = match arguments.optional_text("glob")? {
+        let checked = self.signature.validate(self.name(), arguments)?;
+        let query = checked.text("query").unwrap_or_default();
+        let glob = match checked.text("glob") {
             Some(given) => Some(check_glob(&self.context.paths, self.name(), given)?),
             None => None,
         };
@@ -1047,10 +816,7 @@ impl Tool for SearchWorktree {
             .source
             .search(query, glob.as_deref())
             .map_err(|error| WorktreeContext::failed(self.name(), error))?;
-        Ok(self
-            .context
-            .answer()
-            .hits(hits.into_iter().map(Hit::from).collect(), None))
+        Ok(self.context.answer().hits(hits, self.empty_note.as_deref()))
     }
 }
 
@@ -1059,34 +825,34 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use serde_json::json;
+
     use super::*;
     use crate::config::SecuritySettings;
-    use crate::platform::{Listing, SearchHit as RepoHit};
-    use crate::worktree::{LineRange as DiskRange, SearchHit as DiskHit};
+    use crate::worktree::{Listing, SearchHit};
 
-    /// Counts every question it is asked. That is the whole point of these
-    /// fakes: an out of bounds argument has to be refused *before* the source
-    /// is reached, and only a counter can tell that from a source that was
-    /// asked and happened to answer with nothing.
-    struct CountingRepo {
-        calls: AtomicUsize,
-        listing: Listing,
-        body: String,
-        hits: Vec<RepoHit>,
-    }
-
-    struct CountingDisk {
+    /// Counts every question it is asked. That is the whole point of this
+    /// fake: an out of bounds argument has to be refused *before* the
+    /// worktree is reached, and only a counter can tell that from a worktree
+    /// that was asked and happened to answer with nothing.
+    struct CountingWorktree {
         calls: AtomicUsize,
         root: PathBuf,
-        paths: Vec<String>,
+        reach: Reach,
+        listing: Listing,
         body: String,
-        hits: Vec<DiskHit>,
+        hits: Vec<SearchHit>,
     }
 
-    impl CountingRepo {
-        fn empty() -> Self {
+    impl CountingWorktree {
+        fn empty(root: &Path) -> Self {
             Self {
                 calls: AtomicUsize::new(0),
+                root: root.to_path_buf(),
+                reach: Reach {
+                    content: Content::Checkout,
+                    search: Search::Regex,
+                },
                 listing: Listing {
                     paths: Vec::new(),
                     complete: true,
@@ -1101,24 +867,28 @@ mod tests {
         }
     }
 
-    impl CountingDisk {
-        fn empty(root: &Path) -> Self {
-            Self {
-                calls: AtomicUsize::new(0),
-                root: root.to_path_buf(),
-                paths: Vec::new(),
-                body: String::new(),
-                hits: Vec::new(),
-            }
+    impl WorktreeSource for CountingWorktree {
+        fn root(&self) -> &Path {
+            &self.root
         }
 
-        fn calls(&self) -> usize {
-            self.calls.load(Ordering::SeqCst)
+        fn reach(&self) -> Reach {
+            self.reach
         }
-    }
 
-    impl RepoSource for CountingRepo {
-        fn list_files(&self, _glob: &str) -> Result<Listing, PlatformError> {
+        fn open_in(&self, _run_dir: &Path) -> Result<(), WorktreeError> {
+            Ok(())
+        }
+
+        fn head_sha(&self) -> Result<Option<String>, WorktreeError> {
+            Ok(Some("head".to_string()))
+        }
+
+        fn supply(&self, _path: &str) -> Result<(), WorktreeError> {
+            Ok(())
+        }
+
+        fn list_files(&self, _glob: &str) -> Result<Listing, WorktreeError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.listing.clone())
         }
@@ -1126,42 +896,17 @@ mod tests {
         fn read_file(
             &self,
             _path: &str,
-            _lines: Option<RepoRange>,
-        ) -> Result<String, PlatformError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(self.body.clone())
-        }
-
-        fn search(&self, _query: &str, _glob: Option<&str>) -> Result<Vec<RepoHit>, PlatformError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(self.hits.clone())
-        }
-    }
-
-    impl WorktreeSource for CountingDisk {
-        fn root(&self) -> &Path {
-            &self.root
-        }
-
-        fn head_sha(&self) -> Result<String, WorktreeError> {
-            Ok("head".to_string())
-        }
-
-        fn list_files(&self, _glob: &str) -> Result<Vec<String>, WorktreeError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(self.paths.clone())
-        }
-
-        fn read_file(
-            &self,
-            _path: &str,
-            _lines: Option<DiskRange>,
+            _lines: Option<LineRange>,
         ) -> Result<String, WorktreeError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.body.clone())
         }
 
-        fn search(&self, _query: &str, _glob: Option<&str>) -> Result<Vec<DiskHit>, WorktreeError> {
+        fn search(
+            &self,
+            _query: &str,
+            _glob: Option<&str>,
+        ) -> Result<Vec<SearchHit>, WorktreeError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.hits.clone())
         }
@@ -1178,21 +923,13 @@ mod tests {
     /// The caps have no defaults in config either, so the fixtures name them
     /// once here rather than sprinkling numbers through the tests.
     const LIMITS: ToolLimits = ToolLimits {
-        max_read_bytes: 262_144,
+        max_file_bytes: 262_144,
         max_output_bytes: 65_536,
-        max_files_listed: 200,
-        max_search_hits: 50,
+        max_files_per_listing: 200,
+        max_hits_per_search: 50,
     };
 
-    fn repo_context(source: &Arc<CountingRepo>, deny: &[&str]) -> RepoContext {
-        RepoContext::new(
-            Arc::clone(source) as Arc<dyn RepoSource>,
-            policy(deny, None),
-            LIMITS,
-        )
-    }
-
-    fn disk_context(source: &Arc<CountingDisk>, deny: &[&str]) -> WorktreeContext {
+    fn context(source: &Arc<CountingWorktree>, deny: &[&str]) -> WorktreeContext {
         let root = source.root().to_path_buf();
         WorktreeContext::new(
             Arc::clone(source) as Arc<dyn WorktreeSource>,
@@ -1201,21 +938,13 @@ mod tests {
         )
     }
 
-    fn repo_tools(source: &Arc<CountingRepo>, deny: &[&str]) -> Vec<Box<dyn Tool>> {
-        let context = repo_context(source, deny);
+    fn tools(source: &Arc<CountingWorktree>, deny: &[&str]) -> Vec<Box<dyn Tool>> {
+        let context = context(source, deny);
         vec![
-            Box::new(ListRepoFiles::new(context.clone())),
-            Box::new(ReadRepoFile::new(context.clone())),
-            Box::new(SearchRepo::new(context, Capabilities::default())),
-        ]
-    }
-
-    fn disk_tools(source: &Arc<CountingDisk>, deny: &[&str]) -> Vec<Box<dyn Tool>> {
-        let context = disk_context(source, deny);
-        vec![
-            Box::new(ListWorktreeFiles::new(context.clone())),
-            Box::new(ReadWorktreeFile::new(context.clone())),
-            Box::new(SearchWorktree::new(context)),
+            Box::new(ListFiles::new(context.clone())),
+            Box::new(StatFile::new(context.clone())),
+            Box::new(ReadFile::new(context.clone())),
+            Box::new(SearchCode::new(context)),
         ]
     }
 
@@ -1223,22 +952,21 @@ mod tests {
     /// somewhere it may not go.
     fn out_of_bounds(tool: &str) -> Value {
         match tool {
-            "list_repo_files" | "list_worktree_files" => json!({"glob": "../etc/**"}),
-            "read_repo_file" | "read_worktree_file" => json!({"path": "../etc/passwd"}),
+            ListFiles::NAME => json!({"glob": "../etc/**"}),
+            ReadFile::NAME | StatFile::NAME => json!({"path": "../etc/passwd"}),
             _ => json!({"query": "password", "glob": "secrets/**"}),
         }
     }
 
-    /// The boundary case for every one of the six, because the check being in
+    /// The boundary case for every one of the four, because the check being in
     /// the tool is the only thing holding the read boundary up: there is no
-    /// type that a source refuses to be called with (§6 security).
+    /// type that a worktree refuses to be called with (§6 security).
     #[test]
-    fn an_out_of_bounds_argument_is_refused_before_either_source_is_asked() {
-        let repo = Arc::new(CountingRepo::empty());
+    fn an_out_of_bounds_argument_is_refused_before_the_worktree_is_asked() {
         let root = tempfile::tempdir().expect("temp dir");
-        let disk = Arc::new(CountingDisk::empty(root.path()));
+        let worktree = Arc::new(CountingWorktree::empty(root.path()));
 
-        for tool in repo_tools(&repo, &["secrets/**"]) {
+        for tool in tools(&worktree, &["secrets/**"]) {
             let error = tool
                 .execute(&out_of_bounds(tool.name()))
                 .expect_err(tool.name());
@@ -1253,19 +981,7 @@ mod tests {
                 tool.name()
             );
         }
-        assert_eq!(repo.calls(), 0, "no repository read was attempted");
-
-        for tool in disk_tools(&disk, &["secrets/**"]) {
-            let error = tool
-                .execute(&out_of_bounds(tool.name()))
-                .expect_err(tool.name());
-            assert!(
-                matches!(error, ToolError::Rejected { .. }),
-                "{}: {error}",
-                tool.name()
-            );
-        }
-        assert_eq!(disk.calls(), 0, "no disk read was attempted");
+        assert_eq!(worktree.calls(), 0, "no read was attempted");
     }
 
     /// A denied path is dropped from a listing rather than turned into a
@@ -1274,7 +990,8 @@ mod tests {
     /// trying to read it is refused separately.
     #[test]
     fn listings_drop_denied_paths_and_keep_ones_that_cannot_be_read() {
-        let repo = Arc::new(CountingRepo {
+        let root = tempfile::tempdir().expect("temp dir");
+        let worktree = Arc::new(CountingWorktree {
             listing: Listing {
                 paths: vec![
                     "src/parse.c".to_string(),
@@ -1283,66 +1000,72 @@ mod tests {
                 ],
                 complete: true,
             },
-            ..CountingRepo::empty()
+            ..CountingWorktree::empty(root.path())
         });
-        let context = repo_context(&repo, &["secrets/**"]);
+        let context = context(&worktree, &["secrets/**"]);
 
-        let listed = ListRepoFiles::new(context.clone())
+        let listed = ListFiles::new(context.clone())
             .execute(&json!({"glob": "**/*"}))
             .expect("listed");
         assert!(listed.text.contains("src/parse.c"), "{}", listed.text);
         assert!(listed.text.contains("Makefile"), "{}", listed.text);
         assert!(!listed.text.contains("secrets/"), "{}", listed.text);
 
-        let refused = ReadRepoFile::new(context)
+        let refused = ReadFile::new(context)
             .execute(&json!({"path": "Makefile"}))
             .expect_err("no extension");
         assert!(matches!(refused, ToolError::Rejected { .. }), "{refused}");
-        assert_eq!(repo.calls(), 1, "the refused read never reached the source");
+        assert_eq!(
+            worktree.calls(),
+            1,
+            "the refused read never reached the worktree"
+        );
     }
 
     #[test]
     fn a_search_drops_hits_in_denied_files() {
-        let repo = Arc::new(CountingRepo {
+        let root = tempfile::tempdir().expect("temp dir");
+        let worktree = Arc::new(CountingWorktree {
             hits: vec![
-                RepoHit {
+                SearchHit {
                     path: "src/parse.c".to_string(),
                     line: 12,
                     text: "int token = 5;".to_string(),
                 },
-                RepoHit {
+                SearchHit {
                     path: "secrets/deploy.toml".to_string(),
                     line: 3,
                     text: "token = \"real\"".to_string(),
                 },
             ],
-            ..CountingRepo::empty()
+            ..CountingWorktree::empty(root.path())
         });
-        let output = SearchRepo::new(
-            repo_context(&repo, &["secrets/**"]),
-            Capabilities::default(),
-        )
-        .execute(&json!({"query": "token"}))
-        .expect("searched");
+        let output = SearchCode::new(context(&worktree, &["secrets/**"]))
+            .execute(&json!({"query": "token"}))
+            .expect("searched");
         assert!(output.text.contains("src/parse.c:12:"), "{}", output.text);
         assert!(!output.text.contains("secrets/"), "{}", output.text);
     }
 
     #[test]
     fn a_listing_past_the_ceiling_says_how_many_are_left() {
-        let repo = Arc::new(CountingRepo {
+        let root = tempfile::tempdir().expect("temp dir");
+        let worktree = Arc::new(CountingWorktree {
             listing: Listing {
-                paths: (0..LIMITS.max_files_listed + 5)
+                paths: (0..LIMITS.max_files_per_listing + 5)
                     .map(|index| format!("src/file{index:04}.c"))
                     .collect(),
                 complete: true,
             },
-            ..CountingRepo::empty()
+            ..CountingWorktree::empty(root.path())
         });
-        let output = ListRepoFiles::new(repo_context(&repo, &[]))
+        let output = ListFiles::new(context(&worktree, &[]))
             .execute(&json!({"glob": "src/**/*.c"}))
             .expect("listed");
-        assert_eq!(output.text.lines().count(), LIMITS.max_files_listed + 1);
+        assert_eq!(
+            output.text.lines().count(),
+            LIMITS.max_files_per_listing + 1
+        );
         assert!(output.text.contains("5 more paths"), "{}", output.text);
     }
 
@@ -1351,14 +1074,15 @@ mod tests {
     /// something does not exist.
     #[test]
     fn an_incomplete_listing_says_so_in_words_the_model_reads() {
-        let repo = Arc::new(CountingRepo {
+        let root = tempfile::tempdir().expect("temp dir");
+        let worktree = Arc::new(CountingWorktree {
             listing: Listing {
                 paths: vec!["src/parse.c".to_string()],
                 complete: false,
             },
-            ..CountingRepo::empty()
+            ..CountingWorktree::empty(root.path())
         });
-        let output = ListRepoFiles::new(repo_context(&repo, &[]))
+        let output = ListFiles::new(context(&worktree, &[]))
             .execute(&json!({"glob": "src/**/*.c"}))
             .expect("listed");
         assert!(
@@ -1373,11 +1097,12 @@ mod tests {
     /// evidence against, so a real read has to leave one behind.
     #[test]
     fn a_successful_read_records_what_was_fetched_and_narrows_to_the_range() {
-        let repo = Arc::new(CountingRepo {
+        let root = tempfile::tempdir().expect("temp dir");
+        let worktree = Arc::new(CountingWorktree {
             body: "one\ntwo\nthree\nfour\n".to_string(),
-            ..CountingRepo::empty()
+            ..CountingWorktree::empty(root.path())
         });
-        let output = ReadRepoFile::new(repo_context(&repo, &[]))
+        let output = ReadFile::new(context(&worktree, &[]))
             .execute(&json!({"path": "src/parse.c", "first_line": 2, "last_line": 3}))
             .expect("read");
 
@@ -1388,49 +1113,42 @@ mod tests {
         assert_eq!(file.body, "two\nthree");
     }
 
-    /// Past `max_read_bytes` the answer is a refusal with the size in it. A
+    fn with_limits(source: &Arc<CountingWorktree>, limits: ToolLimits) -> WorktreeContext {
+        let root = source.root().to_path_buf();
+        WorktreeContext::new(
+            Arc::clone(source) as Arc<dyn WorktreeSource>,
+            policy(&[], Some(&root)),
+            limits,
+        )
+    }
+
+    /// Past `max_file_bytes` the answer is a refusal with the size in it. A
     /// silent clip would read exactly like a short file.
     #[test]
-    fn a_file_over_max_read_bytes_is_refused_rather_than_clipped() {
-        let repo = Arc::new(CountingRepo {
+    fn a_file_over_max_file_bytes_is_refused_rather_than_clipped() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let worktree = Arc::new(CountingWorktree {
             body: "x".repeat(1_000),
-            ..CountingRepo::empty()
+            ..CountingWorktree::empty(root.path())
         });
-        let context = RepoContext::new(
-            Arc::clone(&repo) as Arc<dyn RepoSource>,
-            policy(&[], None),
+        let context = with_limits(
+            &worktree,
             ToolLimits {
-                max_read_bytes: 100,
+                max_file_bytes: 100,
                 ..LIMITS
             },
         );
-        let error = ReadRepoFile::new(context)
+        let error = ReadFile::new(context.clone())
             .execute(&json!({"path": "src/parse.c"}))
             .expect_err("over the ceiling");
         assert!(matches!(error, ToolError::Rejected { .. }), "{error}");
-        assert!(error.to_string().contains("max_read_bytes"), "{error}");
+        assert!(error.to_string().contains("max_file_bytes"), "{error}");
         assert!(error.to_string().contains("1000"), "{error}");
-    }
 
-    /// `max_read_bytes` bounds the fetch, not the answer, so a range is no
-    /// way around it: slicing a file means downloading all of it first, and
-    /// the platform API has no way to ask for part of a blob.
-    #[test]
-    fn a_line_range_does_not_get_an_oversized_file_past_the_ceiling() {
-        let repo = Arc::new(CountingRepo {
-            body: "x".repeat(1_000),
-            ..CountingRepo::empty()
-        });
-        let context = RepoContext::new(
-            Arc::clone(&repo) as Arc<dyn RepoSource>,
-            policy(&[], None),
-            ToolLimits {
-                max_read_bytes: 100,
-                ..LIMITS
-            },
-        );
+        // A range is no way around it: reading part of a file means reading
+        // all of it first, whichever shape the worktree has.
         assert!(
-            ReadRepoFile::new(context)
+            ReadFile::new(context)
                 .execute(&json!({"path": "src/parse.c", "first_line": 1, "last_line": 1}))
                 .is_err()
         );
@@ -1442,20 +1160,20 @@ mod tests {
     /// with the numbers needed to ask again for a part that fits.
     #[test]
     fn a_file_too_big_to_return_is_refused_with_the_numbers_to_page_it() {
-        let repo = Arc::new(CountingRepo {
+        let root = tempfile::tempdir().expect("temp dir");
+        let worktree = Arc::new(CountingWorktree {
             body: "0123456789\n".repeat(400),
-            ..CountingRepo::empty()
+            ..CountingWorktree::empty(root.path())
         });
-        let context = RepoContext::new(
-            Arc::clone(&repo) as Arc<dyn RepoSource>,
-            policy(&[], None),
+        let context = with_limits(
+            &worktree,
             ToolLimits {
                 max_output_bytes: 500,
                 ..LIMITS
             },
         );
 
-        let error = ReadRepoFile::new(context.clone())
+        let error = ReadFile::new(context.clone())
             .execute(&json!({"path": "src/parse.c"}))
             .expect_err("4400 bytes do not fit in 500");
         let said = error.to_string();
@@ -1465,55 +1183,39 @@ mod tests {
         assert!(said.contains("line range"), "{said}");
 
         // And the range it was told to use comes back whole, not clipped.
-        let output = ReadRepoFile::new(context)
+        let output = ReadFile::new(context.clone())
             .execute(&json!({"path": "src/parse.c", "first_line": 1, "last_line": 30}))
             .expect("30 lines fit");
         assert_eq!(output.text.lines().count(), 30);
         assert_eq!(output.omitted_bytes, 0, "a read is never clipped");
-    }
 
-    /// A range that still does not fit is refused the same way rather than
-    /// clipped, or paging would silently stop being paging.
-    #[test]
-    fn a_range_too_big_to_return_is_refused_too() {
-        let repo = Arc::new(CountingRepo {
-            body: "0123456789\n".repeat(400),
-            ..CountingRepo::empty()
-        });
-        let context = RepoContext::new(
-            Arc::clone(&repo) as Arc<dyn RepoSource>,
-            policy(&[], None),
-            ToolLimits {
-                max_output_bytes: 500,
-                ..LIMITS
-            },
-        );
-        let error = ReadRepoFile::new(context)
+        // A range that still does not fit is refused the same way rather than
+        // clipped, or paging would silently stop being paging.
+        let refused = ReadFile::new(context)
             .execute(&json!({"path": "src/parse.c", "first_line": 10, "last_line": 300}))
             .expect_err("291 lines do not fit either");
-        assert!(error.to_string().contains("lines 10-300"), "{error}");
+        assert!(refused.to_string().contains("lines 10-300"), "{refused}");
     }
 
-    /// What `stat` is for: the size, and what to do about it, without paying
-    /// for any of the content. A file too big to read at all says so, so the
-    /// model does not spend a round finding out.
+    /// What `stat_file` is for: the size, and what to do about it, without
+    /// paying for any of the content. A file too big to read at all says so,
+    /// so the model does not spend a round finding out.
     #[test]
     fn stat_answers_with_the_size_and_a_plan_and_no_content() {
-        let repo = Arc::new(CountingRepo {
+        let root = tempfile::tempdir().expect("temp dir");
+        let worktree = Arc::new(CountingWorktree {
             body: "0123456789\n".repeat(400),
-            ..CountingRepo::empty()
+            ..CountingWorktree::empty(root.path())
         });
-        let context = RepoContext::new(
-            Arc::clone(&repo) as Arc<dyn RepoSource>,
-            policy(&[], None),
+        let output = StatFile::new(with_limits(
+            &worktree,
             ToolLimits {
                 max_output_bytes: 500,
                 ..LIMITS
             },
-        );
-        let output = StatRepoFile::new(context)
-            .execute(&json!({"path": "src/parse.c"}))
-            .expect("stat");
+        ))
+        .execute(&json!({"path": "src/parse.c"}))
+        .expect("stat");
         assert!(
             output.text.contains("4400 bytes, 400 lines"),
             "{}",
@@ -1534,74 +1236,82 @@ mod tests {
             "a size is not a file this run read"
         );
 
-        let tight = RepoContext::new(
-            Arc::clone(&repo) as Arc<dyn RepoSource>,
-            policy(&[], None),
+        let output = StatFile::new(with_limits(
+            &worktree,
             ToolLimits {
-                max_read_bytes: 100,
+                max_file_bytes: 100,
                 ..LIMITS
             },
-        );
-        let output = StatRepoFile::new(tight)
-            .execute(&json!({"path": "src/parse.c"}))
-            .expect("stat still answers for a file too big to read");
-        assert!(output.text.contains("max_read_bytes"), "{}", output.text);
+        ))
+        .execute(&json!({"path": "src/parse.c"}))
+        .expect("stat still answers for a file too big to read");
+        assert!(output.text.contains("max_file_bytes"), "{}", output.text);
     }
 
     #[test]
     fn half_a_line_range_is_answered_rather_than_guessed_at() {
-        let repo = Arc::new(CountingRepo::empty());
-        let error = ReadRepoFile::new(repo_context(&repo, &[]))
+        let root = tempfile::tempdir().expect("temp dir");
+        let worktree = Arc::new(CountingWorktree::empty(root.path()));
+        let error = ReadFile::new(context(&worktree, &[]))
             .execute(&json!({"path": "src/parse.c", "first_line": 4}))
             .expect_err("half a range");
         assert!(
             matches!(error, ToolError::InvalidArguments { .. }),
             "{error}"
         );
-        assert_eq!(repo.calls(), 0);
+        assert_eq!(worktree.calls(), 0);
     }
 
-    /// The names are the ones `config` reserves, and `search_repo` describes
-    /// the instance it was registered for rather than the group it is in: the
-    /// same name is a regular expression on one platform and a keyword index
-    /// on another, and the model reads only the description.
+    /// The names are fixed now, so the description is the only thing that can
+    /// say what this run's worktree is and how far a search reaches. Every
+    /// shape has to say it, because the model reads only the description.
     #[test]
-    fn the_searches_describe_the_strength_they_actually_have() {
-        let repo = Arc::new(CountingRepo::empty());
-        let keyword = SearchRepo::new(
-            repo_context(&repo, &[]),
-            Capabilities {
-                code_search: true,
-                regex_search: false,
-            },
-        );
-        assert_eq!(keyword.name(), "search_repo");
-        assert!(keyword.description().contains("keyword matching"));
-        assert!(
-            keyword
-                .description()
-                .contains("regex metacharacters are literal")
-        );
-        assert!(keyword.description().contains("does not mean it is absent"));
-
-        let expressions = SearchRepo::new(
-            repo_context(&repo, &[]),
-            Capabilities {
-                code_search: true,
-                regex_search: true,
-            },
-        );
-        assert!(
-            expressions.description().contains("regular expression")
-                && !expressions.description().contains("literal"),
-            "{}",
-            expressions.description()
-        );
-
+    fn the_descriptions_say_which_worktree_this_is_and_how_far_it_reaches() {
         let root = tempfile::tempdir().expect("temp dir");
-        let disk = Arc::new(CountingDisk::empty(root.path()));
-        let local = SearchWorktree::new(disk_context(&disk, &[]));
-        assert!(local.description().contains("regular expression"));
+        let checkout = Arc::new(CountingWorktree::empty(root.path()));
+        let read = ReadFile::new(context(&checkout, &[]));
+        assert_eq!(read.name(), "read_file");
+        assert!(read.description().contains("checkout under review"));
+        assert!(
+            read.description().contains("262144"),
+            "the fetch ceiling is a number, not a word: {}",
+            read.description()
+        );
+        assert!(
+            SearchCode::new(context(&checkout, &[]))
+                .description()
+                .contains("regular expression")
+        );
+
+        let fetched = Arc::new(CountingWorktree {
+            reach: Reach {
+                content: Content::Fetched,
+                search: Search::Keyword,
+            },
+            ..CountingWorktree::empty(root.path())
+        });
+        let read = ReadFile::new(context(&fetched, &[]));
+        assert!(
+            read.description().contains("started empty"),
+            "{}",
+            read.description()
+        );
+        assert!(
+            read.description().contains("fetched"),
+            "{}",
+            read.description()
+        );
+        let search = SearchCode::new(context(&fetched, &[]));
+        assert!(search.description().contains("keyword matching"));
+        assert!(search.description().contains("metacharacters are literal"));
+        assert!(search.description().contains("does not mean it is absent"));
+
+        let listing = ListFiles::new(context(&fetched, &[]));
+        assert!(
+            listing.description().contains("whole repository"),
+            "a listing is not a list of what has been fetched: {}",
+            listing.description()
+        );
     }
 
     /// An empty answer from a keyword index that only covers the default
@@ -1609,16 +1319,17 @@ mod tests {
     /// that instead of just being empty.
     #[test]
     fn an_empty_keyword_search_says_that_it_is_not_a_denial() {
-        let repo = Arc::new(CountingRepo::empty());
-        let output = SearchRepo::new(
-            repo_context(&repo, &[]),
-            Capabilities {
-                code_search: true,
-                regex_search: false,
+        let root = tempfile::tempdir().expect("temp dir");
+        let worktree = Arc::new(CountingWorktree {
+            reach: Reach {
+                content: Content::Fetched,
+                search: Search::Keyword,
             },
-        )
-        .execute(&json!({"query": "parse_token"}))
-        .expect("searched");
+            ..CountingWorktree::empty(root.path())
+        });
+        let output = SearchCode::new(context(&worktree, &[]))
+            .execute(&json!({"query": "parse_token"}))
+            .expect("searched");
         assert!(
             output.text.contains("does not mean it is absent"),
             "{}",
@@ -1626,44 +1337,27 @@ mod tests {
         );
     }
 
-    /// The disk tools are the ones that need a checkout, and they say so, so
-    /// `build_tools` has something to go on beyond knowing their names.
+    /// The real `Checkout`, because a symlink out of the tree has to be
+    /// refused against a real filesystem rather than a fake.
     #[test]
-    fn only_the_disk_group_declares_that_it_needs_a_worktree() {
-        let repo = Arc::new(CountingRepo::empty());
-        let root = tempfile::tempdir().expect("temp dir");
-        let disk = Arc::new(CountingDisk::empty(root.path()));
-        for tool in repo_tools(&repo, &[]) {
-            assert!(!tool.requires_worktree(), "{}", tool.name());
-            assert_eq!(tool.origin(), Origin::Builtin);
-        }
-        for tool in disk_tools(&disk, &[]) {
-            assert!(tool.requires_worktree(), "{}", tool.name());
-            assert_eq!(tool.origin(), Origin::Builtin);
-        }
-    }
-
-    /// The disk group reads a real checkout through the real `LocalWorktree`,
-    /// which is what a symlink out of the tree has to be refused against.
-    #[test]
-    fn a_worktree_read_goes_through_the_checkout_and_stops_at_its_edge() {
+    fn a_read_goes_through_the_worktree_and_stops_at_its_edge() {
         let root = tempfile::tempdir().expect("temp dir");
         std::fs::create_dir_all(root.path().join("src")).expect("src");
         std::fs::write(root.path().join("src/parse.c"), "int main(void)\n{\n}\n").expect("source");
         let worktree =
-            crate::worktree::LocalWorktree::open(root.path().to_path_buf()).expect("worktree");
+            crate::worktree::Checkout::open(root.path().to_path_buf()).expect("worktree");
         let context = WorktreeContext::new(
             Arc::new(worktree) as Arc<dyn WorktreeSource>,
             policy(&[], Some(root.path())),
             LIMITS,
         );
 
-        let listed = ListWorktreeFiles::new(context.clone())
+        let listed = ListFiles::new(context.clone())
             .execute(&json!({"glob": "**/*.c"}))
             .expect("listed");
         assert!(listed.text.contains("src/parse.c"), "{}", listed.text);
 
-        let read = ReadWorktreeFile::new(context.clone())
+        let read = ReadFile::new(context.clone())
             .execute(&json!({"path": "src/parse.c"}))
             .expect("read");
         assert!(read.text.contains("int main(void)"), "{}", read.text);
@@ -1672,7 +1366,7 @@ mod tests {
             "src/parse.c"
         );
 
-        let hits = SearchWorktree::new(context)
+        let hits = SearchCode::new(context)
             .execute(&json!({"query": r"int\s+main"}))
             .expect("searched");
         assert!(hits.text.contains("src/parse.c:1:"), "{}", hits.text);

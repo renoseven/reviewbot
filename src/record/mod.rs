@@ -26,7 +26,7 @@ pub use lock::DirLock;
 pub use meta::{InputKind, InputRecord, Meta, RunIdentity};
 pub use run_id::{InputIdentity, run_id};
 pub use storage::{LocalStorage, Storage};
-pub use trace::{ContextFile, PublishedView, ToolCall, Trace};
+pub use trace::{Check, ContextFile, PublishedView, ToolCall, Trace};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RecordError {

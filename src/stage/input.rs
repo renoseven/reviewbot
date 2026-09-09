@@ -104,12 +104,10 @@ impl Input {
                 })
             }
             Source::Diff { origin, content } => {
-                // Without a worktree there is no commit to anchor to, and
-                // that is recorded as an empty sha rather than invented.
-                let head_sha = match &adapters.worktree {
-                    Some(worktree) => worktree.head_sha()?,
-                    None => String::new(),
-                };
+                // A worktree the run opened for itself stands on no commit of
+                // its own, and that is recorded as an empty sha rather than
+                // invented: the run id is built out of this.
+                let head_sha = adapters.worktree.head_sha()?.unwrap_or_default();
                 Ok(InputRecord {
                     kind: InputKind::Diff,
                     source: origin.clone(),
@@ -145,18 +143,19 @@ impl Input {
                 })?;
         let fetched = platform.fetch_change(&change)?;
 
-        // A worktree standing on a different commit would make every line
-        // number wrong, so it is refused before anything is read.
-        if let Some(worktree) = &context.adapters.worktree {
-            let actual = worktree.head_sha()?;
-            if actual != fetched.head_sha {
-                return Err(StageError::Worktree(
-                    crate::worktree::WorktreeError::HeadMismatch {
-                        actual,
-                        expected: fetched.head_sha.clone(),
-                    },
-                ));
-            }
+        // A checkout standing on a different commit would make every line
+        // number wrong, so it is refused before anything is read. A worktree
+        // the run filled itself has no commit of its own to disagree with:
+        // every file in it was fetched at this very sha.
+        if let Some(actual) = context.adapters.worktree.head_sha()?
+            && actual != fetched.head_sha
+        {
+            return Err(StageError::Worktree(
+                crate::worktree::WorktreeError::HeadMismatch {
+                    actual,
+                    expected: fetched.head_sha.clone(),
+                },
+            ));
         }
 
         // The platform's diff endpoint returns the same unified diff a local
@@ -176,10 +175,7 @@ impl Input {
     }
 
     fn from_diff(context: &mut StageContext<'_>, content: &str) -> Result<ChangeSet, StageError> {
-        let head_sha = match &context.adapters.worktree {
-            Some(worktree) => Some(worktree.head_sha()?),
-            None => None,
-        };
+        let head_sha = context.adapters.worktree.head_sha()?;
         Ok(ChangeSet {
             locator: Locator {
                 head_sha,

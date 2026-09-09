@@ -17,20 +17,21 @@ use crate::protocol::{OutputItem, Protocol, ProtocolError, Request, Response};
 use crate::record::{DirLock, LocalStorage, Storage, layout};
 use crate::security::Redactor;
 use crate::stage::Adapters;
-use crate::tool::{Registry, SubmitComment, SubmitSummary};
+use crate::tool::{FinishReview, Registry, SubmitComment, SubmitSummary};
+use crate::worktree::FetchedWorktree;
 use crate::{Error, RunResult, Source};
 
 const CONFIG: &str = r#"
 [review]
 max_tool_rounds = 12
-max_files_listed = 200
-max_search_hits = 50
-max_read_bytes = 262144
+max_files_per_listing = 200
+max_hits_per_search = 50
+max_file_bytes = 262144
 max_tool_output_bytes = 32768
 
 [triage]
 max_chunk_tokens = 24000
-skip_over_bytes = 262144
+skip_files_over_bytes = 262144
 
 [security]
 allow_extensions = ["rs", "toml", "c", "h"]
@@ -41,24 +42,24 @@ protocol = "openai"
 base_url = "https://api.deepseek.com"
 api_key = "DEEPSEEK_API_KEY"
 currency = "CNY"
-budget = 10.0
+budget_per_run = 10.0
 
 [[model]]
 name = "deepseek-v4-flash"
 default = true
 provider = "deepseek"
-input_per_1m = 2.0
-cached_input_per_1m = 0.2
-output_per_1m = 3.0
-context_window = 131072
+input_per_1m_tokens = 2.0
+cached_input_per_1m_tokens = 0.2
+output_per_1m_tokens = 3.0
+context_window_tokens = 131072
 max_output_tokens = 4096
 
 [[model]]
 name = "deepseek-v4-pro"
 provider = "deepseek"
-input_per_1m = 4.0
-output_per_1m = 12.0
-context_window = 131072
+input_per_1m_tokens = 4.0
+output_per_1m_tokens = 12.0
+context_window_tokens = 131072
 max_output_tokens = 8192
 
 [[platform]]
@@ -269,12 +270,18 @@ fn reply_as_calls(text: &str, request: &Request) -> Option<Vec<OutputItem>> {
 
 fn adapters(calls: Arc<Calls>) -> Adapters {
     let mut tools = Registry::new();
-    tools.register(Box::new(SubmitComment));
+    tools.register(Box::new(SubmitComment::new()));
+    tools.register(Box::new(FinishReview::new()));
+    tools.register(Box::new(SubmitSummary::new()));
     Adapters {
         platform: Some(Box::new(FakePlatform::new(Arc::clone(&calls)))),
         protocol: Box::new(FakeProtocol::new(calls, Arc::new(Mutex::new(Vec::new())))),
         tools,
-        worktree: None,
+        // One worktree, and this one fills itself from the fake platform.
+        worktree: Arc::new(FetchedWorktree::new(
+            Some(Arc::new(FakeRepo) as Arc<dyn RepoSource>),
+            Capabilities::default(),
+        )),
         redactor: Redactor::new(),
     }
 }
@@ -524,7 +531,7 @@ fn resume_refuses_a_run_whose_config_has_changed() {
     let workspace = Workspace::new();
     let first = review(&workspace, Arc::new(Calls::default())).expect("run completes");
 
-    let changed = CONFIG.replace("budget = 10.0", "budget = 20.0");
+    let changed = CONFIG.replace("budget_per_run = 10.0", "budget_per_run = 20.0");
     std::fs::write(&workspace.config_path, changed).expect("rewrite config");
 
     let error = crate::resume_with(
@@ -542,7 +549,7 @@ fn an_explicit_run_id_does_not_get_around_the_fingerprint_check() {
     let workspace = Workspace::new();
     let first = review(&workspace, Arc::new(Calls::default())).expect("run completes");
 
-    let changed = CONFIG.replace("budget = 10.0", "budget = 20.0");
+    let changed = CONFIG.replace("budget_per_run = 10.0", "budget_per_run = 20.0");
     std::fs::write(&workspace.config_path, changed).expect("rewrite config");
     let settings = workspace.settings_with(RunOptions {
         runs_dir: workspace.runs_dir.clone(),
@@ -595,7 +602,7 @@ fn run_parameters_do_not_change_identity_but_conclusions_do() {
 
     std::fs::write(
         &workspace.config_path,
-        CONFIG.replace("budget = 10.0", "budget = 11.0"),
+        CONFIG.replace("budget_per_run = 10.0", "budget_per_run = 11.0"),
     )
     .expect("rewrite config");
     assert_ne!(
@@ -642,7 +649,7 @@ fn a_diff_run_completes_without_a_platform() {
                 Arc::new(Mutex::new(Vec::new())),
             )),
             tools: Registry::new(),
-            worktree: None,
+            worktree: Arc::new(FetchedWorktree::new(None, Capabilities::default())),
             redactor: Redactor::new(),
         },
     )
@@ -696,7 +703,9 @@ fn scripted_diff_adapters(
 ) -> (Adapters, Arc<Mutex<Vec<Request>>>) {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let mut tools = Registry::new();
-    tools.register(Box::new(SubmitComment));
+    tools.register(Box::new(SubmitComment::new()));
+    tools.register(Box::new(FinishReview::new()));
+    tools.register(Box::new(SubmitSummary::new()));
     let adapters = Adapters {
         platform: None,
         protocol: Box::new(FakeProtocol::scripted(
@@ -705,7 +714,7 @@ fn scripted_diff_adapters(
             replies,
         )),
         tools,
-        worktree: None,
+        worktree: Arc::new(FetchedWorktree::new(None, Capabilities::default())),
         redactor: Redactor::new(),
     };
     (adapters, requests)
@@ -790,7 +799,8 @@ fn an_mbox_is_refused_instead_of_being_stripped() {
 
 #[test]
 fn a_budget_of_zero_still_finishes_the_run_and_names_what_it_could_not_review() {
-    let workspace = Workspace::with_config(&CONFIG.replace("budget = 10.0", "budget = 0.0"));
+    let workspace =
+        Workspace::with_config(&CONFIG.replace("budget_per_run = 10.0", "budget_per_run = 0.0"));
     let calls = Arc::new(Calls::default());
     let result = crate::review_with(
         &workspace.settings(),
@@ -845,7 +855,9 @@ fn what_the_author_wrote_reaches_every_review_request_as_material() {
     let calls = Arc::new(Calls::default());
     let requests = Arc::new(Mutex::new(Vec::new()));
     let mut tools = Registry::new();
-    tools.register(Box::new(SubmitComment));
+    tools.register(Box::new(SubmitComment::new()));
+    tools.register(Box::new(FinishReview::new()));
+    tools.register(Box::new(SubmitSummary::new()));
     let adapters = Adapters {
         platform: Some(Box::new(FakePlatform::narrated(Arc::clone(&calls)))),
         protocol: Box::new(FakeProtocol::scripted(
@@ -854,7 +866,7 @@ fn what_the_author_wrote_reaches_every_review_request_as_material() {
             Vec::new(),
         )),
         tools,
-        worktree: None,
+        worktree: Arc::new(FetchedWorktree::new(None, Capabilities::default())),
         redactor: Redactor::new(),
     };
 
@@ -1053,4 +1065,18 @@ diff --git a/src/parse.c b/src/parse.c
             );
         }
     }
+}
+
+/// The error every caller branches on stays small enough that returning it is
+/// not itself a lint. There is not one suppression attribute in this
+/// repository and that is deliberate, so the type has to be small rather than
+/// the warning silenced — and the way it grows is somebody putting a vendor's
+/// hundred-byte error inline in a variant, which is easy to do by accident.
+#[test]
+fn the_error_type_stays_small_enough_to_return() {
+    let size = std::mem::size_of::<Error>();
+    assert!(
+        size < 128,
+        "Error is {size} bytes; box the payload of whichever variant grew"
+    );
 }
