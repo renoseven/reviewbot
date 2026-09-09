@@ -78,6 +78,8 @@ struct Calls {
     head_sha: AtomicUsize,
     fetch_change: AtomicUsize,
     send: AtomicUsize,
+    existing_comments: AtomicUsize,
+    post_comments: AtomicUsize,
 }
 
 impl Calls {
@@ -86,9 +88,24 @@ impl Calls {
     }
 }
 
+/// The merge request itself: what a reader would see on it. It outlives the
+/// adapters, because a run entered a second time builds its own and still has
+/// to meet the comments the first entry left behind.
+#[derive(Default)]
+struct Mr {
+    comments: Mutex<Vec<ExistingComment>>,
+}
+
+impl Mr {
+    fn len(&self) -> usize {
+        self.comments.lock().expect("mr").len()
+    }
+}
+
 struct FakePlatform {
     calls: Arc<Calls>,
     repo: Arc<FakeRepo>,
+    mr: Arc<Mr>,
     /// What `fetch_change` hands back. Empty by default: most of the URL
     /// tests are about locking and fingerprints and want no chunks at all.
     change: PlatformChange,
@@ -99,6 +116,7 @@ impl FakePlatform {
         Self {
             calls,
             repo: Arc::new(FakeRepo),
+            mr: Arc::new(Mr::default()),
             change: PlatformChange {
                 head_sha: HEAD_SHA.to_string(),
                 base_sha: Some("base".to_string()),
@@ -149,16 +167,31 @@ impl Platform for FakePlatform {
         &self,
         _change: &ChangeRef,
     ) -> Result<Vec<ExistingComment>, PlatformError> {
-        Ok(Vec::new())
+        self.calls.existing_comments.fetch_add(1, Ordering::SeqCst);
+        Ok(self.mr.comments.lock().expect("mr").clone())
     }
 
     fn post_comments(
         &self,
         _change: &ChangeRef,
         _refs: &DiffRefs,
-        _comments: &[OutgoingComment],
+        comments: &[OutgoingComment],
     ) -> Result<Vec<ExistingComment>, PlatformError> {
-        Ok(Vec::new())
+        self.calls.post_comments.fetch_add(1, Ordering::SeqCst);
+        let posted: Vec<ExistingComment> = comments
+            .iter()
+            .map(|comment| ExistingComment {
+                marker: comment.marker.clone(),
+                url: None,
+                degraded_to_file: false,
+            })
+            .collect();
+        self.mr
+            .comments
+            .lock()
+            .expect("mr")
+            .extend(posted.iter().cloned());
+        Ok(posted)
     }
 
     fn bind_repo(&self, _change: &ChangeRef, _head_sha: &str) {}
@@ -286,6 +319,33 @@ fn adapters(calls: Arc<Calls>) -> Adapters {
     }
 }
 
+/// A URL run that really has something to say: a diff behind the change and a
+/// merge request the caller holds on to, so two entries into the same run see
+/// one MR rather than two.
+fn publishing_adapters(calls: Arc<Calls>, mr: Arc<Mr>, replies: Vec<&str>) -> Adapters {
+    let mut tools = Registry::new();
+    tools.register(Box::new(SubmitComment::new()));
+    tools.register(Box::new(FinishReview::new()));
+    tools.register(Box::new(SubmitSummary::new()));
+    let mut platform = FakePlatform::new(Arc::clone(&calls));
+    platform.change.diff = DIFF.to_string();
+    platform.mr = mr;
+    Adapters {
+        platform: Some(Box::new(platform)),
+        protocol: Box::new(FakeProtocol::scripted(
+            calls,
+            Arc::new(Mutex::new(Vec::new())),
+            replies,
+        )),
+        tools,
+        worktree: Arc::new(FetchedWorktree::new(
+            Some(Arc::new(FakeRepo) as Arc<dyn RepoSource>),
+            Capabilities::default(),
+        )),
+        redactor: Redactor::new(),
+    }
+}
+
 struct Workspace {
     root: tempfile::TempDir,
     config_path: PathBuf,
@@ -345,12 +405,13 @@ fn review(workspace: &Workspace, calls: Arc<Calls>) -> Result<RunResult, Error> 
     )
 }
 
-const STAGE_FILES: [(u8, &str); 5] = [
+const STAGE_FILES: [(u8, &str); 6] = [
     (1, "input"),
     (2, "triage"),
     (3, "review"),
     (4, "merge"),
-    (5, "publish"),
+    (5, "report"),
+    (6, "publish"),
 ];
 
 fn stage_paths(run_dir: &Path) -> Vec<PathBuf> {
@@ -1009,6 +1070,72 @@ fn a_scored_run_writes_the_report_and_a_second_run_does_not_score_again() {
     );
     assert_eq!(second.overall_score, Some(54));
     assert_eq!(second.comments.len(), 1);
+}
+
+/// The reason the last two stages have no checkpoint skip. A run that got all
+/// the way through is entered again with nothing left to compute: the report
+/// still has to be rendered — that is how somebody gets it back after
+/// deleting it — and the MR still has to be looked at, and still has to hear
+/// nothing, because everything on it is already there.
+#[test]
+fn a_finished_run_entered_again_rewrites_the_report_and_says_nothing_twice() {
+    let workspace = Workspace::with_config(
+        &CONFIG.replace("[triage]", "[triage]\nskip_paths = [\"vendor/**\"]"),
+    );
+    let settings = workspace.settings_with(RunOptions {
+        runs_dir: workspace.runs_dir.clone(),
+        publish: true,
+        ..RunOptions::default()
+    });
+    let mr = Arc::new(Mr::default());
+
+    let first = crate::review_with(
+        &settings,
+        &Source::Url(URL.to_string()),
+        &publishing_adapters(
+            Arc::new(Calls::default()),
+            Arc::clone(&mr),
+            vec![FINDING, SCORE],
+        ),
+    )
+    .expect("run completes");
+
+    assert_eq!(
+        first.published.len(),
+        2,
+        "the finding and the summary went out"
+    );
+    assert_eq!(mr.len(), 2);
+
+    // Whatever the report stage would have been skipped over, it has to
+    // replace: this is not a renderer's output.
+    let run_dir = workspace.run_dir(&first.run_id);
+    std::fs::write(run_dir.join(layout::REPORT), b"stale").expect("overwrite the report");
+
+    let calls = Arc::new(Calls::default());
+    let second = crate::review_with(
+        &settings,
+        &Source::Url(URL.to_string()),
+        &publishing_adapters(Arc::clone(&calls), Arc::clone(&mr), Vec::new()),
+    )
+    .expect("the second entry completes");
+
+    assert_eq!(second.run_id, first.run_id);
+    assert_eq!(Calls::get(&calls.send), 0, "nothing is reviewed again");
+    let report = std::fs::read_to_string(run_dir.join(layout::REPORT)).expect("the report is back");
+    assert!(
+        report.contains("## [major 74% / certain 91%] `src/parse.c:11`"),
+        "the report stage ran and rendered it from the checkpoints: {report}"
+    );
+
+    assert_eq!(
+        Calls::get(&calls.existing_comments),
+        1,
+        "what the MR already says is what decides, so it is read every time"
+    );
+    assert_eq!(Calls::get(&calls.post_comments), 0);
+    assert_eq!(mr.len(), 2, "not one comment was said twice");
+    assert_eq!(second.published.len(), 2, "published.json carries over");
 }
 
 const SECRET_KEY: &str = "sk-abcdefghijklmnopqrstuvwxyz";

@@ -70,7 +70,7 @@ pub enum Format {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Run the five stages over a URL, a diff file, or `-` for stdin.
+    /// Run the six stages over a URL, a diff file, or `-` for stdin.
     #[command(long_about = "Review a change and write a report.\n\n\
                       The target says what to review, and its shape decides how it is read:\n\n\
                       - `http(s)://...` is a merge request or pull request URL. Its host has to \

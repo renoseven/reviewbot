@@ -1,8 +1,9 @@
 //! A run directory, a frozen budget and a scripted model for the stage
 //! tests. Compiled only for tests, so no user config can reach any of it.
 //!
-//! It exists because two stages need a real run directory to be tested at
-//! all: `merge` writes its notes into traces, and `publish` reads them back.
+//! It exists because some stages need a real run directory to be tested at
+//! all: `merge` writes its notes into traces, `publish` reads them back, and
+//! `report` writes the artifacts that sit beside them.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};

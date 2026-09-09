@@ -12,7 +12,7 @@ use crate::domain::Confidence;
 use super::{LocalStorage, Meta, RecordError, Recorder, Storage, layout};
 
 /// Comment counts by band, matching `summary.json` so `run show` can
-/// reuse the file without asking `publish` for the type.
+/// reuse the file without asking `report` for the type.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CommentCount {
     pub band: Confidence,

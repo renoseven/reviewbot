@@ -4,7 +4,7 @@
 //!
 //! `stage::*` -> adapters (`platform` / `worktree` / `protocol` / `tool`) ->
 //! infrastructure (`common` / `config` / `security` / `budget` / `record`) ->
-//! `domain`. The order of the five stages exists only in `review`.
+//! `domain`. The order of the six stages exists only in `review`.
 
 pub mod budget;
 pub(crate) mod common;
@@ -36,6 +36,7 @@ use stage::input::Input;
 use stage::merge::{Merge, MergeOutput};
 use stage::orient::Orientation;
 use stage::publish::{Publish, PublishInput, PublishedComment};
+use stage::report::{Report, ReportInput};
 use stage::review::{Review, ReviewOutput};
 use stage::triage::{SkippedFile, Triage, TriagePlan};
 use stage::{Adapters, StageContext, StageError};
@@ -175,7 +176,7 @@ impl Error {
     }
 }
 
-/// Review a merge request URL or a raw diff. Runs the five stages in order,
+/// Review a merge request URL or a raw diff. Runs the six stages in order,
 /// skipping the ones a previous process already finished.
 pub fn review(settings: &Settings, source: &Source) -> Result<RunResult, Error> {
     let adapters = Adapters::real(settings, source.host().as_deref())?;
@@ -308,8 +309,6 @@ fn finish(
     result
 }
 
-/// The whole of the ordering: ask for each stage's checkpoint, run the ones
-/// that have none, write one checkpoint per step.
 /// Everything a request carries before the diff, assembled once for the run.
 /// `tokens` is its measured size, which `triage` reserves before it cuts the
 /// first chunk.
@@ -319,6 +318,9 @@ struct Preamble {
     tokens: u32,
 }
 
+/// The whole of the ordering. The first four stages are skipped when their
+/// checkpoint is already on disk; the last two are finishing work and run
+/// every time. Every stage writes one checkpoint.
 fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResult, Error> {
     let changeset = match context.completed(stage::input::NUMBER, stage::input::NAME)? {
         Some(done) => done,
@@ -332,7 +334,7 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
     // holds their measured size back from the window, and those two have to
     // agree. Assembled only when one of them is going to run, because the
     // layout digest in the instructions goes to the network -- a run re-entered
-    // with only `publish` left has no business fetching a tree.
+    // with only the report and the posting left has no business fetching a tree.
     let preamble = match planned.is_none() || reviewed_before.is_none() {
         true => {
             let orientation = Orientation::build(context, &changeset);
@@ -383,18 +385,31 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
         Some(done) => done,
         None => Merge::run(context, &changeset, &reviewed)?,
     };
-    let publish_input = PublishInput {
-        changeset: &changeset,
-        plan: &plan,
-        merged: &merged,
-        unreviewed: &reviewed.unreviewed,
-        cut_short: &reviewed.cut_short,
-        unavailable: &reviewed.unavailable,
-    };
-    let published = match context.completed(stage::publish::NUMBER, stage::publish::NAME)? {
-        Some(done) => done,
-        None => Publish::run(context, &publish_input)?,
-    };
+    // Here the rule changes. Each of the four stages above costs a fetch or a
+    // model call, and its checkpoint is how a re-entered run avoids paying
+    // twice. The two below cost nothing, and giving the same command again is
+    // the only way left to re-render a report or to finish posting comments
+    // that never reached the MR -- a skip keyed on a checkpoint would take
+    // both of those away. They still write their checkpoints and mark
+    // themselves complete: `run show` and the run's terminal state read those.
+    let summary = Report::run(
+        context,
+        &ReportInput {
+            plan: &plan,
+            merged: &merged,
+            unreviewed: &reviewed.unreviewed,
+            cut_short: &reviewed.cut_short,
+            unavailable: &reviewed.unavailable,
+        },
+    )?;
+    let published = Publish::run(
+        context,
+        &PublishInput {
+            changeset: &changeset,
+            merged: &merged,
+            summary: &summary,
+        },
+    )?;
 
     Ok(Finished {
         meta: context.recorder.meta(),

@@ -263,7 +263,7 @@ fn run_list_text_aligns_spent_with_currency_and_utc() {
             "price": {"input_per_1m_tokens": 3.0, "cached_input_per_1m_tokens": 0.1, "output_per_1m_tokens": 9.0},
             "spent": 0.0316,
             "publish": false,
-            "completed_stages": ["input", "triage", "review", "merge", "publish"],
+            "completed_stages": ["input", "triage", "review", "merge", "report", "publish"],
             "created_at": 1788936240,
             "updated_at": 1788936240
         }"#,
@@ -287,7 +287,7 @@ fn run_list_text_aligns_spent_with_currency_and_utc() {
     assert!(stdout.contains("0.0316 CNY"), "{stdout}");
     assert!(stdout.contains("2026-09-09 06:44:00 UTC"), "{stdout}");
     assert!(
-        stdout.contains("input, triage, review, merge, publish"),
+        stdout.contains("input, triage, review, merge, report, publish"),
         "{stdout}"
     );
 }

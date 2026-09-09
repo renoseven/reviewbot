@@ -1,4 +1,4 @@
-//! The five stages. Each one ends by writing a checkpoint; none of them knows
+//! The six stages. Each one ends by writing a checkpoint; none of them knows
 //! what runs before or after it. The order lives only in `lib.rs`.
 
 pub mod input;
@@ -6,6 +6,7 @@ pub mod merge;
 pub mod orient;
 pub mod prompt;
 pub mod publish;
+pub mod report;
 pub mod review;
 pub mod triage;
 

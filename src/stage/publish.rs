@@ -1,39 +1,36 @@
-//! Stage 5. The Markdown report is always written; traces stay in `traces/`.
-//! The MR/PR only hears from us when `--publish` was asked for, and posting
-//! is idempotent: comments go out as the finding plus a visible `trace_id`,
-//! with the hidden marker for dedup.
+//! Stage 6. The MR/PR only hears from us when `--publish` was asked for, and
+//! posting is idempotent: comments go out as the finding plus a visible
+//! `trace_id`, with the hidden marker for dedup.
 //!
-//! M1 writes the report, the summary and an empty `published.json`. The
-//! GitLab and GitHub calls arrive in M5.
+//! It runs on every entry, and what decides whether anything goes out is the
+//! MR's current state — the markers already on it plus `published.json` — not
+//! a checkpoint of its own. A run re-entered to finish posting is the only
+//! way left to finish posting, so it may not talk itself out of looking.
+//!
+//! The numbers in the summary comment are stage five's `Summary`, taken as
+//! input rather than counted again.
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::PlatformKind;
-use crate::domain::{ChangeSet, Confidence, Severity};
+use crate::domain::ChangeSet;
 use crate::platform::{ChangeRef, DiffPaths, DiffRefs, OutgoingComment};
 use crate::record::layout;
 
 use super::merge::MergeOutput;
-use super::review::CutShort;
-use super::triage::TriagePlan;
+use super::report::{Summary, badge_suffix, trace_line};
 use super::{StageContext, StageError};
 
-pub const NUMBER: u8 = 5;
+pub const NUMBER: u8 = 6;
 pub const NAME: &str = "publish";
 
-/// Everything the report and the posting need, gathered by the caller so the
-/// stage takes one argument.
+/// Everything that goes on the MR, gathered by the caller so the stage takes
+/// one argument. The changeset is here for the diff paths a comment has to be
+/// anchored to; nothing in it is rendered.
 pub struct PublishInput<'a> {
     pub changeset: &'a ChangeSet,
-    pub plan: &'a TriagePlan,
     pub merged: &'a MergeOutput,
-    pub unreviewed: &'a [String],
-    /// Chunks whose investigation the loop ended early. A file the model was
-    /// still reading around must not read like one it finished with.
-    pub cut_short: &'a [CutShort],
-    /// What this run's worktree could not do at all. A run that saw only the
-    /// diff must not read like one that looked everywhere.
-    pub unavailable: &'a [String],
+    pub summary: &'a Summary,
 }
 
 /// One comment that made it out, keyed by the marker hidden in its body.
@@ -56,52 +53,6 @@ pub struct PublishOutput {
     pub posted_to_platform: bool,
 }
 
-/// `summary.json`: the same numbers as the report, for scripts.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct Summary {
-    pub run_id: String,
-    pub model: String,
-    pub overall_score: Option<u8>,
-    pub summary: Option<String>,
-    pub unscored_reason: Option<String>,
-    pub comments: Vec<CountByBand>,
-    /// The same findings counted the other way. Two breakdowns, because "how
-    /// bad is the worst of it" and "how sure is any of it" are the two things
-    /// a reader wants and neither answers the other.
-    #[serde(default)]
-    pub by_severity: Vec<CountBySeverity>,
-    pub skipped: Vec<String>,
-    pub unreviewed: Vec<String>,
-    /// Chunks that gave nothing usable. Named so a thin report is not
-    /// mistaken for a clean review.
-    #[serde(default)]
-    pub unproduced: Vec<String>,
-    /// Chunks the loop stopped investigating before the model was done. Named
-    /// for the same reason, and because the remedy is a config knob: a run
-    /// where most files land here is asking for more rounds.
-    #[serde(default)]
-    pub cut_short: Vec<String>,
-    /// What this run's worktree could not do, which bounds everything above
-    /// it. Empty on a run that could look at whatever it liked.
-    #[serde(default)]
-    pub unavailable: Vec<String>,
-    pub spent: f64,
-    pub budget: Option<f64>,
-    pub currency: String,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct CountByBand {
-    pub band: Confidence,
-    pub count: usize,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct CountBySeverity {
-    pub band: Severity,
-    pub count: usize,
-}
-
 pub struct Publish;
 
 impl Publish {
@@ -109,45 +60,20 @@ impl Publish {
         context: &mut StageContext<'_>,
         input: &PublishInput<'_>,
     ) -> Result<PublishOutput, StageError> {
-        Self::write_artifacts(context, input)?;
-        let output = Self::post(context, input, false)?;
+        let output = Self::post(context, input)?;
         Self::persist_published(context, &output.published)?;
         context.complete(NUMBER, NAME, &output)?;
         Ok(output)
     }
 
-    /// Rewrite `report.md` and `summary.json` from the checkpoints. Does
-    /// not talk to a model or a platform.
-    pub fn write_artifacts(
-        context: &mut StageContext<'_>,
+    /// Post whatever the MR has not heard yet. A run that was never asked to
+    /// publish returns here, before the platform is touched at all — which is
+    /// what keeps re-entering a run to re-render its report an offline act.
+    fn post(
+        context: &StageContext<'_>,
         input: &PublishInput<'_>,
-    ) -> Result<(), StageError> {
-        let summary = Self::summary(context, input);
-        let report = Self::report(input, &summary);
-        context
-            .recorder
-            .write_artifact(layout::REPORT, report.as_bytes())?;
-        let summary_bytes = serde_json::to_vec_pretty(&summary).map_err(|source| {
-            crate::record::RecordError::Serialize {
-                file: layout::SUMMARY.to_string(),
-                source,
-            }
-        })?;
-        context
-            .recorder
-            .write_artifact(layout::SUMMARY, &summary_bytes)?;
-        Self::export(context, &report, &summary_bytes)?;
-        Ok(())
-    }
-
-    /// Post leftover comments. `force` is the standalone `publish` command:
-    /// the user asked, so `meta.publish` being false does not skip the MR.
-    pub fn post(
-        context: &mut StageContext<'_>,
-        input: &PublishInput<'_>,
-        force: bool,
     ) -> Result<PublishOutput, StageError> {
-        if !force && !context.recorder.meta().publish {
+        if !context.recorder.meta().publish {
             return Ok(PublishOutput::default());
         }
         let Some(platform) = context.adapters.platform.as_ref() else {
@@ -166,7 +92,6 @@ impl Publish {
             start_sha: input.changeset.locator.start_sha.clone(),
         };
         let run_id = context.recorder.meta().run_id.clone();
-        let summary = Self::summary(context, input);
 
         // A marker already on the MR, or already listed in published.json,
         // is not said twice. published.json is rewritten after each success
@@ -202,7 +127,7 @@ impl Publish {
                 paths: DiffPaths::for_path(""),
                 line: None,
                 end_line: None,
-                body: Self::summary_body(&summary, &summary_mark),
+                body: Self::summary_body(input.summary, &summary_mark),
                 marker: summary_mark,
             });
         } else {
@@ -365,206 +290,16 @@ impl Publish {
 
     fn summary_body(summary: &Summary, marker: &str) -> String {
         let mut body = String::from("**Reviewbot report**\n\n");
-        body.push_str(&basics(summary));
+        body.push_str(&summary.basics());
         body.push('\n');
-        body.push_str(&overall_block(summary));
-        body.push_str(LEGEND);
+        body.push_str(&summary.verdict());
         fit_body(&body, "", marker, COMMENT_BODY_LIMIT)
-    }
-
-    fn summary(context: &StageContext<'_>, input: &PublishInput<'_>) -> Summary {
-        let meta = context.recorder.meta();
-        Summary {
-            run_id: meta.run_id.clone(),
-            model: meta.model.clone(),
-            overall_score: input.merged.overall_score,
-            summary: input.merged.summary.clone(),
-            unscored_reason: input.merged.unscored_reason.clone(),
-            comments: input
-                .merged
-                .counts()
-                .into_iter()
-                .map(|(band, count)| CountByBand { band, count })
-                .collect(),
-            by_severity: input
-                .merged
-                .severity_counts()
-                .into_iter()
-                .map(|(band, count)| CountBySeverity { band, count })
-                .collect(),
-            skipped: input
-                .plan
-                .skipped
-                .iter()
-                .map(|file| file.path.clone())
-                .collect(),
-            unreviewed: input.unreviewed.to_vec(),
-            unproduced: input
-                .merged
-                .unproduced
-                .iter()
-                .map(|chunk| format!("{}: {}", chunk.path, chunk.reason))
-                .collect(),
-            cut_short: input
-                .cut_short
-                .iter()
-                .map(|chunk| format!("{}: {}", chunk.path, chunk.reason))
-                .collect(),
-            unavailable: input.unavailable.to_vec(),
-            spent: context.budget.spent(),
-            budget: context.budget.ceiling(),
-            currency: context.budget.currency().to_string(),
-        }
-    }
-
-    /// Findings and coverage in one list. Prompt, diff hunk, model output
-    /// and usage live in `traces/`; each finding names its `trace_id`.
-    /// Spend stays in `summary.json` and on the CLI, not here.
-    fn report(input: &PublishInput<'_>, summary: &Summary) -> String {
-        let mut report = String::from("# Reviewbot report\n\n");
-        report.push_str(&basics(summary));
-        report.push('\n');
-        // Ahead of the model's paragraph, because it bounds every word of it.
-        report.push_str(&coverage_bound(&summary.unavailable));
-        report.push_str(&overall_block(summary));
-        report.push_str(LEGEND);
-        report.push('\n');
-
-        let mut items = String::new();
-        for (index, comment) in input.merged.comments.iter().enumerate() {
-            items.push_str(&finding_item(comment, input.merged.badge(index)));
-        }
-        for chunk in &input.merged.unproduced {
-            items.push_str(&coverage_item(&chunk.path, &chunk.reason));
-        }
-        for file in &input.plan.skipped {
-            items.push_str(&coverage_item(&file.path, &file.reason));
-        }
-        for chunk in input.cut_short {
-            items.push_str(&coverage_item(
-                &chunk.path,
-                &format!("investigation cut short: {}", chunk.reason),
-            ));
-        }
-        for path in &summary.unreviewed {
-            items.push_str(&coverage_item(path, "not reviewed"));
-        }
-        if items.is_empty() {
-            report.push_str("None.\n");
-        } else {
-            report.push_str(&items);
-        }
-        report
-    }
-
-    /// `--output-dir` gets the two artifacts that may leave the machine. The run
-    /// directory as a whole may not: it holds the internal trace view.
-    fn export(
-        context: &StageContext<'_>,
-        report: &str,
-        summary_bytes: &[u8],
-    ) -> Result<(), StageError> {
-        let Some(output_dir) = &context.settings.options.output_dir else {
-            return Ok(());
-        };
-        let run_id = &context.recorder.meta().run_id;
-        let io = |path: std::path::PathBuf| {
-            move |source| crate::record::RecordError::Io { path, source }
-        };
-        std::fs::create_dir_all(output_dir).map_err(io(output_dir.clone()))?;
-        let report_path = output_dir.join(layout::exported_report(run_id));
-        std::fs::write(&report_path, report).map_err(io(report_path.clone()))?;
-        let summary_path = output_dir.join(layout::exported_summary(run_id));
-        std::fs::write(&summary_path, summary_bytes).map_err(io(summary_path.clone()))?;
-        Ok(())
     }
 }
 
 /// GitHub's review-comment ceiling. GitLab is larger; one limit keeps the
 /// finding and the trace id when a body would overflow.
 const COMMENT_BODY_LIMIT: usize = 65_536;
-
-const LEGEND: &str = "\
-A finding is headed by two of the model's own judgements, published as given: \
-how much it matters if it is real, then how sure the model is that it is. They \
-are meant to disagree — a severe finding held with low confidence is a reason \
-to look, not a reason to block. A badge next to them is reviewbot's check of a \
-quotation — a fact it verified, not a judgement it made, and it never moves \
-either number. Overall is the model's judgement of what this run found, not a \
-code quality score: reviewbot only read the changed lines, one file at a \
-time.\n";
-
-fn basics(summary: &Summary) -> String {
-    let overall = match summary.overall_score {
-        Some(score) => format!("overall: {score} / 100"),
-        None => "overall: not scored".to_string(),
-    };
-    format!(
-        "run: `{}`\nmodel: `{}`\n{overall}\n",
-        summary.run_id, summary.model
-    )
-}
-
-/// What this run could not look at, said before anything it concluded.
-///
-/// A review whose worktree could answer nothing still runs, still calls the
-/// model on every chunk and still produces a report — and that report is
-/// indistinguishable from a thorough one: the finding list is empty either
-/// way, the score is the model's either way, and the paragraph says it found
-/// nothing either way. This paragraph is the difference.
-fn coverage_bound(unavailable: &[String]) -> String {
-    if unavailable.is_empty() {
-        return String::new();
-    }
-    format!(
-        "coverage: this run {}. That bounds everything below it — reviewing from what was \
-         available is a normal way to run reviewbot, and the findings stand on their own, but \
-         nothing outside it was examined, so an empty list here is not evidence that there was \
-         nothing to find.\n\n",
-        unavailable.join("; it also "),
-    )
-}
-
-fn overall_block(summary: &Summary) -> String {
-    match summary.overall_score {
-        Some(_) => match &summary.summary {
-            Some(text) => format!("{text}\n\n"),
-            None => String::new(),
-        },
-        None => {
-            let reason = summary
-                .unscored_reason
-                .as_deref()
-                .unwrap_or("no reason was recorded");
-            format!("{reason}\n\nNot scored is not a score of 0.\n\n")
-        }
-    }
-}
-
-fn finding_item(comment: &crate::domain::Comment, badge: Option<&str>) -> String {
-    let line = comment
-        .target
-        .line
-        .map(|line| format!(":{line}"))
-        .unwrap_or_default();
-    format!(
-        "## [{} {}% / {} {}%]{} `{}{}`\n\n{}\n\nsuggestion:\n{}\n\n{}\n\n",
-        comment.severity,
-        comment.severity_score,
-        comment.confidence,
-        comment.confidence_score,
-        badge_suffix(badge),
-        comment.target.path,
-        line,
-        comment.body,
-        comment.suggestion,
-        trace_line(&comment.trace_id)
-    )
-}
-
-fn coverage_item(path: &str, reason: &str) -> String {
-    format!("## `{path}`\n\n{reason}\n\n")
-}
 
 fn paths_for(changeset: &ChangeSet, path: &str) -> DiffPaths {
     changeset
@@ -605,17 +340,6 @@ fn take_bytes(text: &str, max: usize) -> &str {
     &text[..end]
 }
 
-/// What goes between the confidence and the finding. Empty when reviewbot
-/// checked nothing, so a comment with no quotation reads as it always did.
-fn badge_suffix(badge: Option<&str>) -> String {
-    badge.map(|badge| format!(" {badge}")).unwrap_or_default()
-}
-
-/// Visible lookup key, same wording on the report and on the MR comment.
-fn trace_line(trace_id: &str) -> String {
-    format!("trace: `{trace_id}`")
-}
-
 /// The hidden idempotency marker. Neither platform renders HTML comments.
 pub fn marker(run_id: &str, trace_id: &str) -> String {
     format!("<!-- reviewbot:{run_id}:{trace_id} -->")
@@ -641,7 +365,7 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    use crate::domain::{Comment, CommentTarget};
+    use crate::domain::{Comment, CommentTarget, Confidence, Severity};
     use crate::platform::ExistingComment;
     use crate::record::{ContextFile, Trace};
     use crate::stage::StageError;
@@ -674,10 +398,6 @@ mod tests {
         trace.diff = "@@ -10,2 +10,3 @@\n+buf[5] = 0;\n".to_string();
         trace.prompt = format!("instructions\n\ncontext of src/parse.h:\n{SECRET_BODY}\n");
         trace.model_output = r#"{"comments":[{"path":"src/parse.c"}]}"#.to_string();
-        trace.note(
-            crate::stage::merge::NAME,
-            "line 12 is not commentable; moved -1 to 11",
-        );
         trace.context_files.push(ContextFile {
             path: "src/parse.h".to_string(),
             first_line: 1,
@@ -687,337 +407,26 @@ mod tests {
         trace
     }
 
-    fn publish(fixture: &mut StageFixture, merged: &MergeOutput) {
-        let changeset = ChangeSet::default();
-        let plan = TriagePlan::default();
-        let input = PublishInput {
-            changeset: &changeset,
-            plan: &plan,
-            merged,
-            unreviewed: &[],
-            cut_short: &[],
-            unavailable: &[],
-        };
-        let mut context = fixture.context();
-        Publish::run(&mut context, &input).expect("the report is written");
-    }
-
-    #[test]
-    fn the_report_is_the_findings_and_the_trace_stays_in_traces() {
-        let mut fixture = StageFixture::new(Vec::new());
-        fixture
-            .recorder()
-            .write_trace(&internal_trace("review-src_parse.c"))
-            .expect("trace written");
-        let merged = MergeOutput {
-            comments: vec![comment("review-src_parse.c")],
+    /// What stage five hands over. Written out rather than rendered, because
+    /// what is being tested here is that these numbers reach the MR unchanged.
+    fn summary() -> Summary {
+        Summary {
+            run_id: "test-run".to_string(),
+            model: "deepseek-v4-flash".to_string(),
             overall_score: Some(54),
-            summary: Some("one certain finding".to_string()),
-            unproduced: vec![crate::stage::merge::Unproduced {
-                path: "src/other.c".to_string(),
-                reason: "unreadable twice".to_string(),
-            }],
-            ..MergeOutput::default()
-        };
-        let changeset = ChangeSet::default();
-        let plan = TriagePlan {
-            skipped: vec![crate::stage::triage::SkippedFile {
-                path: "src/gone.c".to_string(),
-                reason: "the whole file was deleted".to_string(),
-            }],
-            ..TriagePlan::default()
-        };
-        let input = PublishInput {
-            changeset: &changeset,
-            plan: &plan,
-            merged: &merged,
-            unreviewed: &[],
-            cut_short: &[],
-            unavailable: &[],
-        };
-        {
-            let mut context = fixture.context();
-            Publish::run(&mut context, &input).expect("the report is written");
-        }
-        let report = fixture.report();
-
-        assert!(report.starts_with("# Reviewbot report\n"), "{report}");
-        assert!(report.contains("run: `test-run`"), "{report}");
-        assert!(report.contains("model: `deepseek-v4-flash`"), "{report}");
-        assert!(
-            report.contains("## [major 80% / certain 92%] `src/parse.c:11`"),
-            "{report}"
-        );
-        assert!(
-            report.contains("the index is a constant 5 while buf is char[3]"),
-            "{report}"
-        );
-        assert!(
-            report.contains("suggestion:\nbound the index to buf's length"),
-            "{report}"
-        );
-        assert!(report.contains("trace: `review-src_parse.c`"), "{report}");
-        assert!(
-            !report.contains("traces/"),
-            "the report names the id, not the file path: {report}"
-        );
-        assert!(
-            !report.contains("<details>"),
-            "invocation details stay in traces/: {report}"
-        );
-        assert!(
-            !report.contains("+buf[5] = 0;"),
-            "the triggering hunk is not inlined: {report}"
-        );
-        assert!(
-            !report.contains("instructions"),
-            "the prompt is not inlined: {report}"
-        );
-        assert!(
-            !report.contains("moved -1 to 11"),
-            "checks stay in the trace file: {report}"
-        );
-        assert!(
-            !report.contains(SECRET_BODY),
-            "file bodies never leave the internal trace: {report}"
-        );
-        assert!(report.contains("overall: 54 / 100"), "{report}");
-        assert!(report.contains("not a code quality score"), "{report}");
-        assert!(
-            !report.contains("## comments"),
-            "findings and coverage share one list: {report}"
-        );
-        assert!(!report.contains("## skipped"), "{report}");
-        assert!(!report.contains("## no answer"), "{report}");
-        assert!(!report.contains("## budget"), "{report}");
-        assert!(
-            !report.contains("spent "),
-            "spend is not for the report reader: {report}"
-        );
-        assert!(report.contains("## `src/other.c`"), "{report}");
-        assert!(report.contains("unreadable twice"), "{report}");
-        assert!(report.contains("## `src/gone.c`"), "{report}");
-        assert!(report.contains("the whole file was deleted"), "{report}");
-
-        let stored = fixture
-            .recorder()
-            .read_trace("review-src_parse.c")
-            .expect("readable")
-            .expect("the trace is on disk");
-        assert!(
-            stored.context_files[0].body.contains(SECRET_BODY),
-            "the internal view still has the file body"
-        );
-        let published = fixture.recorder().published_trace(&stored);
-        assert!(
-            published
-                .context_files
-                .iter()
-                .all(|file| file.path == "src/parse.h"),
-            "{:?}",
-            published.context_files
-        );
-        assert!(published.diff.contains("+buf[5] = 0;"));
-        assert!(!published.prompt.contains(SECRET_BODY));
-    }
-
-    #[test]
-    fn a_score_of_zero_does_not_read_as_not_scored() {
-        let mut fixture = StageFixture::new(Vec::new());
-        let scored = MergeOutput {
+            summary: Some("one finding".to_string()),
+            unscored_reason: None,
             comments: Vec::new(),
-            overall_score: Some(0),
-            summary: Some("do not merge this".to_string()),
-            ..MergeOutput::default()
-        };
-        publish(&mut fixture, &scored);
-        let report = fixture.report();
-        assert!(report.contains("overall: 0 / 100"), "{report}");
-        assert!(!report.contains("overall: not scored"), "{report}");
-    }
-
-    #[test]
-    fn an_unscored_run_gives_the_reason_instead_of_a_number() {
-        let mut fixture = StageFixture::new(Vec::new());
-        let unscored = MergeOutput {
-            unscored_reason: Some("not scored: budget exhausted".to_string()),
-            unproduced: vec![crate::stage::merge::Unproduced {
-                path: "src/parse.c".to_string(),
-                reason: "unreadable twice".to_string(),
-            }],
-            ..MergeOutput::default()
-        };
-        publish(&mut fixture, &unscored);
-        let report = fixture.report();
-
-        assert!(report.contains("overall: not scored"), "{report}");
-        assert!(report.contains("budget exhausted"), "{report}");
-        assert!(
-            report.contains("Not scored is not a score of 0."),
-            "{report}"
-        );
-        assert!(report.contains("## `src/parse.c`"), "{report}");
-        assert!(report.contains("unreadable twice"), "{report}");
-        assert!(!report.contains("## no answer"), "{report}");
-        assert!(!report.contains("## budget"), "{report}");
-
-        let bytes = fixture
-            .recorder()
-            .read_artifact(layout::SUMMARY)
-            .expect("readable")
-            .expect("summary.json is always written");
-        let summary: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-        assert!(
-            summary["overall_score"].is_null(),
-            "a missing score is null, never 0: {summary}"
-        );
-        assert!(summary["unscored_reason"].is_string());
-    }
-
-    /// The badge sits next to the model's number without disturbing it.
-    /// Unused checkers stay on the chunk's trace; they are not a report item.
-    #[test]
-    fn the_badge_sits_beside_the_score() {
-        let mut fixture = StageFixture::new(Vec::new());
-        let merged = MergeOutput {
-            comments: vec![comment("review-src_parse.c")],
-            badges: vec![Some(crate::stage::merge::TOOL_FOUND.to_string())],
-            overall_score: Some(54),
-            ..MergeOutput::default()
-        };
-        publish(&mut fixture, &merged);
-        let report = fixture.report();
-
-        assert!(
-            report.contains("## [major 80% / certain 92%] found by tool `src/parse.c:11`"),
-            "{report}"
-        );
-        assert!(!report.contains("none called"), "{report}");
-    }
-
-    /// A file the loop stopped investigating is not a file that came back
-    /// clean, and the report is where the difference has to show: the run
-    /// that produced it saw two thirds of its chunks end this way and read
-    /// as a quiet review.
-    #[test]
-    fn a_chunk_the_loop_cut_short_is_named_in_the_report_and_the_summary() {
-        let mut fixture = StageFixture::new(Vec::new());
-        let merged = MergeOutput {
-            overall_score: Some(70),
-            ..MergeOutput::default()
-        };
-        let changeset = ChangeSet::default();
-        let plan = TriagePlan::default();
-        let cut_short = [CutShort {
-            path: "src/emit.c".to_string(),
-            reason: "the tool loop reached its ceiling of 12 rounds".to_string(),
-        }];
-        let input = PublishInput {
-            changeset: &changeset,
-            plan: &plan,
-            merged: &merged,
-            unreviewed: &[],
-            cut_short: &cut_short,
-            unavailable: &[],
-        };
-        {
-            let mut context = fixture.context();
-            Publish::run(&mut context, &input).expect("the report is written");
+            by_severity: Vec::new(),
+            skipped: Vec::new(),
+            unreviewed: Vec::new(),
+            unproduced: Vec::new(),
+            cut_short: Vec::new(),
+            unavailable: Vec::new(),
+            spent: 0.0,
+            budget: Some(10.0),
+            currency: "CNY".to_string(),
         }
-
-        let report = fixture.report();
-        assert!(report.contains("## `src/emit.c`"), "{report}");
-        assert!(
-            report.contains(
-                "investigation cut short: the tool loop reached its ceiling of 12 rounds"
-            ),
-            "{report}"
-        );
-        let bytes = fixture
-            .recorder()
-            .read_artifact(layout::SUMMARY)
-            .expect("readable")
-            .expect("summary.json is always written");
-        let summary: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-        assert_eq!(
-            summary["cut_short"][0],
-            "src/emit.c: the tool loop reached its ceiling of 12 rounds"
-        );
-    }
-
-    /// The failure this exists for, from a real run: a plain diff with no
-    /// worktree behind it. Nothing could be read, the model said so in every
-    /// reply, the finding list came back empty — and the report said
-    /// "overall 100 / 100 ... appears safe to merge" with not one word about
-    /// the run having seen only the diff. A clean review and a blind one have
-    /// to be told apart by a person reading the report, so it is said before
-    /// anything the model concluded.
-    #[test]
-    fn a_run_that_saw_only_the_diff_does_not_read_like_a_thorough_one() {
-        let mut fixture = StageFixture::new(Vec::new());
-        let merged = MergeOutput {
-            overall_score: Some(100),
-            summary: Some("Nothing worth flagging; safe to merge.".to_string()),
-            ..MergeOutput::default()
-        };
-        let changeset = ChangeSet::default();
-        let plan = TriagePlan::default();
-        let unavailable = ["could not read any file: it saw the diff and nothing else".to_string()];
-        let input = PublishInput {
-            changeset: &changeset,
-            plan: &plan,
-            merged: &merged,
-            unreviewed: &[],
-            cut_short: &[],
-            unavailable: &unavailable,
-        };
-        {
-            let mut context = fixture.context();
-            Publish::run(&mut context, &input).expect("the report is written");
-        }
-
-        let report = fixture.report();
-        let coverage = report.find("coverage: this run").expect(&report);
-        assert!(
-            report.contains("could not read any file: it saw the diff and nothing else"),
-            "{report}"
-        );
-        assert!(
-            report.contains("not evidence that there was nothing to find"),
-            "{report}"
-        );
-        assert!(
-            coverage < report.find("safe to merge").expect(&report),
-            "the bound has to be read before the verdict it bounds: {report}"
-        );
-
-        let bytes = fixture
-            .recorder()
-            .read_artifact(layout::SUMMARY)
-            .expect("readable")
-            .expect("summary.json is always written");
-        let summary: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-        assert_eq!(
-            summary["unavailable"][0],
-            "could not read any file: it saw the diff and nothing else"
-        );
-    }
-
-    /// And a run that could look at everything says nothing about coverage:
-    /// the ordinary case must not pay for a caveat with nothing to caveat.
-    #[test]
-    fn a_run_that_could_look_anywhere_prints_no_coverage_note() {
-        let mut fixture = StageFixture::new(Vec::new());
-        let merged = MergeOutput {
-            overall_score: Some(90),
-            ..MergeOutput::default()
-        };
-        publish(&mut fixture, &merged);
-        assert!(
-            !fixture.report().contains("coverage:"),
-            "{}",
-            fixture.report()
-        );
     }
 
     #[test]
@@ -1061,20 +470,17 @@ mod tests {
             .expect("trace");
 
         let changeset = url_changeset();
-        let plan = TriagePlan::default();
         let merged = MergeOutput {
             comments: vec![comment("review-src_parse.c")],
             overall_score: Some(54),
             summary: Some("one finding".to_string()),
             ..MergeOutput::default()
         };
+        let summary = summary();
         let input = PublishInput {
             changeset: &changeset,
-            plan: &plan,
             merged: &merged,
-            unreviewed: &[],
-            cut_short: &[],
-            unavailable: &[],
+            summary: &summary,
         };
         let mut context = fixture.context();
         Publish::run(&mut context, &input).expect("posted");
@@ -1104,16 +510,25 @@ mod tests {
         assert!(!body.contains(SECRET_BODY), "{body}");
         assert!(!body.contains("spent "), "{body}");
 
-        let summary = posted
+        let summary_comment = posted
             .iter()
             .find(|body| body.contains(":summary -->"))
             .expect("the summary went out");
-        assert!(summary.contains("**Reviewbot report**"), "{summary}");
-        assert!(summary.contains("run: `test-run`"), "{summary}");
-        assert!(summary.contains("overall: 54 / 100"), "{summary}");
-        assert!(!summary.contains("<details>"), "{summary}");
-        assert!(!summary.contains("## budget"), "{summary}");
-        assert!(!summary.contains("spent "), "{summary}");
+        assert!(
+            summary_comment.contains("**Reviewbot report**"),
+            "{summary_comment}"
+        );
+        assert!(
+            summary_comment.contains("run: `test-run`"),
+            "{summary_comment}"
+        );
+        assert!(
+            summary_comment.contains("overall: 54 / 100"),
+            "{summary_comment}"
+        );
+        assert!(!summary_comment.contains("<details>"), "{summary_comment}");
+        assert!(!summary_comment.contains("## budget"), "{summary_comment}");
+        assert!(!summary_comment.contains("spent "), "{summary_comment}");
     }
 
     #[test]
@@ -1138,20 +553,17 @@ mod tests {
             .expect("trace");
 
         let changeset = url_changeset();
-        let plan = TriagePlan::default();
         let merged = MergeOutput {
             comments: vec![comment("review-src_parse.c")],
             overall_score: Some(54),
             summary: Some("one finding".to_string()),
             ..MergeOutput::default()
         };
+        let summary = summary();
         let input = PublishInput {
             changeset: &changeset,
-            plan: &plan,
             merged: &merged,
-            unreviewed: &[],
-            cut_short: &[],
-            unavailable: &[],
+            summary: &summary,
         };
         let mut context = fixture.context();
         let output = Publish::run(&mut context, &input).expect("publish");
@@ -1160,6 +572,43 @@ mod tests {
         let posted = posts.lock().expect("posts");
         assert_eq!(posted.len(), 1, "only the summary is new: {posted:?}");
         assert!(posted[0].contains(":summary -->"), "{posted:?}");
+    }
+
+    /// The stage runs on every entry now, including on a run that was never
+    /// asked to post. Re-entering such a run has to stay an offline act — it
+    /// is how the report is re-rendered — so the platform is not asked
+    /// anything at all, not even what is already on the MR.
+    #[test]
+    fn a_run_that_was_not_asked_to_publish_never_reaches_the_platform() {
+        let mut fixture = StageFixture::new(Vec::new()).with_platform(Box::new(RefusingPlatform));
+        let changeset = url_changeset();
+        let merged = MergeOutput {
+            comments: vec![comment("review-src_parse.c")],
+            overall_score: Some(54),
+            ..MergeOutput::default()
+        };
+        let summary = summary();
+        let input = PublishInput {
+            changeset: &changeset,
+            merged: &merged,
+            summary: &summary,
+        };
+        let output = {
+            let mut context = fixture.context();
+            Publish::run(&mut context, &input).expect("the stage still finishes")
+        };
+
+        assert!(!output.posted_to_platform);
+        assert!(output.published.is_empty());
+        assert_eq!(
+            fixture
+                .recorder()
+                .read_artifact(layout::PUBLISHED)
+                .expect("readable")
+                .expect("written even so"),
+            b"[]",
+            "an empty published.json says the run posted nothing, not that it never ran"
+        );
     }
 
     #[test]
@@ -1183,7 +632,6 @@ mod tests {
             .expect("trace");
 
         let changeset = url_changeset();
-        let plan = TriagePlan::default();
         let merged = MergeOutput {
             comments: vec![
                 comment("review-src_parse.c"),
@@ -1206,13 +654,11 @@ mod tests {
             summary: Some("two findings".to_string()),
             ..MergeOutput::default()
         };
+        let summary = summary();
         let input = PublishInput {
             changeset: &changeset,
-            plan: &plan,
             merged: &merged,
-            unreviewed: &[],
-            cut_short: &[],
-            unavailable: &[],
+            summary: &summary,
         };
         let mut context = fixture.context();
         let error = Publish::run(&mut context, &input).expect_err("second post fails");
@@ -1321,6 +767,57 @@ mod tests {
                 });
             }
             Ok(posted)
+        }
+
+        fn bind_repo(&self, _change: &ChangeRef, _head_sha: &str) {}
+
+        fn repo_source(&self) -> std::sync::Arc<dyn crate::platform::RepoSource> {
+            std::sync::Arc::new(NullRepo)
+        }
+    }
+
+    /// A platform every call to which is a test failure. The only assertion
+    /// it makes is that it is never asked anything.
+    struct RefusingPlatform;
+
+    impl crate::platform::Platform for RefusingPlatform {
+        fn kind(&self) -> PlatformKind {
+            PlatformKind::Gitlab
+        }
+
+        fn host(&self) -> &str {
+            "gitlab.com"
+        }
+
+        fn capabilities(&self) -> crate::platform::Capabilities {
+            crate::platform::Capabilities::default()
+        }
+
+        fn head_sha(&self, _change: &ChangeRef) -> Result<String, crate::platform::PlatformError> {
+            panic!("the platform was reached")
+        }
+
+        fn fetch_change(
+            &self,
+            _change: &ChangeRef,
+        ) -> Result<crate::platform::PlatformChange, crate::platform::PlatformError> {
+            panic!("the platform was reached")
+        }
+
+        fn existing_comments(
+            &self,
+            _change: &ChangeRef,
+        ) -> Result<Vec<ExistingComment>, crate::platform::PlatformError> {
+            panic!("the platform was reached")
+        }
+
+        fn post_comments(
+            &self,
+            _change: &ChangeRef,
+            _refs: &crate::platform::DiffRefs,
+            _comments: &[OutgoingComment],
+        ) -> Result<Vec<ExistingComment>, crate::platform::PlatformError> {
+            panic!("the platform was reached")
         }
 
         fn bind_repo(&self, _change: &ChangeRef, _head_sha: &str) {}
