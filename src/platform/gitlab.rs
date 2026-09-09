@@ -646,7 +646,7 @@ impl GitlabDiffFile {
 mod tests {
     use super::*;
     use crate::config::PlatformKind;
-    use crate::stage::input::diff::UnifiedDiff;
+    use crate::stage::input::UnifiedDiff;
 
     fn change() -> ChangeRef {
         ChangeRef {

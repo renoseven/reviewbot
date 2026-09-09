@@ -28,7 +28,7 @@ use crate::security::{PathPolicy, Redactor};
 use crate::tool::{Registry, ToolError};
 use crate::worktree::{Abilities, Checkout, FetchedWorktree, Reach, WorktreeError, WorktreeSource};
 
-use input::diff::DiffError;
+use input::DiffError;
 use prompt::PromptError;
 
 #[derive(Debug, thiserror::Error)]
