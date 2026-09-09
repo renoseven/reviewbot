@@ -3,6 +3,7 @@
 
 pub const META: &str = "meta.json";
 pub const LOCK: &str = "lock";
+pub const LOG: &str = "log";
 pub const PUBLISHED: &str = "published.json";
 pub const REPORT: &str = "report.md";
 pub const SUMMARY: &str = "summary.json";

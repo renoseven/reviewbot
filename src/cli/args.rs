@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -15,7 +15,7 @@ use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
     long_about = "Review a merge request, a pull request or a raw unified diff with a language \
                   model, write a report, and optionally post the comments back.\n\n\
                   Nothing is read from the current directory: the config comes from --config or \
-                  from ~/.reviewbot/config.toml. Runs, checkpoints and traces live under \
+                  from ~/.reviewbot/config.toml. Runs, checkpoints, logs and traces live under \
                   --runs-dir (default ~/.reviewbot/runs), and `run prune` is the only command \
                   that deletes any of it."
 )]
@@ -42,10 +42,6 @@ pub struct GlobalArgs {
     #[arg(long, global = true, value_enum, default_value_t = Format::Text)]
     pub format: Format,
 
-    /// -v for debug, -vv for trace.
-    #[arg(short = 'v', global = true, action = ArgAction::Count)]
-    pub verbose: u8,
-
     /// Write nothing at all to stdout. Errors still go to stderr.
     #[arg(short = 'q', long, global = true)]
     pub quiet: bool,
@@ -64,7 +60,7 @@ pub struct GlobalArgs {
 pub enum Format {
     /// Aligned columns for a person.
     Text,
-    /// One JSON document, with progress kept off stdout.
+    /// One JSON document, with the status screen kept off stdout.
     Json,
 }
 
@@ -165,8 +161,8 @@ pub enum RunCommand {
                       This is the only command that deletes anything. `--keep N` counts from the \
                       newest run by modification time and deletes everything older; the default \
                       is 0, which deletes every run in the directory. A deleted run takes its \
-                      report, its summary, its traces and its worktree with it, and nothing else \
-                      in reviewbot ever removes them.\n\n\
+                      report, its summary, its log, its traces and its worktree with it, and \
+                      nothing else in reviewbot ever removes them.\n\n\
                       `--dry-run` prints exactly what would go, and deletes nothing.")]
     Prune {
         /// How many of the newest runs to keep. 0 deletes every run.
@@ -347,6 +343,12 @@ mod tests {
         let cli = Cli::try_parse_from(["reviewbot", "config", "check"]).unwrap();
         assert_eq!(cli.global.retries, 2);
         assert_eq!(cli.global.format, Format::Text);
+    }
+
+    #[test]
+    fn verbosity_flags_no_longer_parse() {
+        assert!(Cli::try_parse_from(["reviewbot", "-v", "config", "check"]).is_err());
+        assert!(Cli::try_parse_from(["reviewbot", "-vv", "config", "check"]).is_err());
     }
 
     /// The nouns are singular, and the old plurals are gone rather than

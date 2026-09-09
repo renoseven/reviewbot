@@ -54,6 +54,7 @@ pub struct RunShow {
     pub currency: String,
     pub report: PathBuf,
     pub summary: PathBuf,
+    pub log: PathBuf,
     pub traces: PathBuf,
 }
 
@@ -159,6 +160,7 @@ pub fn show_run(runs_dir: &Path, run_id: &str) -> Result<RunShow, RecordError> {
         currency: row.currency,
         report: directory.join(layout::REPORT),
         summary: directory.join(layout::SUMMARY),
+        log: directory.join(layout::LOG),
         traces: directory.join("traces"),
     })
 }

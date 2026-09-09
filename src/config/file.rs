@@ -11,6 +11,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Logging controls diagnostics, not what the review concludes.
+    // `Config` is serialized only for the run fingerprint. Keep this
+    // operational setting out so changing it can still resume the same run.
+    #[serde(default, skip_serializing)]
+    pub log: LogSettings,
     #[serde(default)]
     pub review: ReviewSettings,
     #[serde(default)]
@@ -28,6 +33,34 @@ pub struct Config {
     pub platforms: Vec<PlatformEntry>,
     #[serde(default, rename = "tool")]
     pub tools: Vec<ToolEntry>,
+}
+
+/// Diagnostics written beside the run's other artifacts.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogSettings {
+    #[serde(default)]
+    pub level: LogLevel,
+}
+
+impl Default for LogSettings {
+    fn default() -> Self {
+        Self {
+            level: LogLevel::Info,
+        }
+    }
+}
+
+/// The least severe diagnostic retained in the run log.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+    Trace,
 }
 
 /// The tool loop's shape. Every number here is required: what the right value

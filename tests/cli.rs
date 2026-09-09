@@ -199,6 +199,15 @@ fn a_piped_review_appends_progress_then_the_text_summary() {
     assert_eq!(output.status.code(), Some(3), "{output:?}");
     assert!(output.stderr.is_empty(), "finished runs write no stderr");
     let stdout = String::from_utf8(output.stdout).expect("utf8");
+    let tracing_line = "input normalized into a change set";
+    assert!(
+        !stdout.contains(tracing_line),
+        "tracing never reaches stdout: {stdout}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains(tracing_line),
+        "tracing never reaches stderr"
+    );
     assert!(
         stdout.contains("[1/6] input     1 files\n"),
         "the pipe retains finished stages: {stdout}"
@@ -223,6 +232,18 @@ fn a_piped_review_appends_progress_then_the_text_summary() {
             .last()
             .is_some_and(|line| line.starts_with("summary    ")),
         "the canonical summary is last: {summary}"
+    );
+
+    let run_dir = std::fs::read_dir(&runs)
+        .expect("runs")
+        .next()
+        .expect("one run")
+        .expect("run entry")
+        .path();
+    let log = std::fs::read_to_string(run_dir.join("log")).expect("run log");
+    assert!(
+        log.contains(tracing_line),
+        "the run log contains tracing output: {log}"
     );
 }
 

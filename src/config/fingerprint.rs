@@ -8,8 +8,8 @@ use super::file::Config;
 
 /// Everything that changes the conclusion. Secret *values* never appear here
 /// (the config only holds their source), and neither do artifact locations
-/// (`--output-dir`, `--runs-dir`) or run parameters (`--retries`, `-v`, `-q`,
-/// `--format`, `--publish`).
+/// (`--output-dir`, `--runs-dir`) or operational settings (`[log]`,
+/// `--retries`, `-q`, `--format`, `--publish`).
 #[derive(Serialize)]
 struct Fingerprinted<'a> {
     config: &'a Config,

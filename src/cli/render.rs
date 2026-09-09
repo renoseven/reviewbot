@@ -274,6 +274,7 @@ pub fn run_show(runs_dir: &Path, run_id: &str, format: Format) -> Result<String,
             }
             out.push_str(&format!("report     {}\n", show.report.display()));
             out.push_str(&format!("summary    {}\n", show.summary.display()));
+            out.push_str(&format!("log        {}\n", show.log.display()));
             out.push_str(&format!("traces     {}\n", show.traces.display()));
             out
         }

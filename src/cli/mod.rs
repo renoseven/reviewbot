@@ -2,31 +2,33 @@
 //! exit code. No business logic lives here.
 
 pub mod args;
+mod logging;
 pub mod render;
 mod status;
 
 use std::io::{IsTerminal, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
 use reviewbot::config::{RunOptions, Settings, paths};
-use reviewbot::progress::Silent;
+use reviewbot::progress::{Event, Progress, Silent};
 use reviewbot::{Error, Source};
 
 use args::{
     Cli, Command, ConfigCommand, GlobalArgs, ModelCommand, PlatformCommand, ProviderCommand,
     ReviewArgs, RunCommand, ToolCommand,
 };
+use logging::LogSink;
 use status::Status;
 
 /// Parse, set up tracing, dispatch, and turn whatever comes back into an
 /// exit code. Successful runs write nothing to stderr.
 pub fn run() -> i32 {
     let cli = Cli::parse();
-    init_tracing(&cli.global);
+    let log = init_tracing(cli.global.config.as_deref());
 
-    match dispatch(&cli) {
+    match dispatch(&cli, &log) {
         Ok(finished) => {
             // `-q` silences text; `--format json` still prints (json wins).
             let show = !finished.output.is_empty()
@@ -65,18 +67,20 @@ impl Finished {
     }
 }
 
-fn dispatch(cli: &Cli) -> Result<Finished, Error> {
+fn dispatch(cli: &Cli, log: &LogSink) -> Result<Finished, Error> {
     match &cli.command {
         Command::Review(review) => {
             let settings = load(&cli.global, review_options(&cli.global, review))?;
             let source = read_source(&review.target)?;
             let quiet = cli.global.quiet || cli.global.format == args::Format::Json;
             let result = if quiet {
-                reviewbot::review(&settings, &source, &Silent)
+                let progress = CliProgress::new(&Silent, log.clone());
+                reviewbot::review(&settings, &source, &progress)
             } else {
                 let tty = std::io::stdout().is_terminal();
                 let status = Status::new(std::io::stdout(), tty, !cli.global.no_color);
-                let result = reviewbot::review(&settings, &source, &status);
+                let progress = CliProgress::new(&status, log.clone());
+                let result = reviewbot::review(&settings, &source, &progress);
                 // A failure also has to take the live block away before its
                 // message reaches stderr; otherwise the cursor is left below
                 // a stale run that appears to still be active.
@@ -180,25 +184,41 @@ fn unreadable(target: &str, error: std::io::Error) -> Error {
     })
 }
 
-/// Progress and warnings are stdout; `-q` silences it completely. The only
-/// thing that ever reaches stderr is the failure message printed above.
-fn init_tracing(global: &GlobalArgs) {
-    let level = match global.verbose {
-        0 => "info",
-        1 => "debug",
-        _ => "trace",
-    };
+/// Keep rendering and log placement separate while listening for the one
+/// event that establishes where this run's artifacts belong.
+struct CliProgress<'a> {
+    rendered: &'a dyn Progress,
+    log: LogSink,
+}
+
+impl<'a> CliProgress<'a> {
+    fn new(rendered: &'a dyn Progress, log: LogSink) -> Self {
+        Self { rendered, log }
+    }
+}
+
+impl Progress for CliProgress<'_> {
+    fn emit(&self, event: Event) {
+        if let Event::RunStarted { run_dir, .. } = &event {
+            let _ = self.log.switch_to(run_dir);
+        }
+        self.rendered.emit(event);
+    }
+}
+
+/// Build tracing before dispatch. The writer buffers until a run starts, and
+/// commands without a run simply discard that buffer when the process exits.
+fn init_tracing(config_path: Option<&Path>) -> LogSink {
+    let level = reviewbot::config::log_level(config_path);
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(format!("reviewbot={level}")));
-    let builder = tracing_subscriber::fmt()
+    let log = LogSink::default();
+    let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
         .without_time()
-        .with_ansi(!global.no_color && std::io::stdout().is_terminal());
-    // JSON stdout must stay parseable: progress goes nowhere, same as `-q`.
-    if global.quiet || global.format == args::Format::Json {
-        let _ = builder.with_writer(std::io::sink).try_init();
-    } else {
-        let _ = builder.with_writer(std::io::stdout).try_init();
-    }
+        .with_ansi(false)
+        .with_writer(log.clone())
+        .try_init();
+    log
 }

@@ -18,8 +18,8 @@ use crate::common::{Secret, SecretSource};
 
 pub use crate::common::Backoff;
 pub use file::{
-    Config, Model, ParamKind, ParamSpec, PlatformEntry, PlatformKind, Provider, ReviewSettings,
-    SecuritySettings, ToolEntry, TriageSettings, builtin_kind,
+    Config, LogLevel, LogSettings, Model, ParamKind, ParamSpec, PlatformEntry, PlatformKind,
+    Provider, ReviewSettings, SecuritySettings, ToolEntry, TriageSettings, builtin_kind,
 };
 
 /// Wire protocols this binary can speak. `protocol` resolves the same list;
@@ -61,6 +61,29 @@ pub const PROMPT_SKELETON_TOKENS: u32 = 4_096;
 /// Placeholders `[[tool]].args` may use without declaring them in `params`.
 /// One run, one worktree, so there is one path worth naming.
 const BUILTIN_PLACEHOLDERS: [&str; 1] = ["worktree"];
+
+/// Read just enough configuration to choose the startup log filter.
+///
+/// The real load follows during dispatch and reports any error with its path
+/// and context. Startup logging therefore stays lenient and uses `info` when
+/// the file is absent, unreadable, or malformed.
+pub fn log_level(config_path: Option<&Path>) -> tracing::Level {
+    let path = config_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(paths::default_config_path);
+    let level = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| toml::from_str::<Config>(&text).ok())
+        .map(|config| config.log.level)
+        .unwrap_or_default();
+    match level {
+        LogLevel::Error => tracing::Level::ERROR,
+        LogLevel::Warn => tracing::Level::WARN,
+        LogLevel::Info => tracing::Level::INFO,
+        LogLevel::Debug => tracing::Level::DEBUG,
+        LogLevel::Trace => tracing::Level::TRACE,
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -715,6 +738,32 @@ max_output_tokens = 4096
         let selection = config.select_model(None).expect("selected");
         assert_eq!(selection.model.name, "deepseek-v4-flash");
         assert_eq!(selection.reason, SelectionReason::SoleEntry);
+    }
+
+    #[test]
+    fn log_level_is_read_leniently_before_the_real_config_load() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let config = directory.path().join("reviewbot.toml");
+        std::fs::write(&config, "[log]\nlevel = \"debug\"\n").expect("config");
+        assert_eq!(log_level(Some(&config)), tracing::Level::DEBUG);
+
+        let missing = directory.path().join("missing.toml");
+        assert_eq!(log_level(Some(&missing)), tracing::Level::INFO);
+        std::fs::write(&config, "not toml = [").expect("malformed config");
+        assert_eq!(log_level(Some(&config)), tracing::Level::INFO);
+    }
+
+    #[test]
+    fn log_level_does_not_change_the_config_fingerprint() {
+        let mut info = parse(MINIMAL);
+        info.log.level = LogLevel::Info;
+        let mut trace = info.clone();
+        trace.log.level = LogLevel::Trace;
+
+        assert_eq!(
+            fingerprint::fingerprint(&info, None, false),
+            fingerprint::fingerprint(&trace, None, false)
+        );
     }
 
     #[test]
