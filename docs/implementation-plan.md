@@ -8,12 +8,14 @@
 
 ```
 src/
-  lib.rs              # review() / resume() / RunResult + 模块声明与再导出，只有这些
+  lib.rs              # review() / RunResult + 模块声明与再导出，只有这些
   main.rs             # 只有 fn main()：起 tracing、调 cli 解析、分派、把错误收成退出码
   cli/                # 二进制这一侧，lib.rs 不声明它
     mod.rs            #   子命令分派 + lib 错误 → 退出码 0/1/2/3/4/5
-    args.rs           #   clap derive：全局 / review / review+report / run prune 四组 flag
-    render.rs         #   text 与 json 两种渲染：进度行、结果摘要、runs/models/tools 列表
+    args.rs           #   clap derive：全局 / review / run prune 三组 flag
+    render.rs         #   text 与 json 两种渲染：结果摘要、失败提示、runs/models/tools 列表
+    status.rs         #   跑的时候那块状态屏，喂它的是 progress 那条事件通道
+    logging.rs        #   tracing 的写出端：先攒着，run 目录一定下就追加进 <run dir>/log
   domain/             # 共享词汇，一类型一文件，不含逻辑
     mod.rs            #   只做 pub use 再导出
     changeset.rs      #   ChangeSet / FileChange / Hunk / 两个行集合（纯数据）
@@ -30,12 +32,13 @@ src/
   worktree/           # WorktreeSource trait 与实现（只有读方法）：遍历、读文件、正则匹配
   protocol/           # Request/Response + Protocol trait + openai
   tool/               # Tool trait + registry + command 实现 + 六个内建 tool（读取前调 security 的路径校验）
-  stage/{input,triage,review,merge,publish}.rs
+  progress.rs         # 类型化的事件通道：run 边跑边说自己在做什么，谁在看由调用方定
+  stage/{input,triage,review,merge,report,publish}.rs
   prompts/{review.md,summary.md}   # include_str!，配置改不动
 tests/                # 少量整装与 CLI 契约测试（assert_cmd）
 ```
 
-依赖单向向下：`stage::*` → 适配器 → 设施 → `domain`；同层只有 `tool` 认 `platform` 的 `RepoSource` 与 `worktree` 的 `WorktreeSource` 这一条。顺序只写在 `lib.rs` 的 `review()` / `resume()` 里，不建 orchestrator 模块。
+依赖单向向下：`stage::*` → 适配器 → 设施 → `domain`；同层只有 `tool` 认 `platform` 的 `RepoSource` 与 `worktree` 的 `WorktreeSource` 这一条。顺序只写在 `lib.rs` 的 `review()` 里，不建 orchestrator 模块。
 
 三处目录形状上的决定：
 
@@ -46,7 +49,7 @@ tests/                # 少量整装与 CLI 契约测试（assert_cmd）
 
 ## 里程碑
 
-**M1 分层骨架**。`Cargo.toml` 补齐 `tokio`/`reqwest`(rustls)/`serde`/`serde_json`/`toml`/`clap`/`sha2`/`regex`/`thiserror`/`tracing`/`tracing-subscriber`，另加 `globset`（`deny_paths` / `skip_paths` 的 glob 匹配，设计的依赖清单没列但绕不开），dev 加 `assert_cmd`。三个扩展点 trait（`Platform` / `Protocol` / `Tool`）与 `record::Storage` 先定死；两个来源 trait 跟着主人放在 `platform` 与 `worktree`，签名收普通的仓库相对路径。`stage::*` 五个空阶段 + 假适配器。验收是「假实现下空跑到底、正确落盘、`resume` 从任一阶段续上」。
+**M1 分层骨架**。`Cargo.toml` 补齐 `tokio`/`reqwest`(rustls)/`serde`/`serde_json`/`toml`/`clap`/`sha2`/`regex`/`thiserror`/`tracing`/`tracing-subscriber`，另加 `globset`（`deny_paths` / `skip_paths` 的 glob 匹配，设计的依赖清单没列但绕不开），dev 加 `assert_cmd`。三个扩展点 trait（`Platform` / `Protocol` / `Tool`）与 `record::Storage` 先定死；两个来源 trait 跟着主人放在 `platform` 与 `worktree`，签名收普通的仓库相对路径。`stage::*` 六个空阶段 + 假适配器。验收是「假实现下空跑到底、正确落盘、把同一条命令再跑一遍能从任一阶段接上」。
 
 **M2 input + triage**。unified diff 解析器（同时服务本地文件与平台 diff 端点，按内容判 mbox 并拒绝），每个文件建**可评论行**与**变更行**两个集合并随 `ChangeSet` 落盘；`triage` 做过滤、按变更行数降序、一文件一分片、超限按 hunk 再切，分片上限按 `context_window − max_output_tokens − 固定骨架 − 工具余量 − headroom` 算。仍用假 protocol。
 
@@ -60,7 +63,7 @@ tests/                # 少量整装与 CLI 契约测试（assert_cmd）
 
 **M7 内建 tool 与两个内容来源**。`RepoSource`（平台 API 按 `head_sha` 列 / 读 / 搜，GitHub 树 `truncated` 时退到逐目录、搜索结果只当候选路径再按 sha 取回本地重做匹配）与 `WorktreeSource`（磁盘遍历、读、正则）；六个对称命名的内建 tool 按能力注册，`capabilities()` 说不支持搜索就不注册 `search_repo`；整棵树一个 run 只取一次，后续 glob 本地过滤。
 
-**M8 收口与交付物**。`publish` / `report` / `run list|show|prune` / `model list` / `tool list` 子命令，`--format json` 的字段化输出（`run list` 的 runs 目录进顶层键），退出码 0/1/2/3/4/5，失败提示带 `run_id` 与可照抄的 `resume` 命令（含非默认 `--runs-dir`）；README（含已知限制、`allow_extensions` 挡掉无扩展名文件、子进程禁写只在容器里成立）、示例 `reviewbot.toml`、GitLab CI / GitHub Actions 片段。
+**M8 收口与交付物**。`run list|show|prune` / `model list` / `tool list` 子命令，`--format json` 的字段化输出（`run list` 的 runs 目录进顶层键），退出码 0/1/2/3/4/5，失败提示带 `run_id` 与可照抄的下一步命令（回放本次 `argv`，含非默认 `--runs-dir`）；README（含已知限制、`allow_extensions` 挡掉无扩展名文件、子进程禁写只在容器里成立）、示例 `reviewbot.toml`、GitLab CI / GitHub Actions 片段。
 
 ## 每步用哪个模型
 
@@ -80,7 +83,7 @@ tests/                # 少量整装与 CLI 契约测试（assert_cmd）
 ## 几条会反复用到的决定
 
 - 错误：每模块 `thiserror` 定义可匹配类型，`lib` 出口一个总错误枚举供 `main.rs` 映射退出码；`anyhow` 只在 `main.rs`。
-- 目录锁：`lock` 文件用 `create_new` 抢占，拿不到直接失败不等待，正常结束删除。
+- 目录锁：`<run dir>/lock` 上做 `flock(LOCK_EX | LOCK_NB)`，拿不到直接失败不等待不抢占；锁在内核手上，所以没有过期的锁、也没有探活与 `--force`，文件本身正常结束后留在原地。锁要在开 worktree 之前拿。
 - checkpoint：临时文件 + `rename`，读不出来就回退上一份完整快照，禁止 catch 后整次重跑。
 - 全程串行，阶段与分片都不并发——并发会让调用前预算检查失效。
 - 密钥读出后只在内存传递，不进 checkpoint / trace / 指纹 / 日志。
@@ -88,6 +91,6 @@ tests/                # 少量整装与 CLI 契约测试（assert_cmd）
 ## 测试（最小档）
 
 - 单元：diff 解析与两个行集合、行号对齐、引文比对、去重、glob、token 估算、脱敏、退避曲线。
-- 整装：假适配器下 `review()` 跑完五阶段，加一次 `resume` 不重复调模型。
+- 整装：假适配器下 `review()` 跑完六阶段，再进入一次同一个 run 不重复调模型。
 - CLI 契约：`assert_cmd` 验成功 run 不写 stderr、`--format json` 可解析、退出码。
 - 设计 §11 的其余用例列进 README 的「已知限制」作为 TODO。

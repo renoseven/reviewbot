@@ -56,26 +56,31 @@ A run always has exactly one worktree. With `--worktree` it is that checkout, wh
 
 | flag | what |
 |---|---|
-| `--runs-dir DIR` | checkpoints, traces and the run's own worktree. Default `~/.reviewbot/runs`. If you point this at the repo (CI does), add it to `.gitignore`. |
-| `--output-dir DIR` | copies `report-<run_id>.md` and `summary-<run_id>.json` for CI artifacts. Do not archive the whole runs directory: `traces/` holds the internal view. |
+| `--runs-dir DIR` | checkpoints, traces, the log and the run's own worktree. Default `~/.reviewbot/runs`. If you point this at the repo (CI does), add it to `.gitignore`. |
+| `--output-dir DIR` | copies `report-<run_id>.md` and `summary-<run_id>.json` for CI artifacts. `review` only. Do not archive the whole runs directory: `traces/` holds the internal view. |
 
-`--format json` makes stdout a JSON document (no progress mixed in). `-q` silences text; JSON still prints.
+Inside one run directory: `report.md`, `summary.json`, `stages/`, `traces/`, `published.json`, `worktree/`, and `log` — every line of tracing this run produced, appended, at the level `[log] level` asks for (`RUST_LOG` overrides). Nothing tracing writes reaches stdout or stderr. `run show` prints the log path.
+
+While a review runs, a terminal gets a live block whose fields are the ones the final summary prints, filled in as they become known, with a line underneath saying what is happening right now. A pipe gets one line per chunk and one per finished stage instead. `--format json` makes stdout a single JSON document with the live block suppressed; `-q` silences stdout entirely, live block included.
 
 ```bash
 reviewbot --config examples/reviewbot.toml --format json -q review change.diff --output-dir artifacts/
 ```
 
-## Resume, publish, report
+## Continuing a run
 
-If a run dies after it has a directory, stderr names the `run_id` and a command you can paste, including `--runs-dir` when you used a non-default one.
+There is no `resume`, `publish` or `report` command. **Running the same `review` command again continues the run it started.** The stages that finished keep their checkpoints and are not paid for a second time; the report is re-rendered and any comment that never reached the MR is posted, because those last two stages are cheap and run on every entry.
 
-```bash
-reviewbot --runs-dir .reviewbot/runs resume 7f3a9c1e
-reviewbot --runs-dir .reviewbot/runs publish 7f3a9c1e   # leftover comments only; no model
-reviewbot --runs-dir .reviewbot/runs report 7f3a9c1e --output-dir artifacts/
+If a run dies after it has a directory, stderr names the `run_id` and prints your own invocation back under `next:`, shell-quoted where a word needs it, so the line pastes and runs:
+
+```
+error: ...
+run_id: 7f3a9c1e
+next: reviewbot --runs-dir .reviewbot/runs review --publish https://gitlab.com/acme/app/-/merge_requests/128
+      the same command again continues run 7f3a9c1e; the stages it finished are not run again
 ```
 
-`publish` posts even if the original `review` did not pass `--publish`. It skips markers already on the MR or in `published.json`.
+Two things worth knowing. Changing the config changes the run id, so the same command against an edited config starts a *new* run rather than being refused; only `--run-id`, which can aim at a directory the config disagrees with, is refused. And `--publish` is re-read from the command line every time: a run you first launched with `--publish` and then re-enter without it records "do not post" and posts nothing that time.
 
 ## Inspecting a config and past runs
 
@@ -98,7 +103,7 @@ reviewbot --config examples/reviewbot.toml provider list
 
 `platform list` and `provider list` name where each credential comes from, never the credential itself — an inline secret is refused when the config is parsed, so there is only ever a source to print. Neither command reads the credential; `config check` is what does that.
 
-`review` and `resume` never delete a run. `run prune` with no `--keep` deletes every run. If a review leaves more than 10 runs, it warns once with a `run prune` line you can paste.
+`review` never deletes a run, including when it re-enters one. `run prune` with no `--keep` deletes every run. If a review leaves more than 10 runs, it warns once with a `run prune` line you can paste.
 
 ## Exit codes
 
@@ -109,7 +114,7 @@ reviewbot --config examples/reviewbot.toml provider list
 | 2 | config / input |
 | 3 | budget stopped the run |
 | 4 | platform or model down |
-| 5 | review done, some posts failed; use `publish` |
+| 5 | review done, some posts failed; run the same command again to post the rest |
 
 There is no `--fail-on`. Gate a pipeline on `summary.json` yourself.
 
@@ -119,7 +124,7 @@ See [`examples/gitlab-ci.yml`](examples/gitlab-ci.yml) and [`examples/github-act
 
 ## Demo report
 
-This repo does not ship a canned PR report. Produce one by pointing `review` at a public C repository (the sample code the brief uses is C). The run directory then has `report.md`, `summary.json`, and `traces/`.
+This repo does not ship a canned PR report. Produce one by pointing `review` at a public C repository (the sample code the brief uses is C). The run directory then has `report.md`, `summary.json`, `log`, and `traces/`.
 
 ## Add a tool without recompiling
 
@@ -128,6 +133,7 @@ This repo does not ship a canned PR report. Produce one by pointing `review` at 
 ## Known limits
 
 - Config field names carry their unit and their subject: `[review].max_file_bytes`, `max_files_per_listing`, `max_hits_per_search`, `[triage].skip_files_over_bytes`, `[[provider]].budget_per_run`, `[[model]].context_window_tokens` and the three `_per_1m_tokens` prices, `[[tool]].requires_checkout`. Every number under `[review]`, `[triage]` and `[security]` is required and has no builtin default, because the right value depends on the model's context window or on how big this repository's files get. Omitting one, or writing a zero, fails `config check` and names the field. Copy [`examples/reviewbot.toml`](examples/reviewbot.toml), which sets all of them.
+- `[log] level` (`error|warn|info|debug|trace`, default `info`) is the one config field left out of the run fingerprint, so turning the log up does not invalidate a run's checkpoints. It is the only way to set the level; there is no `-v`.
 - `[security]` holds permissions only — `deny_paths`, `allow_extensions`, `follow_symlinks`, `allow_build_tools` — and no sizes. How much a tool may fetch or return is a context-window question, so those numbers live under `[review]` with `max_tool_rounds`.
 - `[security].allow_extensions` is required for the same reason and is a hard boundary besides, so a default could only loosen it. Extensions are written bare (`"rs"`, not `".rs"`). It is a whitelist, so it blocks extensionless files (`Makefile`, `Dockerfile`, `LICENSE`).
 - `[review].max_tool_rounds` and `[review].max_tool_output_bytes` are a pair: multiplied together they are held back from the context window, and a run refuses to start once nothing is left for the diff.

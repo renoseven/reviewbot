@@ -5,6 +5,14 @@
 # a [[tool]] bin exists on this machine; the binary must be there for a
 # real review that calls the tool.
 
+# Diagnostics. Every tracing line goes to <run dir>/log and nowhere else --
+# never to stdout or stderr -- appended, so re-entering a run keeps the earlier
+# attempt. `run show` prints the path. RUST_LOG still overrides this.
+# Left out of the run fingerprint on purpose: turning the log up must not
+# invalidate the checkpoints of a run already under way.
+[log]
+level = "info"                # error | warn | info | debug | trace
+
 # Code hosts. The input URL's host picks the row.
 [[platform]]
 host = "gitlab.com"

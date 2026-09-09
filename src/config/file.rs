@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     /// Logging controls diagnostics, not what the review concludes.
     // `Config` is serialized only for the run fingerprint. Keep this
-    // operational setting out so changing it can still resume the same run.
+    // operational setting out so changing it still re-enters the same run.
     #[serde(default, skip_serializing)]
     pub log: LogSettings,
     #[serde(default)]
