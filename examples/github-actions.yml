@@ -1,0 +1,38 @@
+# GitHub Actions: cache may live outside the workspace; still collect
+# --out-dir only, prune after review. config check first.
+
+# .github/workflows/reviewbot.yml
+name: reviewbot
+on:
+  pull_request:
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/reviewbot-runs
+          key: reviewbot-${{ github.event.pull_request.number }}
+      - name: config check
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.REVIEW_BOT_TOKEN }}
+        run: reviewbot --config /etc/reviewbot/reviewbot.toml config check
+      - name: review
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.REVIEW_BOT_TOKEN }}
+        run: >
+          reviewbot --config /etc/reviewbot/reviewbot.toml
+          review --publish --worktree .
+          --runs-dir "${{ runner.temp }}/reviewbot-runs"
+          --out-dir artifacts/
+          "${{ github.event.pull_request.html_url }}"
+      - name: prune
+        run: reviewbot run prune --runs-dir "${{ runner.temp }}/reviewbot-runs"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reviewbot
+          path: artifacts/

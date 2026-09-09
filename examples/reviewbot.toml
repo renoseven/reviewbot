@@ -1,0 +1,108 @@
+# Example machine config. Copy out of the repo and point --config at the copy.
+# api_key / api_token are names or paths, never the secret itself.
+# `reviewbot --config examples/reviewbot.toml config check` is valid with
+# dummy env values (DEEPSEEK_API_KEY, GITLAB_TOKEN). It does not check that
+# a [[tool]] bin exists on this machine; the binary must be there for a
+# real review that calls the tool.
+
+# Code hosts. The input URL's host picks the row.
+[[platform]]
+host = "gitlab.com"
+base_url = "https://gitlab.com/api/v4"
+api_token = "GITLAB_TOKEN"
+
+[[platform]]
+host = "github.com"
+base_url = "https://api.github.com"
+api_token = "~/.config/github_token"
+
+# One vendor: protocol, key, currency, and the run budget.
+[[provider]]
+name = "deepseek"
+protocol = "openai"
+base_url = "https://api.deepseek.com"
+api_key = "~/.config/deepseek_api_key"
+currency = "CNY"
+budget = -1
+
+# Model catalog. Prices and limits travel with the entry; --model switches all of them.
+[[model]]
+name = "deepseek-v4-flash"
+default = true
+provider = "deepseek"
+input_per_1m = 3.0
+cached_input_per_1m = 0.10
+output_per_1m = 9.0
+context_window = 1000000
+max_output_tokens = 384000
+reasoning_effort = "none"
+
+[[model]]
+name = "deepseek-v4-pro"
+provider = "deepseek"
+input_per_1m = 9.0
+cached_input_per_1m = 0.30
+output_per_1m = 27.0
+context_window = 1000000
+max_output_tokens = 384000
+
+# Every number below is required. None of them has an answer that holds
+# across models and repositories, so there are no builtin defaults: reviewbot
+# refuses to start rather than guess on your behalf.
+
+# What to skip and how big one review turn is. Cost policy, not a hard deny.
+[triage]
+# Working size of one review turn, clamped down to whatever the window has
+# room for. The leftover context window is only a hard ceiling, not this.
+max_chunk_tokens = 24000
+# A file bigger than this is skipped and named in the report.
+skip_over_bytes = 262144
+skip_paths = ["**/*.lock", "vendor/**"]
+
+# Tool loop for the review stage: how many turns it gets, and how much content
+# it may pull into the model's window. Which model to use is on [[model]].
+[review]
+# Rounds, not calls: one round carries as many function calls as the model
+# emitted together. triage reserves rounds * max_tool_output_bytes out of the
+# window, so raising this without lowering that shrinks the diff each turn
+# sees -- and reviewbot refuses to start once nothing is left for the diff.
+max_tool_rounds = 12
+# How much one listing or one search may hand back. Both numbers appear in
+# the tool descriptions the model reads, so they cannot drift apart from
+# what the code enforces.
+max_files_listed = 200
+max_search_hits = 50
+# The most of one file a read may fetch. This bounds the fetch, not the
+# answer: the platform API has no range request, so reading part of a file
+# means downloading all of it, and a file past this cannot be read at all.
+# Not a permission -- whether a path may be read at all is [security].
+max_read_bytes = 262144
+# What one tool answer may hand back, and what all the tool output of one
+# round may add up to. Paired with max_tool_rounds above: the two multiplied
+# together are held back from the context window. A file read that does not
+# fit is refused with its size rather than truncated, so the model can ask
+# for a line range instead of judging half a file without knowing.
+max_tool_output_bytes = 32768
+
+# What may be touched at all. Permissions only: nothing here is a size, and
+# no command line flag may override any of it.
+[security]
+deny_paths = ["secrets/**", "**/*.tfvars"]
+# No builtin list: the read-a-file tools touch nothing outside it. A
+# whitelist, so extensionless files (Makefile, Dockerfile) stay unreadable.
+allow_extensions = ["c", "h", "cpp", "hpp", "rs", "toml", "md", "py", "ts", "js", "go", "java"]
+# requires_build tools also need allow_build_tools = true and a sandbox.
+allow_build_tools = false
+
+# External checkers. Listed means enabled. Builtins are not declared here.
+# Default enabled checker: no compile step. The bin must exist for a real
+# review; `config check` does not verify that.
+[[tool]]
+name = "gcc"
+description = "compile one C file with warnings, no object file (gcc -fsyntax-only)"
+bin = "/usr/bin/gcc"
+args = ["-Wall", "-Wextra", "-fsyntax-only", "--", "{path}"]
+params.path = { type = "path" }
+requires_worktree = true
+requires_build = false
+timeout_ms = 60000

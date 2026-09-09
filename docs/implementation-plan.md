@@ -12,7 +12,7 @@ src/
   main.rs             # 只有 fn main()：起 tracing、调 cli 解析、分派、把错误收成退出码
   cli/                # 二进制这一侧，lib.rs 不声明它
     mod.rs            #   子命令分派 + lib 错误 → 退出码 0/1/2/3/4/5
-    args.rs           #   clap derive：全局 / review / review+report / runs prune 四组 flag
+    args.rs           #   clap derive：全局 / review / review+report / run prune 四组 flag
     render.rs         #   text 与 json 两种渲染：进度行、结果摘要、runs/models/tools 列表
   domain/             # 共享词汇，一类型一文件，不含逻辑
     mod.rs            #   只做 pub use 再导出
@@ -28,7 +28,7 @@ src/
   record/             # run_id、run 目录、lock、meta.json、checkpoint 原子写、Trace 两视图、Storage trait
   platform/           # Platform trait + RepoSource trait + gitlab / github + URL 解析 + capabilities()
   worktree/           # WorktreeSource trait 与实现（只有读方法）：遍历、读文件、正则匹配
-  protocol/           # Request/Response + Protocol trait + openai_responses
+  protocol/           # Request/Response + Protocol trait + openai
   tool/               # Tool trait + registry + command 实现 + 六个内建 tool（读取前调 security 的路径校验）
   stage/{input,triage,review,merge,publish}.rs
   prompts/{review.md,summary.md}   # include_str!，配置改不动
@@ -50,17 +50,17 @@ tests/                # 少量整装与 CLI 契约测试（assert_cmd）
 
 **M2 input + triage**。unified diff 解析器（同时服务本地文件与平台 diff 端点，按内容判 mbox 并拒绝），每个文件建**可评论行**与**变更行**两个集合并随 `ChangeSet` 落盘；`triage` 做过滤、按变更行数降序、一文件一分片、超限按 hunk 再切，分片上限按 `context_window − max_output_tokens − 固定骨架 − 工具余量 − headroom` 算。仍用假 protocol。
 
-**M3 review 主干**。`protocol::openai_responses` 打 `POST {base_url}/responses`，无流式、无 `previous_response_id`；prompt 六段写进 `src/prompts/review.md` 用 `include_str!`，`instructions` 在整个 run 内逐字不变，`input` 只装一个文件的 diff；调用前预算检查 + usage 结算 + 脱敏 + 瞬时故障退避重试（500ms 起、翻倍、上限 8s、抖动，只对超时 / 5xx / 429 / 空 body）。不含工具。
+**M3 review 主干**。`protocol::openai` 打 `POST {base_url}/responses`，无流式、无 `previous_response_id`；prompt 六段写进 `src/prompts/review.md` 用 `include_str!`，`instructions` 在整个 run 内逐字不变，`input` 只装一个文件的 diff；调用前预算检查 + usage 结算 + 脱敏 + 瞬时故障退避重试（500ms 起、翻倍、上限 8s、抖动，只对超时 / 5xx / 429 / 空 body）。不含工具。
 
-**M4 merge + 报告**。七步：解析 → 剔越界（越出文件、`diff_lines` 一行都不落在变更行集合上即整条丢弃）→ 行号对齐（精确 → ±3 窗口 → `diff_lines` 兜底 → 退化文件级）→ 核对标注 → 去重（同 `path`、区间相交、正文规范化后逐字相同）→ 定序统计 → 汇总打分（单独一次模型调用，预算不足或不合 schema 就 `overall_score = null` 并写明原因，禁止填 0）。`publish` 先只做写 `report.md` / `summary.json` 与 published 视图的 trace 折叠。
+**M4 merge + 报告**。七步：解析 → 剔越界（越出文件、`diff_lines` 一行都不落在变更行集合上即整条丢弃）→ 行号对齐（精确 → ±3 窗口 → `diff_lines` 兜底 → 退化文件级）→ 核对标注 → 去重（同 `path`、区间相交、正文规范化后逐字相同）→ 定序统计 → 汇总打分（单独一次模型调用，预算不足或不合 schema 就 `overall_score = null` 并写明原因，禁止填 0）。`publish` 先只做写 `report.md` / `summary.json`；trace 留在 `traces/`，不折进报告。
 
-**M5 platform + 发帖**。URL 解析 → host 匹配 `[[platforms]]` → `kind` 由内置两条已知 host 或显式字段定，禁止从 `base_url` 形状反推；GitLab 逐条 discussions（带 `base_sha` / `start_sha` / `head_sha` 与 `new_line`），GitHub 一次 `POST .../reviews`；幂等标记 `<!-- reviewbot:{run_id}:{trace_id} -->`，汇总评论用 `{run_id}:summary`；发前拉已有评论比对，成功一条写一条 `published.json`；422 退化为文件级重试一次。流程到此走完。
+**M5 platform + 发帖**。URL 解析 → host 匹配 `[[platform]]` → `kind` 由内置两条已知 host 或显式字段定，禁止从 `base_url` 形状反推；GitLab 逐条 discussions（带 `base_sha` / `start_sha` / `head_sha` 与 `new_line`），GitHub 一次 `POST .../reviews`；幂等标记 `<!-- reviewbot:{run_id}:{trace_id} -->`，汇总评论用 `{run_id}:summary`；发前拉已有评论比对，成功一条写一条 `published.json`；422 退化为文件级重试一次。流程到此走完。
 
 **M6 工具与 function_call 循环**。`Tool` trait + registry + 通用 command 实现（argv 数组直接 `execve`、一个占位符一个元素、子进程环境剔 `*_API_KEY` / `*_TOKEN`、禁网、超时、stdout+stderr 合并后按 `max_tool_output_bytes` 截断、输出侧路径过 `deny_paths`）；循环每轮走预算与上下文两道检查；`requires_worktree` 不满足整条不注册并 `warn`；「注册了外部检查器但一次都没调」要留痕。引文核对与去重在这一步才真正生效。
 
 **M7 内建 tool 与两个内容来源**。`RepoSource`（平台 API 按 `head_sha` 列 / 读 / 搜，GitHub 树 `truncated` 时退到逐目录、搜索结果只当候选路径再按 sha 取回本地重做匹配）与 `WorktreeSource`（磁盘遍历、读、正则）；六个对称命名的内建 tool 按能力注册，`capabilities()` 说不支持搜索就不注册 `search_repo`；整棵树一个 run 只取一次，后续 glob 本地过滤。
 
-**M8 收口与交付物**。`publish` / `report` / `runs list|show|prune` / `models list` / `tools list` 子命令，`--format json` 的字段化输出（`runs list` 的 runs 目录进顶层键），退出码 0/1/2/3/4/5，失败提示带 `run_id` 与可照抄的 `resume` 命令（含非默认 `--runs-dir`）；README（含已知限制、`allow_extensions` 挡掉无扩展名文件、子进程禁写只在容器里成立）、示例 `reviewbot.toml`、GitLab CI / GitHub Actions 片段。
+**M8 收口与交付物**。`publish` / `report` / `run list|show|prune` / `model list` / `tool list` 子命令，`--format json` 的字段化输出（`run list` 的 runs 目录进顶层键），退出码 0/1/2/3/4/5，失败提示带 `run_id` 与可照抄的 `resume` 命令（含非默认 `--runs-dir`）；README（含已知限制、`allow_extensions` 挡掉无扩展名文件、子进程禁写只在容器里成立）、示例 `reviewbot.toml`、GitLab CI / GitHub Actions 片段。
 
 ## 每步用哪个模型
 

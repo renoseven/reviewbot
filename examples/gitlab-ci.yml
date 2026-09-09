@@ -1,0 +1,21 @@
+# GitLab CI: cache the runs dir inside the project, collect --out-dir only,
+# prune after review. Put the real reviewbot.toml outside the repo (image
+# path or CI file variable). Add .reviewbot/ to .gitignore.
+
+# .gitlab-ci.yml
+code-review:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  cache:
+    key: reviewbot-$CI_MERGE_REQUEST_IID
+    paths: [.reviewbot/runs]
+  artifacts:
+    paths: [artifacts/]
+    when: always
+  script:
+    - reviewbot --config /etc/reviewbot/reviewbot.toml config check
+    - reviewbot --config /etc/reviewbot/reviewbot.toml review --publish --worktree . --runs-dir .reviewbot/runs --out-dir artifacts/ "$CI_MERGE_REQUEST_PROJECT_URL/-/merge_requests/$CI_MERGE_REQUEST_IID"
+    - reviewbot run prune --runs-dir .reviewbot/runs
+  variables:
+    DEEPSEEK_API_KEY: $DEEPSEEK_API_KEY
+    GITLAB_TOKEN: $REVIEW_BOT_TOKEN
