@@ -24,12 +24,9 @@ use crate::config::{ConfigError, Secret, SecretSource, Settings};
 use crate::platform::{Capabilities, ChangeRef, Platform, PlatformError};
 use crate::protocol::{Protocol, ProtocolError, Request, Response};
 use crate::record::{InputIdentity, InputRecord, RecordError, Recorder};
-use crate::security::{EnvPolicy, PathPolicy, Redactor};
-use crate::tool::{
-    CommandContext, CommandTool, FinishReview, ListFiles, ReadFile, Registry, SearchCode, StatFile,
-    SubmitComment, SubmitSummary, ToolError, ToolLimits, WorktreeContext,
-};
-use crate::worktree::{Checkout, FetchedWorktree, Search, WorktreeError, WorktreeSource};
+use crate::security::{PathPolicy, Redactor};
+use crate::tool::{Registry, ToolError};
+use crate::worktree::{Abilities, Checkout, FetchedWorktree, Reach, WorktreeError, WorktreeSource};
 
 use input::diff::DiffError;
 use prompt::PromptError;
@@ -123,11 +120,12 @@ impl Adapters {
             )),
         };
 
-        let tools = build_tools(ToolSources {
+        warn_about_reach(worktree.reach());
+        let tools = crate::tool::build(
             settings,
-            paths: path_policy(settings)?,
-            worktree: Arc::clone(&worktree),
-        })?;
+            PathPolicy::for_settings(settings)?,
+            Arc::clone(&worktree),
+        );
 
         Ok(Self {
             tools,
@@ -219,18 +217,7 @@ impl Protocol for UnusedProtocol {
 /// The read boundary for this run: `[security]` plus the directories the run
 /// writes to, expressed relative to the worktree when there is one.
 pub fn path_policy(settings: &Settings) -> Result<PathPolicy, StageError> {
-    PathPolicy::new(
-        &settings.config.security,
-        &settings.written_paths(),
-        settings.options.worktree.as_deref(),
-    )
-    .map_err(|error| {
-        StageError::Config(ConfigError::InvalidGlob {
-            field: "[security].deny_paths",
-            pattern: String::new(),
-            reason: error.to_string(),
-        })
-    })
+    Ok(PathPolicy::for_settings(settings)?)
 }
 
 fn hide_secret(redactor: &mut Redactor, secret: &Secret) {
@@ -249,81 +236,19 @@ fn hide_platform_token(redactor: &mut Redactor, settings: &Settings, host: &str)
     }
 }
 
-/// What decides which tools exist this run and what each of them may reach.
-/// Gathered into one value so registration still reads as a single decision.
-struct ToolSources<'a> {
-    settings: &'a Settings,
-    paths: PathPolicy,
-    /// This run's worktree, which is the only content source there is.
-    worktree: Arc<dyn WorktreeSource>,
-}
-
-/// A tool whose preconditions are unmet is not registered, and says so once:
-/// what the model can see always equals what it can really call. A tool that
-/// fails is read as an answer about the repository, and that answer ends up in
-/// a comment about the code.
-///
-/// Three preconditions, all of them properties of this run's worktree:
-///
-/// - **content at all.** A diff with no platform behind it leaves the worktree
-///   empty for the whole run, so no content tool and no checker is registered.
-/// - **a search that can be answered.** A platform with no code search leaves
-///   `search_code` out rather than answering nothing: "no hits" would be read
-///   as "not there".
-/// - **a whole checkout.** A checker that compiles, walks history or reasons
-///   across files needs the project, not the handful of files fetched so far.
-fn build_tools(sources: ToolSources<'_>) -> Result<Registry, StageError> {
-    let mut registry = Registry::new();
-    // The three ways of handing something over, always registered: a finding,
-    // "I have none", and the verdict. None of them has a precondition, and
-    // `Round` keeps each off the turns it does not belong to. "I have none"
-    // has to be as available as filing something, or a model with nothing to
-    // file will file something.
-    registry.register(Box::new(SubmitComment::new()));
-    registry.register(Box::new(FinishReview::new()));
-    registry.register(Box::new(SubmitSummary::new()));
-    let settings = sources.settings;
-    let reach = sources.worktree.reach();
-    if !reach.has_content() {
+/// Say once, for whoever is watching the run, what this worktree cannot do.
+/// The model is told the same thing by every description it is given; this is
+/// for the person who is about to read a report built on very little.
+fn warn_about_reach(reach: Reach) {
+    let missing = reach.unmet(Abilities::all());
+    if missing.contains(Abilities::CONTENT) {
         tracing::warn!(
-            "this run has no code to read: no content tool and no checker is registered"
+            "this run has no code to read beyond the diff: pass --worktree to point at a \
+             checkout. Every tool is still offered, and each one says it cannot answer"
         );
-        return Ok(registry);
+    } else if missing.contains(Abilities::SEARCH) {
+        tracing::warn!("nothing can answer a search this run: search_code will refuse");
     }
-
-    let limits = ToolLimits::from_config(&settings.config);
-    let context =
-        WorktreeContext::new(Arc::clone(&sources.worktree), sources.paths.clone(), limits);
-    registry.register(Box::new(ListFiles::new(context.clone())));
-    registry.register(Box::new(StatFile::new(context.clone())));
-    registry.register(Box::new(ReadFile::new(context.clone())));
-    match reach.search {
-        Search::Unavailable => {
-            tracing::warn!("nothing can answer a search this run: search_code is not registered");
-        }
-        _ => registry.register(Box::new(SearchCode::new(context))),
-    }
-
-    for entry in &settings.config.tools {
-        if entry.requires_checkout && !reach.is_checkout() {
-            tracing::warn!(
-                tool = %entry.name,
-                "this run has no checkout, only fetched files: not registered"
-            );
-            continue;
-        }
-        registry.register(Box::new(CommandTool::new(
-            entry.clone(),
-            CommandContext::new(
-                EnvPolicy::default(),
-                sources.paths.clone(),
-                Arc::clone(&sources.worktree),
-                settings.config.review.max_tool_output_bytes,
-                settings.options.backoff(),
-            ),
-        )));
-    }
-    Ok(registry)
 }
 
 /// Everything a stage is allowed to reach. Assembled by the caller so no
@@ -390,7 +315,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::config::{BUILTIN_TOOL_NAMES, RunOptions};
+    use crate::config::{RESERVED_TOOL_NAMES, RunOptions};
     use crate::platform::{LineRange, Listing, RepoSource, SearchHit};
     use crate::tool::Purpose;
 
@@ -488,15 +413,14 @@ type = "path"
         .expect("valid config")
     }
 
-    /// The registration matrix run through `build_tools` itself: every one of
-    /// its decisions is a property of this run's worktree and nothing else.
+    /// Every case below goes through the real construction path, because what
+    /// is being asserted is that it decides nothing: the worktree does.
     fn registry(settings: &Settings, worktree: Arc<dyn WorktreeSource>) -> Registry {
-        build_tools(ToolSources {
+        crate::tool::build(
             settings,
-            paths: path_policy(settings).expect("valid globs"),
+            path_policy(settings).expect("valid globs"),
             worktree,
-        })
-        .expect("built")
+        )
     }
 
     /// The worktree a run opens for itself, already sitting in a directory.
@@ -514,12 +438,54 @@ type = "path"
         Arc::new(Checkout::open(root.to_path_buf()).expect("a directory"))
     }
 
-    /// A diff with no platform behind it: the worktree exists, and it is
-    /// empty for the whole run. Not registered rather than registered and
-    /// always failing — a model that can see a tool will call it, and it
-    /// would read the failure as an answer about the repository.
+    /// The whole point of the change: what a run can check is a property of
+    /// its worktree, and the set of names is not. Three very different
+    /// worktrees, one list.
     #[test]
-    fn an_empty_worktree_leaves_the_model_no_content_tools_and_no_checkers() {
+    fn every_worktree_offers_the_model_the_same_tools() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let names = |worktree| {
+            let settings = settings(root.path(), None);
+            registry(&settings, worktree)
+                .names()
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<String>>()
+        };
+        let expected = vec![
+            "submit_comment",
+            "finish_review",
+            "submit_summary",
+            "list_files",
+            "stat_file",
+            "read_file",
+            "search_code",
+            "typecheck",
+            "compile",
+        ];
+
+        assert_eq!(
+            names(fetched(root.path(), None, Capabilities::default())),
+            expected,
+            "an empty worktree withholds nothing"
+        );
+        assert_eq!(
+            names(fetched(
+                root.path(),
+                Some(Arc::new(StubRepo) as Arc<dyn RepoSource>),
+                Capabilities::default(),
+            )),
+            expected,
+            "neither does a platform that cannot search"
+        );
+        assert_eq!(names(checkout(root.path())), expected);
+    }
+
+    /// A diff with no platform behind it: the worktree exists and is empty for
+    /// the whole run. Every tool is still offered, and every one of them says
+    /// what is missing and that nothing about the code follows from it.
+    #[test]
+    fn an_empty_worktree_answers_every_tool_with_a_reason_about_the_run() {
         let root = tempfile::tempdir().expect("temp dir");
         let settings = settings(root.path(), None);
         let registry = registry(
@@ -527,35 +493,42 @@ type = "path"
             fetched(root.path(), None, Capabilities::default()),
         );
 
-        assert_eq!(
-            registry.names(),
-            vec!["submit_comment", "finish_review", "submit_summary"],
-            "the three ways of handing something over, and nothing to look at"
-        );
-        assert!(registry.names_with_purpose(Purpose::Content).is_empty());
-        assert!(registry.names_with_purpose(Purpose::Check).is_empty());
-        for name in BUILTIN_TOOL_NAMES {
-            // The three ways of handing something over need nothing of the
-            // worktree, so they are there even when there is nothing to read.
-            let delivery = registry
-                .get(name)
-                .is_some_and(|tool| tool.purpose() == Purpose::Delivery);
-            match delivery {
-                true => continue,
-                false => assert!(registry.get(name).is_none(), "{name} should not exist"),
+        assert!(registry.usable_with_purpose(Purpose::Content).is_empty());
+        assert!(registry.usable_with_purpose(Purpose::Check).is_empty());
+        for name in registry.names() {
+            let tool = registry.get(name).expect("just listed");
+            if tool.purpose() == Purpose::Delivery {
+                // Handing a finding over needs nothing of the worktree.
+                assert!(tool.unavailable().is_none(), "{name}");
+                continue;
             }
+            let reason = tool.unavailable().expect(name);
+            assert!(reason.contains("not about the repository"), "{name}");
+            assert!(
+                tool.description().contains("NOT AVAILABLE THIS RUN"),
+                "{name}: the model has to be able to decide before calling"
+            );
+            let refused = registry
+                .execute(name, &serde_json::json!({}))
+                .expect_err(name);
+            assert!(
+                matches!(&refused, ToolError::Unavailable { reason, .. } if reason.contains("not about the repository")),
+                "{name}: {refused}"
+            );
+        }
+        for name in RESERVED_TOOL_NAMES {
+            assert!(registry.get(name).is_some(), "{name} should be offered");
         }
     }
 
-    /// A URL with no checkout: one group of content tools over a worktree the
-    /// run fills from the platform. The names are the same ones a checkout
-    /// gets — only the descriptions differ.
+    /// A platform that cannot search still offers `search_code`, and the
+    /// refusal says what an empty result would have meant if it had run: a
+    /// miss here is the run's limit, not proof of absence.
     #[test]
-    fn a_fetched_worktree_registers_the_content_tools_under_the_same_names() {
+    fn a_worktree_that_cannot_search_refuses_the_search_and_answers_the_rest() {
         let root = tempfile::tempdir().expect("temp dir");
         let settings = settings(root.path(), None);
-
-        let without_search = registry(
+        let registry = registry(
             &settings,
             fetched(
                 root.path(),
@@ -563,35 +536,23 @@ type = "path"
                 Capabilities::default(),
             ),
         );
-        assert_eq!(
-            without_search.names_with_purpose(Purpose::Content),
-            vec!["list_files", "stat_file", "read_file"],
-            "a platform that cannot search registers no search"
-        );
 
-        let with_search = registry(
-            &settings,
-            fetched(
-                root.path(),
-                Some(Arc::new(StubRepo) as Arc<dyn RepoSource>),
-                Capabilities {
-                    code_search: true,
-                    regex_search: false,
-                },
-            ),
-        );
         assert_eq!(
-            with_search.names_with_purpose(Purpose::Content),
-            vec!["list_files", "stat_file", "read_file", "search_code"]
+            registry.usable_with_purpose(Purpose::Content),
+            vec!["list_files", "stat_file", "read_file"]
         );
+        let search = registry.get("search_code").expect("still offered");
+        let reason = search.unavailable().expect("nothing can answer one");
+        assert!(reason.contains("not evidence"), "{reason}");
+        assert!(search.description().contains("NOT AVAILABLE THIS RUN"));
     }
 
-    /// "Needs a whole checkout" is its own precondition, and a worktree of
-    /// fetched files does not satisfy it: a `.c` file without its project
-    /// headers earns a screen of missing includes, which is worse than not
-    /// running the checker at all.
+    /// "Needs a whole checkout" is a fact about the worktree, not about which
+    /// tools were built: a `.c` file without its project headers earns a
+    /// screen of missing includes, which is worse than not running the checker
+    /// at all. So the checker is offered either way and refuses without one.
     #[test]
-    fn a_checker_that_needs_the_whole_project_waits_for_a_checkout() {
+    fn a_checker_that_needs_the_whole_project_refuses_until_it_has_one() {
         let root = tempfile::tempdir().expect("temp dir");
 
         let without = settings(root.path(), None);
@@ -604,19 +565,30 @@ type = "path"
             ),
         );
         assert_eq!(
-            fetched_only.names_with_purpose(Purpose::Check),
+            fetched_only.usable_with_purpose(Purpose::Check),
             vec!["typecheck"],
-            "the single-file checker still runs; the compiling one does not"
+            "the single-file checker answers; the compiling one cannot"
+        );
+        let compile = fetched_only.get("compile").expect("offered all the same");
+        assert!(
+            compile
+                .unavailable()
+                .is_some_and(|reason| reason.contains("whole checkout")),
+            "{:?}",
+            compile.unavailable()
         );
 
         let with = settings(root.path(), Some(root.path().to_path_buf()));
         let whole = registry(&with, checkout(root.path()));
         assert_eq!(
-            whole.names_with_purpose(Purpose::Check),
+            whole.usable_with_purpose(Purpose::Check),
             vec!["typecheck", "compile"]
         );
         assert!(
-            whole.get("compile").is_some(),
+            whole
+                .get("compile")
+                .is_some_and(|tool| tool.unavailable().is_none()
+                    && !tool.description().contains("NOT AVAILABLE")),
             "adding a checker is a [[tool]] entry and nothing else"
         );
     }
@@ -645,7 +617,7 @@ type = "path"
             .map(str::to_string)
             .collect();
         registered.sort();
-        let mut reserved: Vec<String> = BUILTIN_TOOL_NAMES
+        let mut reserved: Vec<String> = RESERVED_TOOL_NAMES
             .iter()
             .map(|name| name.to_string())
             .collect();

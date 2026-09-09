@@ -97,7 +97,7 @@ allow_build_tools = false
 # External checkers. Listed means enabled. Builtins are not declared here.
 # The bin must exist for a real review; `config check` does not verify that.
 
-# One file on its own. No compile, no checkout: registered either way.
+# One file on its own. No compile, no checkout: answerable either way.
 [[tool]]
 name = "cppcheck"
 description = "static analysis for one C/C++ file: memory, bounds, uninitialized values (no compile)"
@@ -110,7 +110,8 @@ timeout_ms = 60000
 
 # The brief's named "add a tool" demo: another [[tool]] row, no recompile.
 # Needs the whole project: a lone .c file without headers is a screen of
-# missing includes, worse than not running. Unregistered without --worktree.
+# missing includes, worse than not running. Still offered to the model without
+# --worktree; the description says it is unavailable and the call is refused.
 [[tool]]
 name = "typecheck"
 description = "type-check one C file with gcc -fsyntax-only (no object file)"

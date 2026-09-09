@@ -18,8 +18,9 @@ use serde_json::{Map, Value};
 
 use crate::config::{Backoff, ToolEntry};
 use crate::security::{EnvPolicy, Limits, PathPolicy, truncate};
-use crate::worktree::WorktreeSource;
+use crate::worktree::{Abilities, WorktreeSource};
 
+use super::availability::unavailable_description;
 use super::signature::Signature;
 use super::{Purpose, Round, Tool, ToolError, ToolOutput};
 
@@ -71,6 +72,17 @@ impl CommandContext {
     fn root(&self) -> &Path {
         self.worktree.root()
     }
+
+    /// Why this run's worktree cannot answer a checker that needs these, when
+    /// it cannot. The same answer the description was written from.
+    fn refusal(&self, needs: Abilities) -> Option<&'static str> {
+        let reach = self.worktree.reach();
+        let missing = reach.unmet(needs);
+        match missing.is_empty() {
+            true => None,
+            false => Some(super::availability::refusal(missing)),
+        }
+    }
 }
 
 pub struct CommandTool {
@@ -80,17 +92,38 @@ pub struct CommandTool {
     /// The `params` table, read as a declaration: the schema the model sees
     /// and the check its call is put through both come from here.
     signature: Signature,
+    /// The config author's own words, plus what this run's worktree makes of
+    /// them. Owned rather than borrowed from the entry, because a checker this
+    /// run cannot answer has to say so where the model reads, and the only
+    /// thing it reads is this.
+    description: String,
+    /// What the checker needs of the worktree, from the entry. Read both to
+    /// write the description and to refuse the call, so the two agree.
+    needs: Abilities,
 }
 
 impl CommandTool {
     pub fn new(entry: ToolEntry, context: CommandContext) -> Self {
         let limits = Limits::new(entry.timeout_ms, context.max_output_bytes);
         let signature = Signature::from_entry(&entry);
+        // Every checker opens a file, so every one of them needs content. A
+        // compiler, a history walk or a cross-file analysis needs the whole
+        // project on top of that, and says so in its entry.
+        let mut needs = Abilities::CONTENT;
+        needs.set(Abilities::CHECKOUT, entry.requires_checkout);
+        let reach = context.worktree.reach();
+        let missing = reach.unmet(needs);
+        let description = match missing.is_empty() {
+            true => entry.description.clone(),
+            false => unavailable_description(&entry.description, missing),
+        };
         Self {
             entry,
             context,
             limits,
             signature,
+            description,
+            needs,
         }
     }
 
@@ -373,7 +406,7 @@ impl Tool for CommandTool {
     }
 
     fn description(&self) -> &str {
-        &self.entry.description
+        &self.description
     }
 
     /// `params` is the schema the model sees, straight from the config.
@@ -381,8 +414,9 @@ impl Tool for CommandTool {
         &self.signature
     }
 
-    /// A checker's answer means something even when it is silent: one that was
-    /// registered and never called says nobody scanned this chunk.
+    /// A checker's answer means something even when it is silent: one this run
+    /// could have answered and the model never called says nobody scanned this
+    /// chunk.
     fn purpose(&self) -> Purpose {
         Purpose::Check
     }
@@ -391,12 +425,12 @@ impl Tool for CommandTool {
         &[Round::Investigation]
     }
 
-    fn requires_checkout(&self) -> bool {
-        self.entry.requires_checkout
+    fn needs(&self) -> Abilities {
+        self.needs
     }
 
-    fn requires_build(&self) -> bool {
-        self.entry.requires_build
+    fn unavailable(&self) -> Option<&str> {
+        self.context.refusal(self.needs)
     }
 
     fn execute(&self, arguments: &Value) -> Result<ToolOutput, ToolError> {
@@ -453,10 +487,33 @@ mod tests {
         }
     }
 
-    /// A command tool only ever asks the worktree where it is: the process it
-    /// spawns opens the files itself.
+    /// A command tool only ever asks the worktree where it is and what it can
+    /// answer: the process it spawns opens the files itself.
     struct RootOnly {
         root: PathBuf,
+        reach: crate::worktree::Reach,
+    }
+
+    impl RootOnly {
+        fn checkout(root: &Path) -> Self {
+            Self {
+                root: root.to_path_buf(),
+                reach: crate::worktree::Reach {
+                    content: crate::worktree::Content::Checkout,
+                    search: crate::worktree::Search::Regex,
+                },
+            }
+        }
+
+        fn fetched(root: &Path) -> Self {
+            Self {
+                root: root.to_path_buf(),
+                reach: crate::worktree::Reach {
+                    content: crate::worktree::Content::Fetched,
+                    search: crate::worktree::Search::Regex,
+                },
+            }
+        }
     }
 
     impl WorktreeSource for RootOnly {
@@ -465,10 +522,7 @@ mod tests {
         }
 
         fn reach(&self) -> crate::worktree::Reach {
-            crate::worktree::Reach {
-                content: crate::worktree::Content::Checkout,
-                search: crate::worktree::Search::Regex,
-            }
+            self.reach
         }
 
         fn open_in(&self, _run_dir: &Path) -> Result<(), crate::worktree::WorktreeError> {
@@ -513,9 +567,7 @@ mod tests {
             CommandContext::new(
                 EnvPolicy::default(),
                 policy(root),
-                Arc::new(RootOnly {
-                    root: root.to_path_buf(),
-                }) as Arc<dyn WorktreeSource>,
+                Arc::new(RootOnly::checkout(root)) as Arc<dyn WorktreeSource>,
                 65_536,
                 Backoff::new(0),
             ),
@@ -680,9 +732,7 @@ mod tests {
             CommandContext::new(
                 EnvPolicy::default(),
                 policy(root.path()),
-                Arc::new(RootOnly {
-                    root: root.path().to_path_buf(),
-                }) as Arc<dyn WorktreeSource>,
+                Arc::new(RootOnly::checkout(root.path())) as Arc<dyn WorktreeSource>,
                 8,
                 Backoff::new(0),
             ),
@@ -714,6 +764,49 @@ mod tests {
 
         assert!(matches!(error, ToolError::Timeout { .. }), "{error}");
         assert!(error.is_retryable());
+    }
+
+    /// `requires_checkout` no longer decides whether the checker exists. It is
+    /// offered on every run and says, in the description the model reads and
+    /// again if it calls anyway, that this run's worktree is not one — and
+    /// that this is a fact about the run rather than a clean scan.
+    #[test]
+    fn a_checker_needing_a_checkout_is_offered_on_a_fetched_worktree_and_refuses() {
+        let root = worktree();
+        let marker = root.path().join("spawned");
+        let script = format!("printf x > {}", marker.display());
+        let checker = |worktree: Arc<dyn WorktreeSource>| {
+            CommandTool::new(
+                entry("/bin/sh", &["-c", script.as_str(), "{path}"]),
+                CommandContext::new(
+                    EnvPolicy::default(),
+                    policy(root.path()),
+                    worktree,
+                    65_536,
+                    Backoff::new(0),
+                ),
+            )
+        };
+
+        let fetched = checker(Arc::new(RootOnly::fetched(root.path())));
+        let reason = fetched.unavailable().expect("not a checkout");
+        assert!(reason.contains("whole checkout"), "{reason}");
+        assert!(reason.contains("not about the code"), "{reason}");
+        assert!(
+            fetched.description().contains("NOT AVAILABLE THIS RUN"),
+            "{}",
+            fetched.description()
+        );
+        assert!(
+            fetched.description().starts_with("static analysis"),
+            "the config author's own words come first: {}",
+            fetched.description()
+        );
+
+        let whole = checker(Arc::new(RootOnly::checkout(root.path())));
+        assert!(whole.unavailable().is_none());
+        assert_eq!(whole.description(), "static analysis for C and C++");
+        assert!(!marker.exists(), "neither of them was run");
     }
 
     #[test]

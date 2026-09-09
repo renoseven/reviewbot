@@ -7,7 +7,9 @@
 pub mod changeset;
 pub mod comment;
 pub mod confidence;
+pub mod severity;
 
 pub use changeset::{ChangeSet, DEV_NULL, FileChange, Hunk, Locator, Narrative};
 pub use comment::{Comment, CommentTarget};
 pub use confidence::Confidence;
+pub use severity::Severity;

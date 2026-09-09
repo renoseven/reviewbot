@@ -66,9 +66,16 @@ impl SubmitComment {
                     "How to fix it. Do not restate the problem. Never an empty string.",
                 ),
                 Parameter::required(
+                    "severity_score",
+                    Shape::percentage(),
+                    "Integer 0-100: how much it matters if this is real. Judge the damage, not \
+                     your certainty -- that is the other number.",
+                ),
+                Parameter::required(
                     "confidence_score",
                     Shape::percentage(),
-                    "Integer 0-100: how sure you are that a reader should act on this.",
+                    "Integer 0-100: how sure you are that this is real. Judge your certainty, \
+                     not the damage -- that is the other number.",
                 ),
                 Parameter::required(
                     "evidence",
@@ -114,11 +121,14 @@ impl SubmitComment {
     pub fn description_text() -> &'static str {
         "Submit one finding for this file. Call once per finding; several \
          calls in one round are fine. body is the problem; suggestion is \
-         the fix. path may be omitted (this file). Stop after this round; \
-         do not wait for confirmation. If you have no locatable defect, do \
-         not call this tool at all: call finish_review instead. A filed \
-         \"no problems found\" is published as a finding and counts towards \
-         the score, so it is worse than nothing."
+         the fix. severity_score and confidence_score are separate \
+         judgements and are meant to disagree: a defect that would corrupt \
+         memory is severe whether or not you are sure of it. path may be \
+         omitted (this file). Stop after this round; do not wait for \
+         confirmation. If you have no locatable defect, do not call this \
+         tool at all: call finish_review instead. A filed \"no problems \
+         found\" is published as a finding and counts towards the score, so \
+         it is worse than nothing."
     }
 
     /// The chunk already knows which file this is. An omitted or empty path
@@ -179,7 +189,10 @@ impl Tool for SubmitComment {
             )
             .finishing());
         }
-        let checked = self.signature.validate(Self::NAME, arguments)?;
+        let checked = self
+            .signature
+            .validate(Self::NAME, arguments)
+            .map_err(resend)?;
         let lines = checked
             .get("evidence")
             .and_then(|evidence| evidence.get("diff_lines"))
@@ -187,10 +200,10 @@ impl Tool for SubmitComment {
             .map(Vec::as_slice)
             .unwrap_or_default();
         if lines.is_empty() {
-            return Err(ToolError::InvalidArguments {
+            return Err(resend(ToolError::InvalidArguments {
                 tool: Self::NAME.to_string(),
                 reason: "evidence.diff_lines must name at least one line".to_string(),
-            });
+            }));
         }
         Ok(ToolOutput::new("recorded".to_string()).with_submission(arguments.clone()))
     }
@@ -324,7 +337,10 @@ impl SubmitSummary {
     /// would publish a verdict with no words behind it. It is refused so the
     /// re-ask can happen, the same as a missing score.
     pub fn read(arguments: &Value) -> Result<(u8, String), ToolError> {
-        let checked = Self::new().signature.validate(Self::NAME, arguments)?;
+        let checked = Self::new()
+            .signature
+            .validate(Self::NAME, arguments)
+            .map_err(summary_resend)?;
         let Some(score) = checked
             .integer("overall_score")
             .and_then(|score| u8::try_from(score).ok())
@@ -380,11 +396,92 @@ impl Tool for SubmitSummary {
     }
 }
 
-fn summary_invalid(reason: &str) -> ToolError {
+/// Say, in the refusal itself, that the finding was not kept and has to be
+/// sent again.
+///
+/// A bare `missing argument "confidence_score"` is true and useless: it does
+/// not say whether the finding was recorded, and the model has to decide what
+/// to do next from a prompt it read thousands of tokens ago. Watched one give
+/// up on that — rejected once, then `finish_review`, and the finding was gone.
+/// The instruction has to travel with the rejection, because that is the
+/// moment it is needed.
+fn resend(error: ToolError) -> ToolError {
+    let ToolError::InvalidArguments { tool, reason } = error else {
+        return error;
+    };
     ToolError::InvalidArguments {
+        tool,
+        reason: format!(
+            "{reason}. Nothing was filed and this finding is still unsubmitted: call \
+             submit_comment again with the same finding and that argument corrected. Do not drop \
+             the finding, and do not answer this with finish_review -- a rejected call is a typo \
+             to fix, not a verdict on what you found."
+        ),
+    }
+}
+
+/// The same for the verdict: a rejected score is not an unscored run, and the
+/// one re-ask this round gets must not be spent on a reply that gave up.
+fn summary_resend(error: ToolError) -> ToolError {
+    let ToolError::InvalidArguments { tool, reason } = error else {
+        return error;
+    };
+    ToolError::InvalidArguments {
+        tool,
+        reason: format!("{reason}. Nothing was recorded: call submit_summary again, corrected."),
+    }
+}
+
+#[cfg(test)]
+mod resend_tests {
+    use super::*;
+
+    /// The real slip this wording exists for: one rejected `submit_comment`
+    /// (a missing `confidence_score`), and the next round was `finish_review`
+    /// with the finding gone. A rejection has to say, where the model reads
+    /// it, that nothing was kept and that giving up is not the answer.
+    #[test]
+    fn a_rejected_finding_says_it_was_not_filed_and_must_be_sent_again() {
+        let error = SubmitComment::new()
+            .execute(&serde_json::json!({
+                "body": "the reference is leaked on the error path",
+                "suggestion": "call fput before returning",
+                "severity_score": 70,
+                "evidence": {"diff_lines": [12]},
+            }))
+            .expect_err("no confidence_score");
+        let said = error.to_string();
+        assert!(said.contains("confidence_score"), "{said}");
+        assert!(said.contains("still unsubmitted"), "{said}");
+        assert!(said.contains("call submit_comment again"), "{said}");
+        assert!(
+            said.contains("do not answer this with finish_review"),
+            "{said}"
+        );
+    }
+
+    /// And the same finding, complete, is recorded without any of that.
+    #[test]
+    fn a_complete_finding_is_recorded_without_a_lecture() {
+        let output = SubmitComment::new()
+            .execute(&serde_json::json!({
+                "body": "the reference is leaked on the error path",
+                "suggestion": "call fput before returning",
+                "severity_score": 70,
+                "confidence_score": 55,
+                "evidence": {"diff_lines": [12]},
+            }))
+            .expect("a complete finding");
+        assert_eq!(output.text, "recorded");
+        assert!(output.submission.is_some());
+    }
+}
+
+fn summary_invalid(reason: &str) -> ToolError {
+    summary_resend(ToolError::InvalidArguments {
         tool: SubmitSummary::NAME.to_string(),
         reason: reason.to_string(),
-    }
+    })
 }
 
 /// No problem and no fix is the model saying it found nothing, whatever else
@@ -412,6 +509,7 @@ mod tests {
             "line": 11,
             "body": "the index is a constant 5",
             "suggestion": "bound the index",
+            "severity_score": 80,
             "confidence_score": 92,
             "evidence": { "diff_lines": [11] }
         })

@@ -6,8 +6,8 @@
 //! by name. It cannot: a name says nothing about how deep an answer goes, and
 //! a name that changes with the run makes the prompt describe tools that are
 //! not registered. So the names are fixed and the *description* carries what
-//! varies — where the answer comes from, and what a miss means. It is written
-//! from `Reach` when the tool is registered.
+//! varies — where the answer comes from, what a miss means, and whether this
+//! run's worktree can answer at all. All of it written from `Reach`.
 //!
 //! Every one of them does the same three things in the same order: read the
 //! model's arguments, put them through `PathPolicy`, and only then ask the
@@ -24,23 +24,16 @@ use crate::config::Config;
 use crate::platform::LineRange;
 use crate::record::ContextFile;
 use crate::security::{PathPolicy, truncate};
-use crate::worktree::{Content, Reach, Search, WorktreeError, WorktreeSource};
+use crate::worktree::{Abilities, Content, Reach, Search, WorktreeError, WorktreeSource};
 
+use super::availability::unavailable_description;
 use super::signature::{Arguments, Parameter, Shape, Signature};
 use super::{Purpose, Round, Tool, ToolError, ToolOutput};
 
-/// Static facts about a builtin, for `tool list`. The real tools still need a
-/// worktree before they can run; this is only what the catalog prints.
-pub struct BuiltinSpec {
-    pub name: &'static str,
-    pub description: String,
-    /// Derived from the same declaration the real tool publishes.
-    pub parameters: Value,
-    /// Whether the worktree has to be a whole checkout for this one.
-    pub requires_checkout: bool,
-    /// Whether a search has to be answerable at all.
-    pub requires_search: bool,
-}
+/// Reading anything at all needs code to read; a search needs somebody able to
+/// answer one. Declared next to the descriptions written from the same facts.
+const READS: Abilities = Abilities::CONTENT;
+const SEARCHES: Abilities = Abilities::CONTENT.union(Abilities::SEARCH);
 
 /// How much a content tool may fetch and how much it may hand back, all of it
 /// from `[review]`. Carried as one value so the four tools cannot drift apart
@@ -82,6 +75,8 @@ fn where_from(reach: Reach) -> &'static str {
              files that have been fetched into it from the platform API at the reviewed commit. \
              It is not a checkout: only what has been asked for is on disk."
         }
+        // Reached only by a caller that did not check `Abilities::CONTENT`
+        // first; every description here does, and says more than this.
         Content::Empty => {
             "The worktree is empty and has nothing behind it, so nothing can be read this run."
         }
@@ -89,6 +84,11 @@ fn where_from(reach: Reach) -> &'static str {
 }
 
 fn desc_read_file(reach: Reach, limits: ToolLimits) -> String {
+    const WHAT: &str = "Read one file out of this run's worktree.";
+    let missing = reach.unmet(READS);
+    if !missing.is_empty() {
+        return unavailable_description(WHAT, missing);
+    }
     let fetching = match reach.content {
         Content::Fetched => {
             " A file not on disk yet is fetched at the reviewed commit on the first read and \
@@ -97,7 +97,7 @@ fn desc_read_file(reach: Reach, limits: ToolLimits) -> String {
         _ => "",
     };
     format!(
-        "Read one file out of this run's worktree. {}{fetching} Optional line range (first_line \
+        "{WHAT} {}{fetching} Optional line range (first_line \
          and last_line together); without one you get the whole file. Nothing is ever truncated: \
          a file over {} bytes cannot be read at all, and a single answer may carry at most {} \
          bytes, so a read that would not fit is refused with the file's size. Ask stat_file \
@@ -111,9 +111,14 @@ fn desc_read_file(reach: Reach, limits: ToolLimits) -> String {
 }
 
 fn desc_stat_file(reach: Reach, limits: ToolLimits) -> String {
+    const WHAT: &str = "Size of one file in this run's worktree, in bytes and lines, plus whether \
+                        it fits in one read and how many lines to ask for at a time.";
+    let missing = reach.unmet(READS);
+    if !missing.is_empty() {
+        return unavailable_description(WHAT, missing);
+    }
     format!(
-        "Size of one file in this run's worktree, in bytes and lines, plus whether it fits in one \
-         read and how many lines to ask for at a time. {} Returns numbers only, never file \
+        "{WHAT} {} Returns numbers only, never file \
          content, so it is cheap. Ask this before reading a file whose size you do not know: one \
          call here turns one refused read into a plan, against the {} bytes a single answer may \
          carry.",
@@ -123,89 +128,57 @@ fn desc_stat_file(reach: Reach, limits: ToolLimits) -> String {
 }
 
 fn desc_list_files(reach: Reach, limits: ToolLimits) -> String {
+    const WHAT: &str = "List the paths in this run's worktree matching a glob.";
+    let missing = reach.unmet(READS);
+    if !missing.is_empty() {
+        return unavailable_description(WHAT, missing);
+    }
     let source = match reach.content {
         Content::Checkout => {
             "It scans the checkout, so the listing is complete and a path missing from it is not \
              there."
         }
-        Content::Fetched => {
+        _ => {
             "It asks the platform API about the reviewed commit rather than about what has been \
              fetched so far, so it answers for the whole repository. An answer the platform could \
              not complete says so."
         }
-        Content::Empty => "There is nothing to list.",
     };
     format!(
-        "List the paths in this run's worktree matching a glob. {} {source} At most {} paths; \
-         overflow says how many remain.",
+        "{WHAT} {} {source} At most {} paths; overflow says how many remain.",
         where_from(reach),
         limits.max_files_per_listing,
     )
 }
 
 fn desc_search_code(reach: Reach, limits: ToolLimits) -> String {
+    const WHAT: &str = "Search the code of this run's worktree.";
+    let missing = reach.unmet(SEARCHES);
+    if !missing.is_empty() {
+        return unavailable_description(WHAT, missing);
+    }
     let strength = match reach.search {
-        Search::Regex => match reach.content {
-            Content::Checkout => {
-                "query is a regular expression matched over every file in the checkout, so a miss \
-                 usually means it is not there."
-            }
-            _ => {
-                "query is a regular expression, matched by the platform over the reviewed commit, \
-                 so a miss usually means it is not there."
-            }
-        },
         Search::Keyword => {
             "query is case-insensitive keyword matching against the platform's index; regex \
              metacharacters are literal, not a regex. That index covers the default branch only, \
              so a miss does not mean it is absent — confirm with list_files or read_file before \
              concluding anything from an empty result."
         }
-        // Not registered in this case, so nothing reads this arm; it stays
-        // truthful rather than unreachable.
-        Search::Unavailable => "No search is available this run.",
+        _ if reach.is_checkout() => {
+            "query is a regular expression matched over every file in the checkout, so a miss \
+             usually means it is not there."
+        }
+        _ => {
+            "query is a regular expression, matched by the platform over the reviewed commit, so \
+             a miss usually means it is not there."
+        }
     };
     format!(
-        "Search the code of this run's worktree. {} {strength} Optional glob to limit the files. \
-         At most {} hits; overflow says how many remain.",
+        "{WHAT} {} {strength} Optional glob to limit the files. At most {} hits; overflow says \
+         how many remain.",
         where_from(reach),
         limits.max_hits_per_search,
     )
-}
-
-/// The catalog rows. `reach` decides the wording, exactly as it does at
-/// registration, so `tool list` prints the contract the model would be given.
-pub fn builtin_specs(reach: Reach, limits: ToolLimits) -> [BuiltinSpec; 4] {
-    [
-        BuiltinSpec {
-            name: ListFiles::NAME,
-            description: desc_list_files(reach, limits),
-            parameters: glob_signature().schema(),
-            requires_checkout: false,
-            requires_search: false,
-        },
-        BuiltinSpec {
-            name: StatFile::NAME,
-            description: desc_stat_file(reach, limits),
-            parameters: path_signature(false).schema(),
-            requires_checkout: false,
-            requires_search: false,
-        },
-        BuiltinSpec {
-            name: ReadFile::NAME,
-            description: desc_read_file(reach, limits),
-            parameters: path_signature(true).schema(),
-            requires_checkout: false,
-            requires_search: false,
-        },
-        BuiltinSpec {
-            name: SearchCode::NAME,
-            description: desc_search_code(reach, limits),
-            parameters: search_signature().schema(),
-            requires_checkout: false,
-            requires_search: true,
-        },
-    ]
 }
 
 /// Content is investigated, never concluded with: once the tools come off, the
@@ -226,7 +199,7 @@ const READ_MISS_HINT: &str = "(If the path was wrong, list the files first to se
                               the worktree actually has, rather than guessing again.)";
 
 /// What the four content tools share. Cloned into each of them when they are
-/// registered, so `Tool::execute` still takes nothing but arguments.
+/// built, so `Tool::execute` still takes nothing but arguments.
 #[derive(Clone)]
 pub struct WorktreeContext {
     source: Arc<dyn WorktreeSource>,
@@ -249,6 +222,19 @@ impl WorktreeContext {
 
     pub fn limits(&self) -> ToolLimits {
         self.limits
+    }
+
+    /// Why this run's worktree cannot answer a tool that needs these, when it
+    /// cannot. The tool passes the same set its description was written from,
+    /// so what the model is told before the call and what it is told after one
+    /// come out of the same answer.
+    fn refusal(&self, needs: Abilities) -> Option<&'static str> {
+        let reach = self.reach();
+        let missing = reach.unmet(needs);
+        match missing.is_empty() {
+            true => None,
+            false => Some(super::availability::refusal(missing)),
+        }
     }
 
     fn answer(&self) -> Answer<'_> {
@@ -612,6 +598,14 @@ impl Tool for ListFiles {
         INVESTIGATION
     }
 
+    fn needs(&self) -> Abilities {
+        READS
+    }
+
+    fn unavailable(&self) -> Option<&str> {
+        self.context.refusal(READS)
+    }
+
     fn execute(&self, arguments: &Value) -> Result<ToolOutput, ToolError> {
         let checked = self.signature.validate(self.name(), arguments)?;
         let glob = check_glob(
@@ -674,6 +668,14 @@ impl Tool for StatFile {
         INVESTIGATION
     }
 
+    fn needs(&self) -> Abilities {
+        READS
+    }
+
+    fn unavailable(&self) -> Option<&str> {
+        self.context.refusal(READS)
+    }
+
     fn execute(&self, arguments: &Value) -> Result<ToolOutput, ToolError> {
         let checked = self.signature.validate(self.name(), arguments)?;
         let path = self
@@ -728,6 +730,14 @@ impl Tool for ReadFile {
         INVESTIGATION
     }
 
+    fn needs(&self) -> Abilities {
+        READS
+    }
+
+    fn unavailable(&self) -> Option<&str> {
+        self.context.refusal(READS)
+    }
+
     fn execute(&self, arguments: &Value) -> Result<ToolOutput, ToolError> {
         let checked = self.signature.validate(self.name(), arguments)?;
         let path = self
@@ -747,9 +757,9 @@ impl Tool for ReadFile {
 }
 
 /// `search_code`, whose description and empty-result note are written from the
-/// worktree's reach when it is registered. The same name is a regular
-/// expression search on one run and a keyword index on another, and the model
-/// has no way to tell which one it got from the name alone.
+/// worktree's reach when it is built. The same name is a regular expression
+/// search on one run, a keyword index on another and nothing at all on a
+/// third, and the model has no way to tell which one it got from the name.
 pub struct SearchCode {
     context: WorktreeContext,
     description: String,
@@ -802,6 +812,14 @@ impl Tool for SearchCode {
 
     fn rounds(&self) -> &'static [Round] {
         INVESTIGATION
+    }
+
+    fn needs(&self) -> Abilities {
+        SEARCHES
+    }
+
+    fn unavailable(&self) -> Option<&str> {
+        self.context.refusal(SEARCHES)
     }
 
     fn execute(&self, arguments: &Value) -> Result<ToolOutput, ToolError> {
@@ -1312,6 +1330,72 @@ mod tests {
             "a listing is not a list of what has been fetched: {}",
             listing.description()
         );
+    }
+
+    /// The content tools exist on a run that has nothing to read, because the
+    /// set of names is not where "what can this run check" is written down.
+    /// Both halves of the answer are, though: the description says so before
+    /// the call, and the refusal says so after one, and both say the same
+    /// thing about what does not follow from it.
+    #[test]
+    fn an_empty_worktree_says_so_in_the_description_and_again_in_the_refusal() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let worktree = Arc::new(CountingWorktree {
+            reach: Reach {
+                content: Content::Empty,
+                search: Search::Unavailable,
+            },
+            ..CountingWorktree::empty(root.path())
+        });
+
+        for tool in tools(&worktree, &[]) {
+            assert!(
+                tool.description().contains("NOT AVAILABLE THIS RUN"),
+                "{}: {}",
+                tool.name(),
+                tool.description()
+            );
+            let reason = tool
+                .unavailable()
+                .unwrap_or_else(|| panic!("{} answers on an empty worktree", tool.name()));
+            assert!(
+                reason.contains("not about the repository"),
+                "{}: {reason}",
+                tool.name()
+            );
+        }
+        assert_eq!(worktree.calls(), 0);
+    }
+
+    /// A platform with no code search leaves `search_code` offered and unable
+    /// to answer. It has to say which of the two it is: an empty result would
+    /// read as "not there", and that reading ends up in a finding.
+    #[test]
+    fn a_search_nothing_can_answer_says_so_rather_than_coming_back_empty() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let worktree = Arc::new(CountingWorktree {
+            reach: Reach {
+                content: Content::Fetched,
+                search: Search::Unavailable,
+            },
+            ..CountingWorktree::empty(root.path())
+        });
+        let context = context(&worktree, &[]);
+
+        let search = SearchCode::new(context.clone());
+        assert!(
+            search
+                .unavailable()
+                .is_some_and(|reason| reason.contains("not evidence")),
+            "{:?}",
+            search.unavailable()
+        );
+        assert!(search.description().contains("NOT AVAILABLE THIS RUN"));
+
+        // Only the search. Reading and listing are a different ability and
+        // this worktree still has them.
+        assert!(ReadFile::new(context.clone()).unavailable().is_none());
+        assert!(ListFiles::new(context).unavailable().is_none());
     }
 
     /// An empty answer from a keyword index that only covers the default

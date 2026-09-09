@@ -502,8 +502,9 @@ impl RepoSource for GitLabRepo {
     }
 
     /// Blob search exists only with Advanced Search or Exact Code Search, and
-    /// nothing in the config says whether this instance has it. `search_repo`
-    /// is therefore not registered at all, which is why this is never called.
+    /// nothing in the config says whether this instance has it. `capabilities`
+    /// therefore reports no code search, so `search_code` refuses before
+    /// reaching the worktree and this is never called.
     fn search(&self, _query: &str, _glob: Option<&str>) -> Result<Vec<SearchHit>, PlatformError> {
         Err(PlatformError::Unsupported {
             host: self.host.clone(),

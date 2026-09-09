@@ -20,6 +20,7 @@ use crate::protocol::{InputItem, Request, Role, ToolSchema};
 use crate::record::{ContextFile, ToolCall, Trace};
 use crate::security::{Redactor, truncate};
 use crate::tool::{Purpose, Registry, Round, SubmitComment, ToolError};
+use crate::worktree::{Abilities, Content, Reach};
 
 use super::orient::Orientation;
 use super::prompt::{CappedList, Fence, Keep, Overflow, Prompts, code_ref};
@@ -37,9 +38,9 @@ pub struct ChunkOutput {
     pub raw_output: String,
 }
 
-/// A chunk where external checkers were registered and the model called none
-/// of them. "The checker found nothing" and "the checker never ran" have to
-/// read differently, so the second one is written down.
+/// A chunk where external checkers could have answered and the model called
+/// none of them. "The checker found nothing" and "the checker never ran" have
+/// to read differently, so the second one is written down.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct UnusedCheckers {
     pub path: String,
@@ -75,6 +76,16 @@ pub struct ReviewOutput {
     /// reason as the two lists above.
     #[serde(default)]
     pub cut_short: Vec<CutShort>,
+    /// What this run's worktree could not do at all, in the report's words.
+    ///
+    /// Not a failure: reviewing a plain diff with nothing behind it is a
+    /// normal way to run reviewbot, and every chunk still gets its model call.
+    /// It is here because the alternative is a report that cannot be told
+    /// apart from a thorough one — same empty list, same score, same "found
+    /// nothing" paragraph. This is a fact about the run, recorded once and
+    /// carried to the reader.
+    #[serde(default)]
+    pub unavailable: Vec<String>,
 }
 
 /// Everything one finished chunk contributes to the stage output: the raw
@@ -148,7 +159,13 @@ impl Review {
         instructions: &str,
         narrative: Option<&str>,
     ) -> Result<ReviewOutput, StageError> {
-        let mut output = ReviewOutput::default();
+        let mut output = ReviewOutput {
+            // Written down before the first chunk, because it is true of the
+            // whole run and has to survive as far as the report whatever the
+            // chunks turn out to do.
+            unavailable: went_without(context.adapters.worktree.reach()),
+            ..ReviewOutput::default()
+        };
         let of = plan.chunks.len();
         // Pieces of one file are consecutive, so one slot is enough. Filtered
         // by path so a handoff can never reach a different file, whatever the
@@ -216,11 +233,12 @@ impl Review {
         // in the worktree before the first round — the prompt asks for
         // checkers first, and a checker that cannot find the file is read as
         // "this file does not exist". Free on a checkout, one fetch on a
-        // worktree the run fills itself, and skipped when no checker exists.
+        // worktree the run fills itself, and skipped when no checker of this
+        // run can answer anyway.
         if !context
             .adapters
             .tools
-            .names_with_purpose(Purpose::Check)
+            .usable_with_purpose(Purpose::Check)
             .is_empty()
             && let Err(error) = context.adapters.worktree.supply(path)
         {
@@ -547,28 +565,28 @@ impl Conversation {
         self.trace.note(NAME, note);
     }
 
-    /// A checker that was available and never called is worth saying out
-    /// loud: otherwise a chunk nobody scanned looks like a clean one.
+    /// A checker that could have answered and never was called is worth saying
+    /// out loud: otherwise a chunk nobody scanned looks like a clean one. Only
+    /// the ones this run's worktree can answer count — a checker that would
+    /// have refused is not a checker the model neglected.
     fn note_unused_checkers(&mut self, path: &str, tools: &Registry) -> Option<UnusedCheckers> {
-        let registered: Vec<String> = tools
-            .names_with_purpose(Purpose::Check)
+        let usable: Vec<String> = tools
+            .usable_with_purpose(Purpose::Check)
             .into_iter()
             .map(|name| name.to_string())
             .collect();
-        if registered.is_empty() || registered.iter().any(|name| self.called.contains(name)) {
+        if usable.is_empty() || usable.iter().any(|name| self.called.contains(name)) {
             return None;
         }
-        let names = registered.join(", ");
+        let names = usable.join(", ");
         tracing::warn!(chunk = %path, tools = %names, "no external checker was called");
         self.trace.note(
             NAME,
-            format!(
-                "external checkers were registered ({names}) and the model called none of them"
-            ),
+            format!("external checkers were available ({names}) and the model called none of them"),
         );
         Some(UnusedCheckers {
             path: path.to_string(),
-            tools: registered,
+            tools: usable,
         })
     }
 }
@@ -845,12 +863,13 @@ fn split_preface(
 /// rest.
 pub(crate) fn assemble_instructions(
     tools: &Registry,
+    reach: Reach,
     redactor: &Redactor,
     orientation: &Orientation,
 ) -> Result<String, StageError> {
     let assembled = Prompts::REVIEW
         .fill()
-        .set("capabilities", capability_paragraph(tools)?)
+        .set("capabilities", capability_paragraph(tools, reach)?)
         // Either of these can be missing rather than empty, and the template
         // takes the whole section away with the value: a heading with nothing
         // under it would say this change touched one file, or that the
@@ -878,10 +897,11 @@ pub(crate) fn prompt_tokens(instructions: &str, narrative: Option<&str>, tools: 
 }
 
 /// What abilities this run has, written from the registry so the prompt and the
-/// request's `tools` field cannot name different sets. Two templates rather
-/// than one with a condition in it: a run with nothing to look with is not a
-/// run with an empty list, and the sentence it needs is a different sentence.
-fn capability_paragraph(tools: &Registry) -> Result<String, StageError> {
+/// request's `tools` field cannot name different sets. One template, because
+/// the list no longer varies: every tool is offered on every run, and what
+/// varies is the worktree behind them, which says so itself in the paragraph
+/// under the list and again in each description.
+fn capability_paragraph(tools: &Registry, reach: Reach) -> Result<String, StageError> {
     let mut investigation = Vec::new();
     let mut delivery = Vec::new();
     for schema in tools.schemas_for(Round::Investigation) {
@@ -891,19 +911,33 @@ fn capability_paragraph(tools: &Registry) -> Result<String, StageError> {
             Purpose::Content | Purpose::Check => investigation.push(line),
         }
     }
-    let delivery = bullets(delivery);
-    let text = match investigation.is_empty() {
-        true => Prompts::NO_CAPABILITIES
-            .fill()
-            .set("delivery", delivery)
-            .render()?,
-        false => Prompts::CAPABILITIES
-            .fill()
-            .set("investigation", bullets(investigation))
-            .set("delivery", delivery)
-            .render()?,
+    Ok(Prompts::CAPABILITIES
+        .fill()
+        .set("investigation", bullets(investigation))
+        .set("delivery", bullets(delivery))
+        .set("worktree", worktree_paragraph(reach)?)
+        .render()?)
+}
+
+/// What this run's worktree could not do, in the report's words. Empty when it
+/// could do everything, which is the common case and prints nothing.
+fn went_without(reach: Reach) -> Vec<String> {
+    crate::tool::availability::worth_reporting(reach.unmet(Abilities::all()))
+        .into_iter()
+        .map(|ability| crate::tool::availability::went_without(ability).to_string())
+        .collect()
+}
+
+/// What this run's worktree is, in the words the model reads. One template per
+/// shape rather than one with a condition in it: a run that can read nothing
+/// needs a different paragraph, not an emptier one.
+fn worktree_paragraph(reach: Reach) -> Result<String, StageError> {
+    let template = match reach.content {
+        Content::Checkout => Prompts::WORKTREE_CHECKOUT,
+        Content::Fetched => Prompts::WORKTREE_FETCHED,
+        Content::Empty => Prompts::WORKTREE_EMPTY,
     };
-    Ok(text)
+    Ok(template.text()?)
 }
 
 fn bullets(lines: Vec<String>) -> String {
@@ -961,7 +995,7 @@ mod tests {
     }
 
     const COMMENT: &str = r#"{"path":"src/parse.c","line":1,"body":"b",
-                              "suggestion":"s","confidence_score":80,"evidence":{"diff_lines":[1]}}"#;
+                              "suggestion":"s","severity_score":50,"confidence_score":80,"evidence":{"diff_lines":[1]}}"#;
 
     struct Listed;
 
@@ -1145,10 +1179,32 @@ mod tests {
         }
     }
 
+    /// The widest worktree there is, which is what a test that is not about
+    /// the worktree should not have to name.
+    const CHECKOUT: Reach = Reach {
+        content: crate::worktree::Content::Checkout,
+        search: crate::worktree::Search::Regex,
+    };
+
+    /// A plain diff with no platform behind it.
+    const NOTHING: Reach = Reach {
+        content: crate::worktree::Content::Empty,
+        search: crate::worktree::Search::Unavailable,
+    };
+
     /// The review body as shipped, which is what the loop is handed when a
     /// test is not about assembly.
     fn assembled(tools: &Registry, redactor: &Redactor, orientation: &Orientation) -> String {
-        assemble_instructions(tools, redactor, orientation).expect("the prompt fills")
+        assembled_over(tools, CHECKOUT, redactor, orientation)
+    }
+
+    fn assembled_over(
+        tools: &Registry,
+        reach: Reach,
+        redactor: &Redactor,
+        orientation: &Orientation,
+    ) -> String {
+        assemble_instructions(tools, reach, redactor, orientation).expect("the prompt fills")
     }
 
     fn instructions() -> String {
@@ -1243,7 +1299,7 @@ mod tests {
 
     #[test]
     fn submit_comment_without_a_path_uses_the_file_under_review() {
-        const BARE: &str = r#"{"line":1,"body":"b","suggestion":"s","confidence_score":80,"evidence":{"diff_lines":[1]}}"#;
+        const BARE: &str = r#"{"line":1,"body":"b","suggestion":"s","severity_score":50,"confidence_score":80,"evidence":{"diff_lines":[1]}}"#;
         let mut fixture = StageFixture::scripted(
             vec![Reply::calls(&[("submit_comment", BARE)])],
             Limit::Amount(10.0),
@@ -1868,7 +1924,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_registry_does_not_advertise_callable_tools() {
+    fn the_shipped_prompt_fills_and_leaves_no_marker_behind() {
         let redactor = Redactor::new();
         let first = assembled(&Registry::new(), &redactor, &Orientation::none());
         let second = assembled(&Registry::new(), &redactor, &Orientation::none());
@@ -1878,10 +1934,10 @@ mod tests {
         assert!(first.contains("What you can do, and how to use it"));
         assert!(first.contains("What to do with checker output"));
         assert!(first.contains("Output contract"));
-        assert!(first.contains("Scoring your confidence"));
-        assert!(first.contains("Nothing in this run can list or read a file"));
+        assert!(first.contains("Scoring a finding"));
         assert!(!first.contains("read_repo_file"));
         assert!(!first.contains("{{capabilities}}"));
+        assert!(!first.contains("{{worktree}}"));
         // A single-file change with no repository source has no orientation
         // to give, and an unresolved marker would go out as literal braces.
         assert!(!first.contains("{{change}}"), "{first}");
@@ -1892,18 +1948,67 @@ mod tests {
         );
     }
 
-    /// The prompt may not name a tool that is not registered. It used to name
-    /// two groups of four that no longer exist, and a tool the model cannot
-    /// call is not read as a mistake in the prompt: it is read as "this
-    /// repository does not have that", and then written into a finding.
+    /// The list of names is the same every run, so it can no longer say what
+    /// this run can do. The worktree says it instead, in the capability
+    /// section, in the words the refusals will use.
+    #[test]
+    fn the_capability_section_says_what_this_run_s_worktree_is() {
+        let redactor = Redactor::new();
+        let orientation = Orientation::none();
+
+        let checkout = assembled_over(&Registry::new(), CHECKOUT, &redactor, &orientation);
+        assert!(checkout.contains("the checkout under review"), "{checkout}");
+
+        let nothing = assembled_over(&Registry::new(), NOTHING, &redactor, &orientation);
+        assert!(
+            nothing.contains("empty and has nothing behind it"),
+            "{nothing}"
+        );
+        assert!(
+            nothing.contains("says nothing about the repository"),
+            "a run that could not look must not read as a repository with nothing in it: {nothing}"
+        );
+        // Reviewing a plain diff is a normal way to run this. The paragraph
+        // that says what is missing has to say that too, or it reads as
+        // permission to stop.
+        assert!(
+            nothing.contains("normal way to run this") && nothing.contains("do the review"),
+            "{nothing}"
+        );
+        // And the trap that follows from it. A real run reasoned its way to a
+        // possible refcount leak and then filed nothing, because it could not
+        // read the rest of the function to confirm the premise. On a run where
+        // no premise can ever be confirmed, "I could not verify it" cannot be
+        // what decides whether a finding is filed — that is what the score is
+        // for.
+        assert!(
+            nothing.contains("cannot be your reason for filing nothing"),
+            "{nothing}"
+        );
+        for instructions in [&checkout, &nothing] {
+            assert!(
+                instructions.contains("never a reason to drop it"),
+                "{instructions}"
+            );
+            assert!(
+                instructions.contains("a rule about the number, not about whether to file"),
+                "{instructions}"
+            );
+        }
+    }
+
+    /// The prompt may not name a tool that is not there. It used to name two
+    /// groups of four that no longer exist, and a tool the model cannot call
+    /// is not read as a mistake in the prompt: it is read as "this repository
+    /// does not have that", and then written into a finding.
     ///
     /// So the body names no tool at all — the abilities arrive through the
     /// capability block, written from the registry — and every name the
-    /// assembled prompt does carry belongs to something registered.
+    /// assembled prompt does carry belongs to something in it.
     #[test]
     fn the_prompt_names_only_tools_that_are_really_registered() {
-        for name in crate::config::BUILTIN_TOOL_NAMES {
-            // The two deliveries of a review round are always registered, and
+        for name in crate::config::RESERVED_TOOL_NAMES {
+            // The two deliveries of a review round are there on every run, and
             // the output contract has to name both: the channel a finding
             // travels down, and the ending for having none.
             if name == SubmitComment::NAME || name == crate::tool::FinishReview::NAME {

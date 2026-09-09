@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use budget::{Budget, BudgetError, Limit};
 use config::{ConfigError, Settings};
-use domain::{ChangeSet, Comment, Confidence};
+use domain::{ChangeSet, Comment, Confidence, Severity};
 use platform::PlatformError;
 use protocol::ProtocolError;
 use record::{LocalStorage, Meta, RecordError, Recorder, RunIdentity, Storage, layout};
@@ -74,6 +74,16 @@ impl RunResult {
         self.comments
             .iter()
             .filter(|comment| comment.confidence == band)
+            .count()
+    }
+
+    /// The same over the other axis. Both breakdowns reach the terminal,
+    /// because "one certain finding" and "one critical finding" are the two
+    /// halves of what a reader needs before deciding to open the report.
+    pub fn count_severity(&self, band: Severity) -> usize {
+        self.comments
+            .iter()
+            .filter(|comment| comment.severity == band)
             .count()
     }
 
@@ -218,6 +228,7 @@ fn publish_run_inner(settings: &Settings, run_id: &str) -> Result<RunResult, Err
         unreviewed: &reviewed.unreviewed,
         unused_checkers: &reviewed.unused_checkers,
         cut_short: &reviewed.cut_short,
+        unavailable: &reviewed.unavailable,
     };
     let paths = stage::path_policy(settings)?;
     let published = {
@@ -263,6 +274,7 @@ fn render_report_inner(settings: &Settings, run_id: &str) -> Result<RunResult, E
         unreviewed: &reviewed.unreviewed,
         unused_checkers: &reviewed.unused_checkers,
         cut_short: &reviewed.cut_short,
+        unavailable: &reviewed.unavailable,
     };
     let paths = stage::path_policy(settings)?;
     {
@@ -454,6 +466,7 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
             let orientation = Orientation::build(context, &changeset);
             let instructions = stage::review::assemble_instructions(
                 &context.adapters.tools,
+                context.adapters.worktree.reach(),
                 context.redactor,
                 &orientation,
             )?;
@@ -505,6 +518,7 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
         unreviewed: &reviewed.unreviewed,
         unused_checkers: &reviewed.unused_checkers,
         cut_short: &reviewed.cut_short,
+        unavailable: &reviewed.unavailable,
     };
     let published = match context.completed(stage::publish::NUMBER, stage::publish::NAME)? {
         Some(done) => done,

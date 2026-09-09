@@ -12,8 +12,9 @@ impl Registry {
         Self::default()
     }
 
-    /// A tool whose preconditions are unmet is not registered: what the model
-    /// can see always equals what it can really call.
+    /// Every tool this config defines, whatever this run's worktree can do
+    /// with it. What varies between runs is not the set of names but what the
+    /// worktree behind them can answer, and the tool says that itself.
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         self.tools.push(tool);
     }
@@ -37,13 +38,23 @@ impl Registry {
         self.tools.iter().map(|tool| tool.name()).collect()
     }
 
-    /// The checkers of this run, which `review` needs so it can say that one
-    /// was registered and never called. By purpose, not by where the tool was
-    /// written: what matters is that its answer means something.
-    pub fn names_with_purpose(&self, purpose: Purpose) -> Vec<&str> {
+    /// Every tool, in registration order. `tool list` reads its rows off
+    /// these, so the catalog is the registry rather than a second description
+    /// of it.
+    pub fn all(&self) -> Vec<&dyn Tool> {
+        self.tools.iter().map(|tool| tool.as_ref()).collect()
+    }
+
+    /// The tools of one purpose that this run's worktree can actually answer,
+    /// which is what `review` needs so it can say a checker went unused. By
+    /// purpose, not by where the tool was written: what matters is that its
+    /// answer means something. And usable rather than merely registered,
+    /// because a checker this run cannot answer is not a checker nobody
+    /// bothered to call.
+    pub fn usable_with_purpose(&self, purpose: Purpose) -> Vec<&str> {
         self.tools
             .iter()
-            .filter(|tool| tool.purpose() == purpose)
+            .filter(|tool| tool.purpose() == purpose && tool.unavailable().is_none())
             .map(|tool| tool.name())
             .collect()
     }
@@ -65,8 +76,14 @@ impl Registry {
             .collect()
     }
 
-    /// Look the tool up and let it check its own arguments against the
-    /// signature it published. Nothing here knows any tool's shape.
+    /// Look the tool up, ask the worktree whether it can be answered at all,
+    /// and let it check its own arguments against the signature it published.
+    /// Nothing here knows any tool's shape.
+    ///
+    /// The availability question is asked here rather than inside each
+    /// `execute`, because every tool would otherwise have to remember to ask
+    /// it, and the one that forgot would spawn a checker against a worktree
+    /// holding four files and hand the model its missing-include screen.
     pub fn execute(
         &self,
         name: &str,
@@ -76,6 +93,12 @@ impl Registry {
             tool: name.to_string(),
             reason: "no tool with that name is registered".to_string(),
         })?;
+        if let Some(reason) = tool.unavailable() {
+            return Err(ToolError::Unavailable {
+                tool: name.to_string(),
+                reason: reason.to_string(),
+            });
+        }
         tool.execute(arguments)
     }
 }
@@ -141,6 +164,68 @@ mod tests {
             registry.execute("cppcheck", &serde_json::json!({})),
             Err(ToolError::Unavailable { .. })
         ));
+    }
+
+    /// A tool this run's worktree cannot answer is registered like any other
+    /// and refused here, before it can reach out and do half the job. The
+    /// reason travels verbatim: it is the only thing standing between "this
+    /// run could not look" and a finding that says the code is fine.
+    #[test]
+    fn a_tool_the_worktree_cannot_answer_is_refused_before_it_runs() {
+        struct Grounded;
+
+        impl Tool for Grounded {
+            fn name(&self) -> &str {
+                "grounded"
+            }
+
+            fn description(&self) -> &str {
+                "never gets that far"
+            }
+
+            fn signature(&self) -> &Signature {
+                static EMPTY: std::sync::OnceLock<Signature> = std::sync::OnceLock::new();
+                EMPTY.get_or_init(|| Signature::new(Vec::new()))
+            }
+
+            fn purpose(&self) -> Purpose {
+                Purpose::Check
+            }
+
+            fn rounds(&self) -> &'static [Round] {
+                &[Round::Investigation]
+            }
+
+            fn unavailable(&self) -> Option<&str> {
+                Some("this run's worktree is not a checkout, which says nothing about the code")
+            }
+
+            fn execute(&self, _arguments: &serde_json::Value) -> Result<ToolOutput, ToolError> {
+                panic!("a tool that cannot answer must not be reached");
+            }
+        }
+
+        let mut registry = Registry::new();
+        registry.register(Box::new(Grounded));
+        registry.register(Box::new(Echo::new()));
+
+        assert_eq!(
+            registry.names(),
+            vec!["grounded", "echo"],
+            "offered all the same: the model decides what to call"
+        );
+        assert!(
+            registry.usable_with_purpose(Purpose::Check).is_empty(),
+            "and a checker that would refuse is not one nobody bothered to call"
+        );
+        let refused = registry
+            .execute("grounded", &serde_json::json!({}))
+            .expect_err("cannot be answered");
+        assert!(
+            matches!(&refused, ToolError::Unavailable { reason, .. }
+                     if reason.contains("says nothing about the code")),
+            "{refused}"
+        );
     }
 
     /// A round shows what it accepts and nothing else: a tool the model can

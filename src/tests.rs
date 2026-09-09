@@ -937,7 +937,7 @@ fn instructions_are_byte_identical_across_two_chunks() {
 const FINDING: &str = r#"{"comments":[{"path":"src/parse.c","line":11,
     "body":"`added` is declared twice once the removed line comes back",
     "suggestion":"keep only one declaration of `added`",
-    "confidence_score":91,"evidence":{"diff_lines":[11,12]}}]}"#;
+    "severity_score":74,"confidence_score":91,"evidence":{"diff_lines":[11,12]}}]}"#;
 
 const SCORE: &str = r#"{"overall_score":54,"summary":"one certain finding; read it first"}"#;
 
@@ -972,8 +972,8 @@ fn a_scored_run_writes_the_report_and_resume_does_not_score_again() {
 
     let report = std::fs::read_to_string(&first.report_path).expect("the report is on disk");
     assert!(
-        report.contains("## [certain 91%] `src/parse.c:11`"),
-        "{report}"
+        report.contains("## [major 74% / certain 91%] `src/parse.c:11`"),
+        "both of the model's numbers reach the report, in that order: {report}"
     );
     assert!(
         report.contains("suggestion:\nkeep only one declaration of `added`"),

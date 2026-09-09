@@ -7,7 +7,8 @@
 //! happen. Without one, the run opens an empty directory of its own under the
 //! run directory and fills it from the platform API as files are asked for.
 //! That directory is not a checkout and does not pretend to be one: it says
-//! so through `Reach`, which is what the tool descriptions are written from.
+//! so through `Reach`, which is what the tool descriptions are written from,
+//! and what a call this worktree cannot answer is refused with.
 //!
 //! The platform API is therefore an attribute of the worktree rather than a
 //! second source with its own tools. It is the one dependency allowed inside
@@ -62,6 +63,10 @@ pub enum WorktreeError {
 /// the worktree whatever shape it is in, and a description is the only place
 /// left that can tell a whole checkout from a directory holding the four
 /// files somebody happened to ask for.
+///
+/// This is also where "what can this run check" is settled. Not by which
+/// tools exist — every tool exists on every run — but by what the worktree
+/// behind them can answer, which is a property of this one value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Reach {
     pub content: Content,
@@ -69,8 +74,8 @@ pub struct Reach {
 }
 
 impl Reach {
-    /// Nothing to read, and so no content tool and no checker: a diff with no
-    /// platform behind it leaves the worktree empty for the whole run.
+    /// Nothing to read: a diff with no platform behind it leaves the worktree
+    /// empty for the whole run.
     pub fn has_content(self) -> bool {
         self.content != Content::Empty
     }
@@ -78,6 +83,51 @@ impl Reach {
     /// Whether a checker that needs the whole project has one.
     pub fn is_checkout(self) -> bool {
         self.content == Content::Checkout
+    }
+
+    /// What this worktree can do, as one value. The whole of "what can this
+    /// run check": a tool declares what it needs and the two are matched, so
+    /// adding an ability later is one bit here and one sentence in the tool
+    /// layer, with no tool to revisit.
+    pub fn provides(self) -> Abilities {
+        let mut provided = Abilities::empty();
+        provided.set(Abilities::CONTENT, self.has_content());
+        provided.set(Abilities::SEARCH, self.search != Search::Unavailable);
+        provided.set(Abilities::CHECKOUT, self.is_checkout());
+        provided
+    }
+
+    /// What a tool needing `needs` would not get from this worktree. Empty
+    /// means it can be answered.
+    ///
+    /// Facts only. Why the bits are missing, and what to say about it, is the
+    /// tool layer's business: this module has no business writing prose the
+    /// model reads.
+    pub fn unmet(self, needs: Abilities) -> Abilities {
+        needs.difference(self.provides())
+    }
+}
+
+bitflags::bitflags! {
+    /// What a worktree can do, and what a tool needs of it. One vocabulary for
+    /// both sides, so the question "can this run answer this tool" is a set
+    /// difference rather than a rule written once per tool.
+    ///
+    /// These never decide whether a tool is registered — every tool is, every
+    /// run. They decide whether a call to it can be answered.
+    ///
+    /// A permission is not an ability and does not belong here:
+    /// `[security].allow_build_tools` is something the operator grants, not
+    /// something a worktree provides, and it fails at startup rather than
+    /// refusing a call.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct Abilities: u8 {
+        /// Any code at all to read.
+        const CONTENT = 1 << 0;
+        /// A search somebody can answer.
+        const SEARCH = 1 << 1;
+        /// The whole project on disk, not the files fetched so far.
+        const CHECKOUT = 1 << 2;
     }
 }
 
@@ -98,8 +148,8 @@ pub enum Content {
 pub enum Search {
     Regex,
     Keyword,
-    /// Not answerable, so no search tool is registered rather than one that
-    /// answers nothing.
+    /// Nobody can answer one this run. The search tool is offered all the
+    /// same and refuses, because an empty result would read as "not there".
     Unavailable,
 }
 
@@ -291,9 +341,9 @@ impl WorktreeSource for Checkout {
 /// "what has been fetched so far" into "what this repository has", and one
 /// miss would read as "it does not exist".
 pub struct FetchedWorktree {
-    /// Bound when the run directory exists, which is later than the tools
-    /// are registered: what may be registered follows from the platform, not
-    /// from where the files will land.
+    /// Bound when the run directory exists, which is later than the tools are
+    /// built: what they can answer follows from the platform, not from where
+    /// the files will land.
     root: OnceLock<PathBuf>,
     repository: Option<Arc<dyn RepoSource>>,
     reach: Reach,
@@ -410,6 +460,62 @@ impl WorktreeSource for FetchedWorktree {
                 path: query.to_string(),
                 reason: error.to_string(),
             })
+    }
+}
+
+/// The widest worktree there is, and not one any review uses: a whole
+/// checkout with a platform that can match expressions. `tool list` builds the
+/// real tools over it, because there is no run behind that command and yet the
+/// contract it prints has to be the one a tool really publishes.
+///
+/// It provides every ability and answers no read. Nothing executes a tool from
+/// `tool list`, and a read that somehow happened must say what it is rather
+/// than invent a repository.
+pub struct Widest;
+
+impl WorktreeSource for Widest {
+    fn root(&self) -> &Path {
+        Path::new("/")
+    }
+
+    fn reach(&self) -> Reach {
+        Reach {
+            content: Content::Checkout,
+            search: Search::Regex,
+        }
+    }
+
+    fn open_in(&self, _run_dir: &Path) -> Result<(), WorktreeError> {
+        Ok(())
+    }
+
+    fn head_sha(&self) -> Result<Option<String>, WorktreeError> {
+        Ok(None)
+    }
+
+    fn supply(&self, path: &str) -> Result<(), WorktreeError> {
+        Err(Self::no_run(path))
+    }
+
+    fn list_files(&self, glob: &str) -> Result<Listing, WorktreeError> {
+        Err(Self::no_run(glob))
+    }
+
+    fn read_file(&self, path: &str, _lines: Option<LineRange>) -> Result<String, WorktreeError> {
+        Err(Self::no_run(path))
+    }
+
+    fn search(&self, query: &str, _glob: Option<&str>) -> Result<Vec<SearchHit>, WorktreeError> {
+        Err(Self::no_run(query))
+    }
+}
+
+impl Widest {
+    fn no_run(path: &str) -> WorktreeError {
+        WorktreeError::Unreadable {
+            path: path.to_string(),
+            reason: "there is no run behind this, so there is nothing to read".to_string(),
+        }
     }
 }
 
@@ -637,6 +743,57 @@ mod tests {
         let hits = worktree.search("main", None).expect("searched");
         assert_eq!(repository.searches.load(Ordering::SeqCst), 1);
         assert_eq!(hits[0].path, "src/lex.c", "a file that is not on disk");
+    }
+
+    /// Which tools exist no longer says what a run can check, so this does.
+    /// Facts only: the words about them belong to the tool layer.
+    #[test]
+    fn a_worktree_reports_the_abilities_its_shape_really_has() {
+        let whole = Reach {
+            content: Content::Checkout,
+            search: Search::Regex,
+        };
+        assert_eq!(whole.provides(), Abilities::all());
+        assert!(whole.unmet(Abilities::all()).is_empty());
+
+        let fetched = Reach {
+            content: Content::Fetched,
+            search: Search::Keyword,
+        };
+        assert_eq!(
+            fetched.provides(),
+            Abilities::CONTENT | Abilities::SEARCH,
+            "files fetched so far are not a project"
+        );
+        assert_eq!(fetched.unmet(Abilities::all()), Abilities::CHECKOUT);
+
+        let unsearchable = Reach {
+            content: Content::Fetched,
+            search: Search::Unavailable,
+        };
+        assert_eq!(unsearchable.provides(), Abilities::CONTENT);
+
+        let empty = Reach {
+            content: Content::Empty,
+            search: Search::Unavailable,
+        };
+        assert_eq!(empty.provides(), Abilities::empty());
+        assert_eq!(empty.unmet(Abilities::all()), Abilities::all());
+    }
+
+    /// A tool asks only for what it needs, so a worktree short of something
+    /// else must not refuse it.
+    #[test]
+    fn a_need_the_worktree_does_meet_is_not_reported_as_missing() {
+        let unsearchable = Reach {
+            content: Content::Fetched,
+            search: Search::Unavailable,
+        };
+        assert!(unsearchable.unmet(Abilities::CONTENT).is_empty());
+        assert_eq!(
+            unsearchable.unmet(Abilities::CONTENT | Abilities::SEARCH),
+            Abilities::SEARCH
+        );
     }
 
     /// A directory this run made stands on no commit, and the run id must not

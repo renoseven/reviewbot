@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::PlatformKind;
-use crate::domain::{ChangeSet, Confidence};
+use crate::domain::{ChangeSet, Confidence, Severity};
 use crate::platform::{ChangeRef, DiffPaths, DiffRefs, OutgoingComment};
 use crate::record::layout;
 
@@ -34,6 +34,9 @@ pub struct PublishInput<'a> {
     /// Chunks whose investigation the loop ended early. A file the model was
     /// still reading around must not read like one it finished with.
     pub cut_short: &'a [CutShort],
+    /// What this run's worktree could not do at all. A run that saw only the
+    /// diff must not read like one that looked everywhere.
+    pub unavailable: &'a [String],
 }
 
 /// One comment that made it out, keyed by the marker hidden in its body.
@@ -65,6 +68,11 @@ pub struct Summary {
     pub summary: Option<String>,
     pub unscored_reason: Option<String>,
     pub comments: Vec<CountByBand>,
+    /// The same findings counted the other way. Two breakdowns, because "how
+    /// bad is the worst of it" and "how sure is any of it" are the two things
+    /// a reader wants and neither answers the other.
+    #[serde(default)]
+    pub by_severity: Vec<CountBySeverity>,
     pub skipped: Vec<String>,
     pub unreviewed: Vec<String>,
     /// Chunks that gave nothing usable. Named so a thin report is not
@@ -76,6 +84,10 @@ pub struct Summary {
     /// where most files land here is asking for more rounds.
     #[serde(default)]
     pub cut_short: Vec<String>,
+    /// What this run's worktree could not do, which bounds everything above
+    /// it. Empty on a run that could look at whatever it liked.
+    #[serde(default)]
+    pub unavailable: Vec<String>,
     pub spent: f64,
     pub budget: Option<f64>,
     pub currency: String,
@@ -84,6 +96,12 @@ pub struct Summary {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct CountByBand {
     pub band: Confidence,
+    pub count: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CountBySeverity {
+    pub band: Severity,
     pub count: usize,
 }
 
@@ -331,7 +349,9 @@ impl Publish {
         run_id: &str,
     ) -> String {
         let finding = format!(
-            "**[{} {}%]**{} {}\n\nsuggestion:\n{}",
+            "**[{} {}% / {} {}%]**{} {}\n\nsuggestion:\n{}",
+            comment.severity,
+            comment.severity_score,
             comment.confidence,
             comment.confidence_score,
             badge_suffix(badge),
@@ -369,6 +389,12 @@ impl Publish {
                 .into_iter()
                 .map(|(band, count)| CountByBand { band, count })
                 .collect(),
+            by_severity: input
+                .merged
+                .severity_counts()
+                .into_iter()
+                .map(|(band, count)| CountBySeverity { band, count })
+                .collect(),
             skipped: input
                 .plan
                 .skipped
@@ -387,6 +413,7 @@ impl Publish {
                 .iter()
                 .map(|chunk| format!("{}: {}", chunk.path, chunk.reason))
                 .collect(),
+            unavailable: input.unavailable.to_vec(),
             spent: context.budget.spent(),
             budget: context.budget.ceiling(),
             currency: context.budget.currency().to_string(),
@@ -400,6 +427,8 @@ impl Publish {
         let mut report = String::from("# Reviewbot report\n\n");
         report.push_str(&basics(summary));
         report.push('\n');
+        // Ahead of the model's paragraph, because it bounds every word of it.
+        report.push_str(&coverage_bound(&summary.unavailable));
         report.push_str(&overall_block(summary));
         report.push_str(LEGEND);
         report.push('\n');
@@ -465,11 +494,14 @@ impl Publish {
 const COMMENT_BODY_LIMIT: usize = 65_536;
 
 const LEGEND: &str = "\
-The number and the band on a finding are the model's own confidence, published \
-as given. A badge next to them is reviewbot's check of a quotation — a fact it \
-verified, not a judgement it made, and it never moves the number. Overall is \
-the model's judgement of what this run found, not a code quality score: \
-reviewbot only read the changed lines, one file at a time.\n";
+A finding is headed by two of the model's own judgements, published as given: \
+how much it matters if it is real, then how sure the model is that it is. They \
+are meant to disagree — a severe finding held with low confidence is a reason \
+to look, not a reason to block. A badge next to them is reviewbot's check of a \
+quotation — a fact it verified, not a judgement it made, and it never moves \
+either number. Overall is the model's judgement of what this run found, not a \
+code quality score: reviewbot only read the changed lines, one file at a \
+time.\n";
 
 fn basics(summary: &Summary) -> String {
     let overall = match summary.overall_score {
@@ -479,6 +511,26 @@ fn basics(summary: &Summary) -> String {
     format!(
         "run: `{}`\nmodel: `{}`\n{overall}\n",
         summary.run_id, summary.model
+    )
+}
+
+/// What this run could not look at, said before anything it concluded.
+///
+/// A review whose worktree could answer nothing still runs, still calls the
+/// model on every chunk and still produces a report — and that report is
+/// indistinguishable from a thorough one: the finding list is empty either
+/// way, the score is the model's either way, and the paragraph says it found
+/// nothing either way. This paragraph is the difference.
+fn coverage_bound(unavailable: &[String]) -> String {
+    if unavailable.is_empty() {
+        return String::new();
+    }
+    format!(
+        "coverage: this run {}. That bounds everything below it — reviewing from what was \
+         available is a normal way to run reviewbot, and the findings stand on their own, but \
+         nothing outside it was examined, so an empty list here is not evidence that there was \
+         nothing to find.\n\n",
+        unavailable.join("; it also "),
     )
 }
 
@@ -505,7 +557,9 @@ fn finding_item(comment: &crate::domain::Comment, badge: Option<&str>) -> String
         .map(|line| format!(":{line}"))
         .unwrap_or_default();
     format!(
-        "## [{} {}%]{} `{}{}`\n\n{}\n\nsuggestion:\n{}\n\n{}\n\n",
+        "## [{} {}% / {} {}%]{} `{}{}`\n\n{}\n\nsuggestion:\n{}\n\n{}\n\n",
+        comment.severity,
+        comment.severity_score,
         comment.confidence,
         comment.confidence_score,
         badge_suffix(badge),
@@ -614,6 +668,8 @@ mod tests {
             },
             body: "the index is a constant 5 while buf is char[3]".to_string(),
             suggestion: "bound the index to buf's length".to_string(),
+            severity: Severity::Major,
+            severity_score: 80,
             confidence: Confidence::Certain,
             confidence_score: 92,
             trace_id: trace_id.to_string(),
@@ -650,6 +706,7 @@ mod tests {
             unreviewed: &[],
             unused_checkers: &[],
             cut_short: &[],
+            unavailable: &[],
         };
         let mut context = fixture.context();
         Publish::run(&mut context, &input).expect("the report is written");
@@ -687,6 +744,7 @@ mod tests {
             unreviewed: &[],
             unused_checkers: &[],
             cut_short: &[],
+            unavailable: &[],
         };
         {
             let mut context = fixture.context();
@@ -698,7 +756,7 @@ mod tests {
         assert!(report.contains("run: `test-run`"), "{report}");
         assert!(report.contains("model: `deepseek-v4-flash`"), "{report}");
         assert!(
-            report.contains("## [certain 92%] `src/parse.c:11`"),
+            report.contains("## [major 80% / certain 92%] `src/parse.c:11`"),
             "{report}"
         );
         assert!(
@@ -856,6 +914,7 @@ mod tests {
             unreviewed: &[],
             unused_checkers: &unused,
             cut_short: &[],
+            unavailable: &[],
         };
         {
             let mut context = fixture.context();
@@ -864,7 +923,7 @@ mod tests {
         let report = fixture.report();
 
         assert!(
-            report.contains("## [certain 92%] found by tool `src/parse.c:11`"),
+            report.contains("## [major 80% / certain 92%] found by tool `src/parse.c:11`"),
             "{report}"
         );
         assert!(!report.contains("## checkers not used"), "{report}");
@@ -896,6 +955,7 @@ mod tests {
             unreviewed: &[],
             unused_checkers: &[],
             cut_short: &cut_short,
+            unavailable: &[],
         };
         {
             let mut context = fixture.context();
@@ -919,6 +979,82 @@ mod tests {
         assert_eq!(
             summary["cut_short"][0],
             "src/emit.c: the tool loop reached its ceiling of 12 rounds"
+        );
+    }
+
+    /// The failure this exists for, from a real run: a plain diff with no
+    /// worktree behind it. Nothing could be read, the model said so in every
+    /// reply, the finding list came back empty — and the report said
+    /// "overall 100 / 100 ... appears safe to merge" with not one word about
+    /// the run having seen only the diff. A clean review and a blind one have
+    /// to be told apart by a person reading the report, so it is said before
+    /// anything the model concluded.
+    #[test]
+    fn a_run_that_saw_only_the_diff_does_not_read_like_a_thorough_one() {
+        let mut fixture = StageFixture::new(Vec::new());
+        let merged = MergeOutput {
+            overall_score: Some(100),
+            summary: Some("Nothing worth flagging; safe to merge.".to_string()),
+            ..MergeOutput::default()
+        };
+        let changeset = ChangeSet::default();
+        let plan = TriagePlan::default();
+        let unavailable = ["could not read any file: it saw the diff and nothing else".to_string()];
+        let input = PublishInput {
+            changeset: &changeset,
+            plan: &plan,
+            merged: &merged,
+            unreviewed: &[],
+            unused_checkers: &[],
+            cut_short: &[],
+            unavailable: &unavailable,
+        };
+        {
+            let mut context = fixture.context();
+            Publish::run(&mut context, &input).expect("the report is written");
+        }
+
+        let report = fixture.report();
+        let coverage = report.find("coverage: this run").expect(&report);
+        assert!(
+            report.contains("could not read any file: it saw the diff and nothing else"),
+            "{report}"
+        );
+        assert!(
+            report.contains("not evidence that there was nothing to find"),
+            "{report}"
+        );
+        assert!(
+            coverage < report.find("safe to merge").expect(&report),
+            "the bound has to be read before the verdict it bounds: {report}"
+        );
+
+        let bytes = fixture
+            .recorder()
+            .read_artifact(layout::SUMMARY)
+            .expect("readable")
+            .expect("summary.json is always written");
+        let summary: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            summary["unavailable"][0],
+            "could not read any file: it saw the diff and nothing else"
+        );
+    }
+
+    /// And a run that could look at everything says nothing about coverage:
+    /// the ordinary case must not pay for a caveat with nothing to caveat.
+    #[test]
+    fn a_run_that_could_look_anywhere_prints_no_coverage_note() {
+        let mut fixture = StageFixture::new(Vec::new());
+        let merged = MergeOutput {
+            overall_score: Some(90),
+            ..MergeOutput::default()
+        };
+        publish(&mut fixture, &merged);
+        assert!(
+            !fixture.report().contains("coverage:"),
+            "{}",
+            fixture.report()
         );
     }
 
@@ -977,6 +1113,7 @@ mod tests {
             unreviewed: &[],
             unused_checkers: &[],
             cut_short: &[],
+            unavailable: &[],
         };
         let mut context = fixture.context();
         Publish::run(&mut context, &input).expect("posted");
@@ -1054,6 +1191,7 @@ mod tests {
             unreviewed: &[],
             unused_checkers: &[],
             cut_short: &[],
+            unavailable: &[],
         };
         let mut context = fixture.context();
         let output = Publish::run(&mut context, &input).expect("publish");
@@ -1097,6 +1235,8 @@ mod tests {
                     },
                     body: "another finding".to_string(),
                     suggestion: "change the other file".to_string(),
+                    severity: Severity::Minor,
+                    severity_score: 55,
                     confidence: Confidence::High,
                     confidence_score: 80,
                     trace_id: "review-other".to_string(),
@@ -1113,6 +1253,7 @@ mod tests {
             unreviewed: &[],
             unused_checkers: &[],
             cut_short: &[],
+            unavailable: &[],
         };
         let mut context = fixture.context();
         let error = Publish::run(&mut context, &input).expect_err("second post fails");

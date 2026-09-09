@@ -94,7 +94,7 @@ reviewbot --config examples/reviewbot.toml platform list
 reviewbot --config examples/reviewbot.toml provider list
 ```
 
-`tool list` prints each tool's contract — what it is for, how it is called, what each argument is, which rounds offer it, and what a run needs before it exists. It does not say whether a tool is registered: that is a fact about one review, and this command reviews nothing.
+`tool list` prints each tool's contract — what it is for, how it is called, what each argument is, which rounds offer it, and what a run's worktree needs to be able to do before a call to it can be answered. Every tool is offered to the model on every run; what varies is whether that run's worktree can answer it, and this command reviews nothing, so it describes the widest worktree there is.
 
 `platform list` and `provider list` name where each credential comes from, never the credential itself — an inline secret is refused when the config is parsed, so there is only ever a source to print. Neither command reads the credential; `config check` is what does that.
 
@@ -123,7 +123,7 @@ This repo does not ship a canned PR report. Produce one by pointing `review` at 
 
 ## Add a tool without recompiling
 
-[`examples/reviewbot.toml`](examples/reviewbot.toml) ships two checkers. `cppcheck` (`requires_build = false`, `requires_checkout` unset) reads one C/C++ file on its own, so it is registered either way. `typecheck` is the brief's named example of adding a tool without recompiling: another `[[tool]]` row, `gcc -fsyntax-only`, `requires_checkout = true` because a `.c` file without its headers produces a screen of missing includes, which is worse than not running. `tool list` prints both contracts. A `requires_build` tool also needs `[security].allow_build_tools` and a sandbox.
+[`examples/reviewbot.toml`](examples/reviewbot.toml) ships two checkers. `cppcheck` (`requires_build = false`, `requires_checkout` unset) reads one C/C++ file on its own, so any worktree with code in it can answer it. `typecheck` is the brief's named example of adding a tool without recompiling: another `[[tool]]` row, `gcc -fsyntax-only`, `requires_checkout = true` because a `.c` file without its headers produces a screen of missing includes, which is worse than not running. Both are offered to the model on every run; without a checkout, `typecheck`'s description says it is not available this run and calling it returns that same reason instead of the missing-include screen. `tool list` prints both contracts. A `requires_build` tool also needs `[security].allow_build_tools` and a sandbox.
 
 ## Known limits
 
@@ -142,7 +142,7 @@ This repo does not ship a canned PR report. Produce one by pointing `review` at 
 - reviewbot never writes the checkout you name with `--worktree`; the only local writes are the run directory (including the run's own worktree) and `--out-dir`. A subprocess cannot be stopped from writing the checkout on a bare machine; that only holds in an isolated environment (container, or a user with no write permission).
 - `requires_build` needs `allow_build_tools` and a sandbox.
 - Suppression-style prompt injection (persuading the model to report nothing) is undetectable: an empty list is a legal review.
-- On GitLab, `search_code` stays off until Advanced Search can be known without guessing. `tool list` still prints its contract, with the precondition that says when it exists.
+- On GitLab, nothing answers `search_code` until Advanced Search can be known without guessing. The tool is still offered to the model, and both its description and its refusal say that a miss there would have been the run's limit rather than evidence of absence.
 - No clone. One worktree per run: the checkout you name, or a directory the run fills from the platform API.
 - Confidence calibration is unmeasured: the model’s number is published as given.
 

@@ -153,7 +153,8 @@ pub struct ReviewArgs {
                      Without it the run opens an empty worktree of its own under the run \
                      directory and fetches files into it from the platform API as they are \
                      asked for. That worktree is not a whole project, so a checker declaring \
-                     requires_checkout is not registered for it."
+                     requires_checkout refuses on it, saying so to the model rather than \
+                     reporting the project files it cannot find."
     )]
     pub worktree: Option<PathBuf>,
 
@@ -239,10 +240,12 @@ pub enum ToolCommand {
                       grouped by what the tool is for.\n\n\
                       Each row is the call as the model writes it, the description the model \
                       reads, one line per declared argument, the rounds the tool is offered on, \
-                      and what has to be true of a run before it exists at all.\n\n\
-                      It does not say whether a tool is registered. Registration is a fact about \
-                      one review — which worktree it got, which platform, what the config asked \
-                      for — and this command reviews nothing and calls nothing. The content \
+                      and what a run's worktree has to be able to do before a call can be \
+                      answered.\n\n\
+                      Every tool here is offered to the model on every run; what varies is \
+                      whether that run's worktree can answer it, and a run that cannot says so \
+                      in the description and again in the refusal. Which worktree a review got \
+                      is a fact about that review, and this command reviews nothing. The content \
                       descriptions here are written for the widest worktree there is, a whole \
                       checkout with a platform that can match expressions; the preconditions are \
                       what say when a run would get less."

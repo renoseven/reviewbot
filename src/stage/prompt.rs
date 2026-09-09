@@ -63,14 +63,27 @@ impl Prompts {
     /// The scoring instructions, for the one call `merge` makes.
     pub const SUMMARY: Template = Template::new("summary", include_str!("../prompts/summary.md"));
 
-    /// What abilities this run has, when it has some.
+    /// What abilities this run has, and what its worktree can do with them.
     pub const CAPABILITIES: Template =
         Template::new("capabilities", include_str!("../prompts/capabilities.md"));
 
-    /// What abilities this run has, when it has nothing to look with.
-    pub const NO_CAPABILITIES: Template = Template::new(
-        "capabilities-none",
-        include_str!("../prompts/capabilities-none.md"),
+    /// The three shapes of worktree, one paragraph each. The tool list no
+    /// longer varies between runs, so this is where a run says what it can
+    /// really do — including that reviewing from the diff alone is a normal
+    /// way to run and not a reason to stop.
+    pub const WORKTREE_CHECKOUT: Template = Template::new(
+        "worktree-checkout",
+        include_str!("../prompts/worktree-checkout.md"),
+    );
+
+    pub const WORKTREE_FETCHED: Template = Template::new(
+        "worktree-fetched",
+        include_str!("../prompts/worktree-fetched.md"),
+    );
+
+    pub const WORKTREE_EMPTY: Template = Template::new(
+        "worktree-empty",
+        include_str!("../prompts/worktree-empty.md"),
     );
 
     /// The author's own account of the change, fenced as material.
@@ -438,6 +451,9 @@ mod tests {
             Prompts::SPLIT_HANDOFF,
             Prompts::CONCLUDE,
             Prompts::AFTER_TRUNCATE,
+            Prompts::WORKTREE_CHECKOUT,
+            Prompts::WORKTREE_FETCHED,
+            Prompts::WORKTREE_EMPTY,
         ] {
             assert!(
                 template.slots().is_empty(),
@@ -449,7 +465,6 @@ mod tests {
         for template in [
             Prompts::REVIEW,
             Prompts::CAPABILITIES,
-            Prompts::NO_CAPABILITIES,
             Prompts::NARRATIVE,
             Prompts::SPLIT,
             Prompts::SPLIT_FINDINGS,

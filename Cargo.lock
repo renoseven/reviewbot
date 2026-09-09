@@ -1109,6 +1109,7 @@ name = "reviewbot"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
+ "bitflags",
  "clap",
  "globset",
  "httpdate",

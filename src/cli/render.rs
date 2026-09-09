@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use reviewbot::config::{Settings, paths};
-use reviewbot::domain::Confidence;
+use reviewbot::domain::{Confidence, Severity};
 use reviewbot::security::Redactor;
 use reviewbot::tool::Purpose;
 use reviewbot::{Error, RunResult};
@@ -37,15 +37,19 @@ fn text_summary(result: &RunResult) -> String {
                 .unwrap_or("no reason given")
         )),
     }
+    let severity = Severity::ALL
+        .iter()
+        .map(|band| format!("{band} {}", result.count_severity(*band)))
+        .collect::<Vec<_>>()
+        .join(" / ");
     let bands = Confidence::ALL
         .iter()
         .map(|band| format!("{band} {}", result.count(*band)))
         .collect::<Vec<_>>()
         .join(" / ");
-    out.push_str(&format!(
-        "comments   {}  ({bands})\n",
-        result.comments.len()
-    ));
+    out.push_str(&format!("comments   {}\n", result.comments.len()));
+    out.push_str(&format!("severity   {severity}\n"));
+    out.push_str(&format!("confidence {bands}\n"));
     out.push_str(&format!("skipped    {} files\n", result.skipped.len()));
     if !result.unreviewed.is_empty() {
         out.push_str(&format!("unreviewed {} files\n", result.unreviewed.len()));
@@ -400,17 +404,17 @@ pub fn model_list(settings: &Settings, format: Format) -> Result<String, Error> 
     Ok(Redactor::new().redact(&text))
 }
 
-/// The contract of every tool this config could offer: what it is for, how it
-/// is called, what each argument is, which rounds it appears on, and what has
-/// to be true of a run before it exists.
+/// The contract of every tool this config offers: what it is for, how it is
+/// called, what each argument is, which rounds it appears on, and what a run's
+/// worktree has to be able to do before a call can be answered.
 ///
-/// It does not say whether a tool is registered. Registration is a fact about
-/// one invocation of `review` — which worktree it got, which platform, what the
-/// config asked for — and this command reviews nothing and calls nothing, so it
-/// has no invocation to report on. It printed one anyway, which read as a
-/// verdict on the tool itself.
+/// Every tool is offered to the model on every run, so there is nothing here
+/// about a tool being present or absent. What varies is whether a given run
+/// can answer it, and that is a fact about one invocation of `review` — which
+/// worktree it got, which platform — while this command reviews nothing. So it
+/// prints the preconditions instead of a verdict.
 pub fn tool_list(settings: &Settings, format: Format) -> Result<String, Error> {
-    let rows = reviewbot::tool::inventory(settings);
+    let rows = reviewbot::tool::inventory(settings)?;
     let text = match format {
         Format::Json => serde_json::json!({ "tools": rows }).to_string(),
         Format::Text => {
@@ -659,9 +663,10 @@ mod tests {
     use serde_json::json;
 
     /// The row is the tool's contract: how it is called, what each argument
-    /// is, which rounds offer it, and what a run needs before it exists.
-    /// Never whether it is registered — that is a fact about one review, and
-    /// this command reviews nothing.
+    /// is, which rounds offer it, and what a run's worktree needs to be able
+    /// to do before a call can be answered. Never a verdict — whether this
+    /// run can answer it is a fact about one review, and this command reviews
+    /// nothing.
     #[test]
     fn a_tool_row_prints_the_contract_rather_than_a_registration_verdict() {
         let row = ToolListing {

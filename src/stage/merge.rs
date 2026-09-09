@@ -11,7 +11,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{ChangeSet, Comment, CommentTarget, Confidence, FileChange};
+use crate::domain::{ChangeSet, Comment, CommentTarget, Confidence, FileChange, Severity};
 use crate::protocol::{InputItem, Request, Role, ToolSchema};
 use crate::record::{ToolCall, Trace};
 use crate::tool::{Round, SubmitSummary, whole_score};
@@ -74,7 +74,7 @@ impl MergeOutput {
         self.badges.get(index).and_then(|badge| badge.as_deref())
     }
 
-    /// Counts per band, for `summary.json` and the stdout summary.
+    /// Counts per confidence band, for `summary.json` and the stdout summary.
     pub fn counts(&self) -> Vec<(Confidence, usize)> {
         Confidence::ALL
             .iter()
@@ -83,6 +83,23 @@ impl MergeOutput {
                     .comments
                     .iter()
                     .filter(|comment| comment.confidence == *band)
+                    .count();
+                (*band, count)
+            })
+            .collect()
+    }
+
+    /// The same over the other axis. Two breakdowns rather than a grid: a
+    /// reader wants "how bad is the worst of it" and "how sure is any of it",
+    /// and a four-by-four table answers neither at a glance.
+    pub fn severity_counts(&self) -> Vec<(Severity, usize)> {
+        Severity::ALL
+            .iter()
+            .map(|band| {
+                let count = self
+                    .comments
+                    .iter()
+                    .filter(|comment| comment.severity == *band)
                     .count();
                 (*band, count)
             })
@@ -107,6 +124,8 @@ struct RawComment {
     end_line: Option<u32>,
     body: Option<String>,
     suggestion: Option<String>,
+    /// Left as JSON: `82.5` and `"82"` have to be told apart from `82`.
+    severity_score: Option<serde_json::Value>,
     /// Left as JSON: `82.5` and `"82"` have to be told apart from `82`.
     confidence_score: Option<serde_json::Value>,
     evidence: Option<RawEvidence>,
@@ -411,7 +430,8 @@ impl Merge {
             None => return Err("no path".to_string()),
         }
 
-        let score = score_of(raw.confidence_score.as_ref())?;
+        let severity_score = score_of("severity_score", raw.severity_score.as_ref())?;
+        let score = score_of("confidence_score", raw.confidence_score.as_ref())?;
         let body = match raw.body {
             Some(body) if !body.trim().is_empty() => body,
             _ => return Err("no body".to_string()),
@@ -488,6 +508,8 @@ impl Merge {
                     },
                     body,
                     suggestion,
+                    severity: severity_band(severity_score),
+                    severity_score,
                     confidence: band(score),
                     confidence_score: score,
                     trace_id: file.trace_id.to_string(),
@@ -565,21 +587,22 @@ impl Merge {
                 continue;
             };
             let existing = kept.remove(at);
-            // The higher number wins the comment itself; everything the loser
-            // pointed at is kept, because that is what the reader would have
-            // had to read both entries for.
-            let (survivor, dropped) =
-                match candidate.comment.confidence_score > existing.comment.confidence_score {
-                    true => (candidate, existing),
-                    false => (existing, candidate),
-                };
+            // The worse reading of the same defect wins the comment itself,
+            // certainty breaking the tie; everything the loser pointed at is
+            // kept, because that is what the reader would have had to read
+            // both entries for.
+            let (survivor, dropped) = match weight(&candidate) > weight(&existing) {
+                true => (candidate, existing),
+                false => (existing, candidate),
+            };
             notes.push((
                 survivor.comment.trace_id.clone(),
                 format!(
                     "merged a duplicate of this comment from {} line {} \
-                     (confidence {}, trace {})",
+                     (severity {}, confidence {}, trace {})",
                     dropped.comment.target.path,
                     sort_line(&dropped.comment),
+                    dropped.comment.severity_score,
                     dropped.comment.confidence_score,
                     dropped.comment.trace_id,
                 ),
@@ -590,14 +613,24 @@ impl Merge {
         notes
     }
 
-    /// Step 6, the order. Highest confidence first, because on a busy merge
-    /// request that is the only thing that gets the top of the list read.
+    /// Step 6, the order. Worst first, then most certain: on a busy merge
+    /// request the top of the list is the only part that gets read, and what
+    /// belongs there is the thing that would do the most damage. Sorting by
+    /// certainty alone put a sure naming quibble above an uncertain memory
+    /// error, which is the wrong way round for the person deciding whether to
+    /// merge.
     fn sort(findings: &mut [Finding]) {
         findings.sort_by(|left, right| {
             right
                 .comment
-                .confidence_score
-                .cmp(&left.comment.confidence_score)
+                .severity_score
+                .cmp(&left.comment.severity_score)
+                .then_with(|| {
+                    right
+                        .comment
+                        .confidence_score
+                        .cmp(&left.comment.confidence_score)
+                })
                 .then_with(|| left.comment.target.path.cmp(&right.comment.target.path))
                 .then_with(|| sort_line(&left.comment).cmp(&sort_line(&right.comment)))
         });
@@ -830,15 +863,28 @@ fn band(score: u8) -> Confidence {
     }
 }
 
-/// The one number reviewbot never invents: missing or not a 0-100 integer
-/// and the entry goes, because there is no default to fall back on. Read
-/// through the same function the tools use, so a quoted number is read the
-/// same way here as it is on the way in.
-fn score_of(value: Option<&serde_json::Value>) -> Result<u8, String> {
+/// The same cut points on the other axis, so a reader learns one table rather
+/// than two. The names differ because the questions do.
+fn severity_band(score: u8) -> Severity {
+    match score {
+        90..=100 => Severity::Critical,
+        70..=89 => Severity::Major,
+        40..=69 => Severity::Minor,
+        _ => Severity::Trivial,
+    }
+}
+
+/// The numbers reviewbot never invents: missing or not a 0-100 integer and the
+/// entry goes, because there is no default to fall back on. Read through the
+/// same function the tools use, so a quoted number is read the same way here
+/// as it is on the way in. The field is named because the note goes into the
+/// trace and "which of the two" is the first thing a reader asks.
+fn score_of(field: &str, value: Option<&serde_json::Value>) -> Result<u8, String> {
     let Some(value) = value else {
-        return Err("no confidence_score".to_string());
+        return Err(format!("no {field}"));
     };
-    whole_score(Some(value)).ok_or_else(|| format!("{value} is not an integer between 0 and 100"))
+    whole_score(Some(value))
+        .ok_or_else(|| format!("{field} {value} is not an integer between 0 and 100"))
 }
 
 /// What the scoring round offers, straight from the registry: one tool, the
@@ -1058,9 +1104,24 @@ fn merge_findings(survivor: Finding, dropped: Finding) -> Finding {
     }
 }
 
+/// Which of two readings of the same defect the merged comment keeps. Damage
+/// first, certainty second — the same order the list is sorted in, so the
+/// survivor of a merge is the one that would have sorted higher anyway.
+fn weight(finding: &Finding) -> (u8, u8) {
+    (
+        finding.comment.severity_score,
+        finding.comment.confidence_score,
+    )
+}
+
 /// What the scoring call is given: the final list and nothing else. Not the
 /// diff, which was already paid for once, and not the dropped entries, which
 /// are not being published.
+///
+/// Both numbers travel, because the verdict is a judgement about them
+/// together: one certain trivial note and one uncertain critical defect are
+/// very different lists, and a scoring round shown only certainty cannot tell
+/// them apart.
 fn findings_json(comments: &[Comment]) -> String {
     let findings: Vec<serde_json::Value> = comments
         .iter()
@@ -1068,6 +1129,8 @@ fn findings_json(comments: &[Comment]) -> String {
             serde_json::json!({
                 "path": comment.target.path,
                 "line": comment.target.line,
+                "severity": comment.severity.as_str(),
+                "severity_score": comment.severity_score,
                 "confidence": comment.confidence.as_str(),
                 "confidence_score": comment.confidence_score,
                 "body": comment.body,
@@ -1138,10 +1201,22 @@ mod tests {
     }
 
     /// One entry with everything the contract wants, so each test can bend
-    /// exactly the field it is about.
+    /// exactly the field it is about. Severity is fixed here because most
+    /// tests are not about it; `graded` is for the ones that are.
     fn entry(path: &str, line: u32, score: &str, diff_lines: &str, body: &str) -> String {
+        graded(path, line, "50", score, diff_lines, body)
+    }
+
+    fn graded(
+        path: &str,
+        line: u32,
+        severity: &str,
+        score: &str,
+        diff_lines: &str,
+        body: &str,
+    ) -> String {
         format!(
-            r#"{{"path":"{path}","line":{line},"body":"{body}","suggestion":"fix it","confidence_score":{score},"evidence":{{"diff_lines":{diff_lines}}}}}"#
+            r#"{{"path":"{path}","line":{line},"body":"{body}","suggestion":"fix it","severity_score":{severity},"confidence_score":{score},"evidence":{{"diff_lines":{diff_lines}}}}}"#
         )
     }
 
@@ -1586,8 +1661,8 @@ mod tests {
         let changeset = changeset(vec![file("src/parse.c", &[10, 11, 12], &[11, 12])]);
         let raw = format!(
             r#"{{"comments":[{},{},{}]}}"#,
-            r#"{"path":"src/parse.c","line":11,"body":"no score at all","evidence":{"diff_lines":[11]}}"#,
-            r#"{"path":"src/parse.c","line":12,"body":"a fractional score","confidence_score":82.5,"evidence":{"diff_lines":[12]}}"#,
+            r#"{"path":"src/parse.c","line":11,"body":"no score at all","severity_score":50,"evidence":{"diff_lines":[11]}}"#,
+            r#"{"path":"src/parse.c","line":12,"body":"a fractional score","severity_score":50,"confidence_score":82.5,"evidence":{"diff_lines":[12]}}"#,
             entry("src/parse.c", 11, "44", "[11]", "the neighbour"),
         );
         let mut fixture = scoring(vec![r#"{"overall_score":55,"summary":"s"}"#]);
@@ -1623,7 +1698,7 @@ mod tests {
         let changeset = changeset(vec![file("src/parse.c", &[10, 11, 12], &[11, 12])]);
         let raw = format!(
             r#"{{"comments":[{},{}]}}"#,
-            r#"{"path":"src/parse.c","line":11,"body":"a real problem","confidence_score":80,"evidence":{"diff_lines":[11]}}"#,
+            r#"{"path":"src/parse.c","line":11,"body":"a real problem","severity_score":50,"confidence_score":80,"evidence":{"diff_lines":[11]}}"#,
             entry("src/parse.c", 12, "44", "[12]", "the neighbour"),
         );
         let mut fixture = scoring(vec![r#"{"overall_score":55,"summary":"s"}"#]);
@@ -1692,6 +1767,100 @@ mod tests {
         assert_eq!(counts[1], (Confidence::High, 3));
     }
 
+    /// The whole reason there are two numbers. Sorting on certainty alone put
+    /// a sure naming quibble above an uncertain memory error, and on a busy
+    /// merge request the top of the list is the only part that gets read.
+    #[test]
+    fn the_worst_finding_leads_even_when_a_trivial_one_is_more_certain() {
+        let changeset = changeset(vec![file("src/parse.c", &[10, 11, 12], &[10, 11, 12])]);
+        let raw = document(&[
+            graded(
+                "src/parse.c",
+                10,
+                "20",
+                "99",
+                "[10]",
+                "the name reads oddly",
+            ),
+            graded("src/parse.c", 11, "95", "45", "[11]", "the buffer overruns"),
+            graded(
+                "src/parse.c",
+                12,
+                "95",
+                "80",
+                "[12]",
+                "the pointer is freed twice",
+            ),
+        ]);
+        let mut fixture = scoring(vec![r#"{"overall_score":30,"summary":"s"}"#]);
+        write_trace(&fixture, "review-src_parse.c");
+
+        let output = merge(
+            &mut fixture,
+            &changeset,
+            &review(vec![chunk("src/parse.c", &raw)]),
+        );
+
+        let order: Vec<&str> = output
+            .comments
+            .iter()
+            .map(|comment| comment.body.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "the pointer is freed twice",
+                "the buffer overruns",
+                "the name reads oddly",
+            ],
+            "worst first, certainty breaking the tie"
+        );
+        assert_eq!(output.comments[0].severity, Severity::Critical);
+        assert_eq!(output.comments[0].confidence, Confidence::High);
+        // Both numbers are the model's, kept as given on both axes.
+        assert_eq!(output.comments[2].severity_score, 20);
+        assert_eq!(output.comments[2].confidence_score, 99);
+        assert_eq!(output.comments[2].severity, Severity::Trivial);
+        assert_eq!(output.comments[2].confidence, Confidence::Certain);
+    }
+
+    /// The scoring round cannot weigh what it cannot see: a list shown only
+    /// certainty reads one certain triviality and one uncertain critical
+    /// defect as much the same thing.
+    #[test]
+    fn the_scoring_round_is_shown_both_numbers() {
+        let changeset = changeset(vec![file("src/parse.c", &[11], &[11])]);
+        let raw = document(&[graded(
+            "src/parse.c",
+            11,
+            "95",
+            "45",
+            "[11]",
+            "the buffer overruns",
+        )]);
+        let mut fixture = scoring(vec![r#"{"overall_score":40,"summary":"s"}"#]);
+        write_trace(&fixture, "review-src_parse.c");
+
+        merge(
+            &mut fixture,
+            &changeset,
+            &review(vec![chunk("src/parse.c", &raw)]),
+        );
+
+        let sent = fixture.sent();
+        let scoring_call = sent.last().expect("the scoring call");
+        let InputItem::Message { content, .. } = &scoring_call.input[0] else {
+            panic!(
+                "the findings ride in a message: {:?}",
+                scoring_call.input[0]
+            );
+        };
+        assert!(content.contains(r#""severity":"critical""#), "{content}");
+        assert!(content.contains(r#""severity_score":95"#), "{content}");
+        assert!(content.contains(r#""confidence":"medium""#), "{content}");
+        assert!(content.contains(r#""confidence_score":45"#), "{content}");
+    }
+
     /// A file level comment cannot come out of a well formed change set —
     /// every changed line is commentable, so step 3 always finds one — but
     /// the order still has to be defined for the one built by hand.
@@ -1705,6 +1874,8 @@ mod tests {
             },
             body: body.to_string(),
             suggestion: "fix it".to_string(),
+            severity: severity_band(60),
+            severity_score: 60,
             confidence: band(80),
             confidence_score: 80,
             trace_id: "review-src_a.c".to_string(),
@@ -1801,6 +1972,7 @@ mod tests {
             stopped: Some("budget exhausted".to_string()),
             unused_checkers: Vec::new(),
             cut_short: Vec::new(),
+            unavailable: Vec::new(),
         };
         let stopped_reason = nothing_to_score(&stopped, &[]);
         assert!(stopped_reason.contains("stopped"), "{stopped_reason}");
@@ -1927,6 +2099,7 @@ mod tests {
         format!(
             r#"{{"path":"src/parse.c","line":{line},"body":"cppcheck found it",
                "suggestion":"fix it",
+               "severity_score":50,
                "confidence_score":{score},
                "evidence":{{"diff_lines":[{line}],
                "tool_quote":{{"tool":"cppcheck","text":"{quote}","note":"{note}"}}}}}}"#
@@ -2036,7 +2209,7 @@ mod tests {
         let changeset = changeset(vec![file("src/parse.c", &[10, 11], &[11])]);
         let raw = format!(
             r#"{{"comments":[{}]}}"#,
-            r#"{"path":"src/parse.c","line":11,"body":"cppcheck found it","suggestion":"fix it","confidence_score":85,
+            r#"{"path":"src/parse.c","line":11,"body":"cppcheck found it","suggestion":"fix it","severity_score":70,"confidence_score":85,
                 "evidence":{"diff_lines":[11],"external_files":["src/parse.h"]}}"#
         );
         let mut fixture = scoring(vec![r#"{"overall_score":35,"summary":"s"}"#]);

@@ -36,7 +36,7 @@ pub const KNOWN_REASONING_EFFORTS: [&str; 7] =
 /// which makes this list a security boundary rather than documentation: a name
 /// missing from it is a builtin a config entry could shadow. A test asserts it
 /// equals what a fully equipped run registers, because it has drifted before.
-pub const BUILTIN_TOOL_NAMES: [&str; 7] = [
+pub const RESERVED_TOOL_NAMES: [&str; 7] = [
     "submit_comment",
     "finish_review",
     "submit_summary",
@@ -530,7 +530,7 @@ impl Config {
 
     fn check_tools(&self) -> Result<(), ConfigError> {
         for tool in &self.tools {
-            if BUILTIN_TOOL_NAMES.contains(&tool.name.as_str()) {
+            if RESERVED_TOOL_NAMES.contains(&tool.name.as_str()) {
                 return Err(ConfigError::ToolNameCollidesWithBuiltin {
                     tool: tool.name.clone(),
                 });

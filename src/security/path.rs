@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
-use crate::config::SecuritySettings;
+use crate::config::{ConfigError, SecuritySettings, Settings};
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq)]
 pub enum PathRejection {
@@ -60,6 +60,25 @@ impl PathPolicy {
             deny_patterns: patterns,
             allow_extensions: settings.allow_extensions.clone(),
             follow_symlinks: settings.follow_symlinks,
+        })
+    }
+
+    /// The read boundary of one run, assembled from the settings alone.
+    ///
+    /// Lives here rather than at either caller because there are two: the
+    /// stages, and `tool list`, which builds the real tools to print their
+    /// contracts. Two assemblies of the same boundary is one of them being
+    /// wrong.
+    pub fn for_settings(settings: &Settings) -> Result<Self, ConfigError> {
+        Self::new(
+            &settings.config.security,
+            &settings.written_paths(),
+            settings.options.worktree.as_deref(),
+        )
+        .map_err(|error| ConfigError::InvalidGlob {
+            field: "[security].deny_paths",
+            pattern: String::new(),
+            reason: error.to_string(),
         })
     }
 

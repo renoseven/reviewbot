@@ -133,12 +133,16 @@ impl ChunkLimit {
 
     /// What the tool loop may append to `input` before the last round.
     /// Delivery-only tools do not grow the conversation with bulk output, so
-    /// they do not reserve this.
+    /// they do not reserve this. Neither does one this run's worktree cannot
+    /// answer: it is offered to the model like the rest, but all it can ever
+    /// return is a one-line refusal.
     fn tool_allowance(config: &Config, tools: &Registry) -> u32 {
         let investigates = tools
-            .schemas_for(crate::tool::Round::Investigation)
+            .offered_on(crate::tool::Round::Investigation)
             .iter()
-            .any(|schema| schema.purpose != crate::tool::Purpose::Delivery);
+            .any(|tool| {
+                tool.purpose() != crate::tool::Purpose::Delivery && tool.unavailable().is_none()
+            });
         if !investigates {
             return 0;
         }
