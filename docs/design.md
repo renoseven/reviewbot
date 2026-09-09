@@ -568,7 +568,7 @@ checkpoint 管的是进程活不下来；进程还在时的瞬时故障走下面
 
 ### 可观测
 
-Trace 住在 run 目录的 `traces/` 里，不拆进 Markdown 报告，也不折进 MR/PR 评论。`report.md` 标题是 `Reviewbot report`，随后是基础信息（`run` / `model` / `overall`），再是一份清单：发现、跳过、未产出、未调用的检查器、被掐断、未评审，不分子节。每条发现先写问题、再写 `suggestion:`，加一行可见的 `trace: <id>`。花费只写在 `summary.json` 和 CLI stdout，不进报告也不进评论。MR 行内评论带 `run` 与 `trace`；幂等靠隐藏标记 `<!-- reviewbot:{run_id}:{trace_id} -->`。
+Trace 住在 run 目录的 `traces/` 里，不拆进 Markdown 报告，也不折进 MR/PR 评论。`report.md` 标题是 `Reviewbot report`，随后是基础信息（`run` / `model` / `overall`），再是一份清单：发现、跳过、未产出、被掐断、未评审，不分子节。未调用的检查器只写在该分片的 trace 上：哪个检查器适用于眼前这份文件是模型按描述自己判断的，C 检查器没打到一份 Rust 文件上不是这次改动的缺口，不能和发现并列。每条发现先写问题、再写 `suggestion:`，加一行可见的 `trace: <id>`。花费只写在 `summary.json` 和 CLI stdout，不进报告也不进评论。MR 行内评论带 `run` 与 `trace`；幂等靠隐藏标记 `<!-- reviewbot:{run_id}:{trace_id} -->`。
 
 published 视图仍是去掉文件正文的那份——给需要外发一份 trace 文件时用，不是帖子正文。发布视图带齐四样：用过的工具、触发该 comment 的原始 diff、发给模型的 prompt、模型原始回复。
 

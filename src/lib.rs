@@ -226,7 +226,6 @@ fn publish_run_inner(settings: &Settings, run_id: &str) -> Result<RunResult, Err
         plan: &plan,
         merged: &merged,
         unreviewed: &reviewed.unreviewed,
-        unused_checkers: &reviewed.unused_checkers,
         cut_short: &reviewed.cut_short,
         unavailable: &reviewed.unavailable,
     };
@@ -272,7 +271,6 @@ fn render_report_inner(settings: &Settings, run_id: &str) -> Result<RunResult, E
         plan: &plan,
         merged: &merged,
         unreviewed: &reviewed.unreviewed,
-        unused_checkers: &reviewed.unused_checkers,
         cut_short: &reviewed.cut_short,
         unavailable: &reviewed.unavailable,
     };
@@ -516,7 +514,6 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
         plan: &plan,
         merged: &merged,
         unreviewed: &reviewed.unreviewed,
-        unused_checkers: &reviewed.unused_checkers,
         cut_short: &reviewed.cut_short,
         unavailable: &reviewed.unavailable,
     };

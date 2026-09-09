@@ -14,7 +14,7 @@ use crate::platform::{ChangeRef, DiffPaths, DiffRefs, OutgoingComment};
 use crate::record::layout;
 
 use super::merge::MergeOutput;
-use super::review::{CutShort, UnusedCheckers};
+use super::review::CutShort;
 use super::triage::TriagePlan;
 use super::{StageContext, StageError};
 
@@ -28,9 +28,6 @@ pub struct PublishInput<'a> {
     pub plan: &'a TriagePlan,
     pub merged: &'a MergeOutput,
     pub unreviewed: &'a [String],
-    /// Chunks that had an external checker available and never used it. A
-    /// clean chunk and an unscanned one must not read the same.
-    pub unused_checkers: &'a [UnusedCheckers],
     /// Chunks whose investigation the loop ended early. A file the model was
     /// still reading around must not read like one it finished with.
     pub cut_short: &'a [CutShort],
@@ -443,12 +440,6 @@ impl Publish {
         for file in &input.plan.skipped {
             items.push_str(&coverage_item(&file.path, &file.reason));
         }
-        for unused in input.unused_checkers {
-            items.push_str(&coverage_item(
-                &unused.path,
-                &format!("offered {}; none called", unused.tools.join(", ")),
-            ));
-        }
         for chunk in input.cut_short {
             items.push_str(&coverage_item(
                 &chunk.path,
@@ -704,7 +695,6 @@ mod tests {
             plan: &plan,
             merged,
             unreviewed: &[],
-            unused_checkers: &[],
             cut_short: &[],
             unavailable: &[],
         };
@@ -742,7 +732,6 @@ mod tests {
             plan: &plan,
             merged: &merged,
             unreviewed: &[],
-            unused_checkers: &[],
             cut_short: &[],
             unavailable: &[],
         };
@@ -885,50 +874,25 @@ mod tests {
         assert!(summary["unscored_reason"].is_string());
     }
 
-    /// The badge sits next to the model's number without disturbing it, and
-    /// a checker nobody used is listed with the findings so a chunk that was
-    /// merely read does not read as a chunk that was scanned.
+    /// The badge sits next to the model's number without disturbing it.
+    /// Unused checkers stay on the chunk's trace; they are not a report item.
     #[test]
-    fn the_badge_sits_beside_the_score_and_an_unused_checker_is_listed() {
+    fn the_badge_sits_beside_the_score() {
         let mut fixture = StageFixture::new(Vec::new());
-        fixture
-            .recorder()
-            .write_trace(&internal_trace("review-src_parse.c"))
-            .expect("trace written");
         let merged = MergeOutput {
             comments: vec![comment("review-src_parse.c")],
             badges: vec![Some(crate::stage::merge::TOOL_FOUND.to_string())],
             overall_score: Some(54),
             ..MergeOutput::default()
         };
-        let changeset = ChangeSet::default();
-        let plan = TriagePlan::default();
-        let unused = [UnusedCheckers {
-            path: "src/emit.c".to_string(),
-            tools: vec!["cppcheck".to_string()],
-        }];
-        let input = PublishInput {
-            changeset: &changeset,
-            plan: &plan,
-            merged: &merged,
-            unreviewed: &[],
-            unused_checkers: &unused,
-            cut_short: &[],
-            unavailable: &[],
-        };
-        {
-            let mut context = fixture.context();
-            Publish::run(&mut context, &input).expect("the report is written");
-        }
+        publish(&mut fixture, &merged);
         let report = fixture.report();
 
         assert!(
             report.contains("## [major 80% / certain 92%] found by tool `src/parse.c:11`"),
             "{report}"
         );
-        assert!(!report.contains("## checkers not used"), "{report}");
-        assert!(report.contains("## `src/emit.c`"), "{report}");
-        assert!(report.contains("offered cppcheck; none called"), "{report}");
+        assert!(!report.contains("none called"), "{report}");
     }
 
     /// A file the loop stopped investigating is not a file that came back
@@ -953,7 +917,6 @@ mod tests {
             plan: &plan,
             merged: &merged,
             unreviewed: &[],
-            unused_checkers: &[],
             cut_short: &cut_short,
             unavailable: &[],
         };
@@ -1005,7 +968,6 @@ mod tests {
             plan: &plan,
             merged: &merged,
             unreviewed: &[],
-            unused_checkers: &[],
             cut_short: &[],
             unavailable: &unavailable,
         };
@@ -1111,7 +1073,6 @@ mod tests {
             plan: &plan,
             merged: &merged,
             unreviewed: &[],
-            unused_checkers: &[],
             cut_short: &[],
             unavailable: &[],
         };
@@ -1189,7 +1150,6 @@ mod tests {
             plan: &plan,
             merged: &merged,
             unreviewed: &[],
-            unused_checkers: &[],
             cut_short: &[],
             unavailable: &[],
         };
@@ -1251,7 +1211,6 @@ mod tests {
             plan: &plan,
             merged: &merged,
             unreviewed: &[],
-            unused_checkers: &[],
             cut_short: &[],
             unavailable: &[],
         };

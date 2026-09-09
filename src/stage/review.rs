@@ -39,8 +39,9 @@ pub struct ChunkOutput {
 }
 
 /// A chunk where external checkers could have answered and the model called
-/// none of them. "The checker found nothing" and "the checker never ran" have
-/// to read differently, so the second one is written down.
+/// none of them. Written on the chunk's trace: which checkers apply is a
+/// judgement the model makes from their descriptions, so an unused checker
+/// is not a gap in the change and does not belong in the report.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct UnusedCheckers {
     pub path: String,
@@ -67,13 +68,13 @@ pub struct ReviewOutput {
     /// money still finishes: it writes the report, names what it could not
     /// look at, and says so through the exit code.
     pub stopped: Option<String>,
-    /// Chunks that had a checker available and never used it. A note, not a
-    /// failure: it does not touch the exit code.
+    /// Chunks that had a checker available and never used it. A trace note,
+    /// not a report item and not a failure: it does not touch the exit code.
     #[serde(default)]
     pub unused_checkers: Vec<UnusedCheckers>,
     /// Chunks whose investigation the loop ended rather than the model. Also
-    /// a note rather than a failure, and named in the report for the same
-    /// reason as the two lists above.
+    /// a note rather than a failure, and named in the report: a file the
+    /// loop stopped looking at must not read like one it finished.
     #[serde(default)]
     pub cut_short: Vec<CutShort>,
     /// What this run's worktree could not do at all, in the report's words.
@@ -565,10 +566,13 @@ impl Conversation {
         self.trace.note(NAME, note);
     }
 
-    /// A checker that could have answered and never was called is worth saying
-    /// out loud: otherwise a chunk nobody scanned looks like a clean one. Only
-    /// the ones this run's worktree can answer count — a checker that would
-    /// have refused is not a checker the model neglected.
+    /// A checker that could have answered and never was called is a trace
+    /// note: the operator can see a chunk nobody scanned. It is not a report
+    /// item, because which checkers apply is the model's call from their
+    /// descriptions, and a C checker left unused on a Rust file is not a
+    /// gap in the change. Only the ones this run's worktree can answer
+    /// count — a checker that would have refused is not a checker the
+    /// model neglected.
     fn note_unused_checkers(&mut self, path: &str, tools: &Registry) -> Option<UnusedCheckers> {
         let usable: Vec<String> = tools
             .usable_with_purpose(Purpose::Check)
@@ -1358,7 +1362,8 @@ mod tests {
     }
 
     /// "The checker found nothing" and "the checker never ran" have to read
-    /// differently, so the second one is written down and the first is not.
+    /// differently on the trace; the second one is written down and the first
+    /// is not. Neither is a report item.
     #[test]
     fn a_checker_nobody_called_is_recorded_and_one_that_was_called_is_not() {
         let (tools, _) = counted("clean");
