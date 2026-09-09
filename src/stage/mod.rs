@@ -24,6 +24,7 @@ use crate::budget::{Budget, BudgetError};
 use crate::common::{Secret, SecretSource};
 use crate::config::{ConfigError, Settings};
 use crate::platform::{ChangeRef, Platform, PlatformError};
+use crate::progress::{Event, Progress};
 use crate::protocol::{Protocol, ProtocolError, Request, Response};
 use crate::record::{InputIdentity, InputRecord, RecordError, Recorder};
 use crate::security::{PathPolicy, Redactor};
@@ -222,9 +223,29 @@ pub struct StageContext<'a> {
     pub budget: &'a mut Budget,
     pub redactor: &'a Redactor,
     pub paths: &'a PathPolicy,
+    /// Whoever is watching this run. Shared, not owned: the same watcher
+    /// hears every stage, and no stage may change what it does because of
+    /// what is on the other end.
+    pub progress: &'a dyn Progress,
 }
 
 impl StageContext<'_> {
+    /// A stage is beginning, whether or not there is work left in it.
+    pub fn stage_started(&self, number: u8, name: &'static str) {
+        self.progress.emit(Event::StageStarted { number, name });
+    }
+
+    /// A stage is over, and `detail` is what it has to show for itself.
+    /// Said by the caller that knows the order rather than by the stage,
+    /// which is the same reason the order lives in `lib.rs`.
+    pub fn stage_finished(&self, number: u8, name: &'static str, detail: String) {
+        self.progress.emit(Event::StageFinished {
+            number,
+            name,
+            detail,
+        });
+    }
+
     /// The stage's own checkpoint, when it already finished.
     pub fn completed<T: DeserializeOwned>(
         &mut self,
@@ -268,6 +289,14 @@ impl StageContext<'_> {
             cumulative = format!("{:.4}", self.budget.spent()),
             "model replied"
         );
+        // The one place money moves, so the one place worth saying it from.
+        // Straight off the budget rather than accumulated by the watcher:
+        // the run's own account is what the summary will print.
+        self.progress.emit(Event::Spend {
+            spent: self.budget.spent(),
+            budget: self.budget.ceiling(),
+            currency: self.budget.currency().to_string(),
+        });
         Ok(response)
     }
 }

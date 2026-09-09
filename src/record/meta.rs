@@ -26,6 +26,28 @@ pub struct InputRecord {
     pub head_sha: String,
 }
 
+impl InputRecord {
+    /// One line naming what is under review, for whoever is watching the run.
+    /// Read off the identity rather than off `source`, because the identity
+    /// is what the run is keyed by: two paths to the same merge request are
+    /// one run and read as one line. A diff has no locator of its own, so it
+    /// is named by where its bytes came from — which is all `source` ever is
+    /// for a diff.
+    pub fn describe(&self) -> String {
+        match &self.identity {
+            InputIdentity::Platform {
+                host,
+                project,
+                number,
+            } => format!("{host}/{project} #{number}"),
+            InputIdentity::Diff { .. } if self.source == "-" => {
+                "a diff on standard input".to_string()
+            }
+            InputIdentity::Diff { .. } => self.source.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Meta {
     pub run_id: String,

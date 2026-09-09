@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::budget::{Budget, Limit, Price, TokenUsage};
 use crate::config::{RunOptions, Settings};
+use crate::progress::Silent;
 use crate::protocol::{OutputItem, Protocol, ProtocolError, Request, Response};
 use crate::record::{LocalStorage, Meta, Recorder, RunIdentity, Storage, layout};
 use crate::security::{PathPolicy, Redactor};
@@ -271,6 +272,10 @@ impl StageFixture {
             budget: &mut self.budget,
             redactor: &self.adapters.redactor,
             paths: &self.paths,
+            // What a stage emits is asserted where a whole run can be seen;
+            // a stage test hands in the watcher that hears everything and
+            // keeps nothing.
+            progress: &Silent,
         }
     }
 

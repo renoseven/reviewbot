@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::budget::estimate_tokens;
 use crate::common::truncate;
 use crate::domain::Narrative;
+use crate::progress::Event;
 use crate::protocol::{InputItem, Request, Role, ToolSchema};
 use crate::record::{ContextFile, ToolCall, Trace};
 use crate::security::Redactor;
@@ -174,6 +175,11 @@ impl Review {
         // plan's order turns out to be.
         let mut handoff: Option<Handoff> = None;
         for (index, chunk) in plan.chunks.iter().enumerate() {
+            context.progress.emit(Event::Chunk {
+                index: chunk.index + 1,
+                of,
+                path: chunk.path.clone(),
+            });
             let carried = handoff
                 .take()
                 .filter(|previous| previous.path == chunk.path);
@@ -353,6 +359,10 @@ impl Review {
                 round = chat.rounds + 1,
             )
             .entered();
+            context.progress.emit(Event::Round {
+                round: chat.rounds + 1,
+                of: max_rounds,
+            });
             let response = context.send_and_settle(&request)?;
             chat.trace.usage.add(&response.usage);
             chat.record_turn(&response);
@@ -431,6 +441,10 @@ impl Review {
         let mut other = 0;
         for (call_id, name, arguments) in calls {
             chat.called.insert(name.clone());
+            // Said here rather than inside `execute_call`, which answers to
+            // the registry and the redactor and nothing else. The moment is
+            // the same one: the call is about to run.
+            context.progress.emit(Event::Tool { name: name.clone() });
             let call = execute_call(
                 &context.adapters.tools,
                 context.redactor,

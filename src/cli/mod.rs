@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use reviewbot::config::{RunOptions, Settings, paths};
+use reviewbot::progress::Silent;
 use reviewbot::{Error, Source};
 
 use args::{
@@ -67,7 +68,10 @@ fn dispatch(cli: &Cli) -> Result<Finished, Error> {
         Command::Review(review) => {
             let settings = load(&cli.global, review_options(&cli.global, review))?;
             let source = read_source(&review.target)?;
-            let result = reviewbot::review(&settings, &source)?;
+            // Nothing watches a run yet: the status screen is the next step,
+            // and until it exists the live word on a run is the tracing
+            // output `init_tracing` set up.
+            let result = reviewbot::review(&settings, &source, &Silent)?;
             Ok(Finished {
                 output: render::run_result(&result, cli.global.format),
                 exit_code: result.exit_code(),

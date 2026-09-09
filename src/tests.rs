@@ -13,6 +13,7 @@ use crate::platform::{
     Capabilities, ChangeRef, DiffRefs, ExistingComment, LineRange, Listing, OutgoingComment,
     Platform, PlatformChange, PlatformError, RepoSource, SearchHit,
 };
+use crate::progress::{Event, Progress, Silent};
 use crate::protocol::{OutputItem, Protocol, ProtocolError, Request, Response};
 use crate::record::{LocalStorage, Storage, layout};
 use crate::security::Redactor;
@@ -402,6 +403,7 @@ fn review(workspace: &Workspace, calls: Arc<Calls>) -> Result<RunResult, Error> 
         &workspace.settings(),
         &Source::Url(URL.to_string()),
         &adapters(calls),
+        &Silent,
     )
 }
 
@@ -570,6 +572,7 @@ fn a_second_process_on_the_same_run_directory_fails_at_once() {
         &settings,
         &Source::Url(URL.to_string()),
         &adapters(Arc::new(Calls::default())),
+        &Silent,
     )
     .expect_err("the second open fails");
     assert!(
@@ -626,6 +629,7 @@ fn an_explicit_run_id_does_not_get_around_the_fingerprint_check() {
         &settings,
         &Source::Url(URL.to_string()),
         &adapters(Arc::new(Calls::default())),
+        &Silent,
     )
     .expect_err("the same check applies");
     assert!(matches!(error, Error::FingerprintMismatch { .. }));
@@ -691,8 +695,13 @@ fn publishing_a_raw_diff_fails_before_the_run_directory_exists() {
         content: "--- a\n+++ b\n".to_string(),
     };
 
-    let error = crate::review_with(&settings, &source, &adapters(Arc::new(Calls::default())))
-        .expect_err("--publish needs a platform");
+    let error = crate::review_with(
+        &settings,
+        &source,
+        &adapters(Arc::new(Calls::default())),
+        &Silent,
+    )
+    .expect_err("--publish needs a platform");
     assert!(matches!(error, Error::PublishNeedsPlatform));
     assert_eq!(error.exit_code(), 2);
     assert!(!workspace.runs_dir.exists(), "nothing was written");
@@ -718,6 +727,7 @@ fn a_diff_run_completes_without_a_platform() {
             worktree: Arc::new(FetchedWorktree::new(None, Capabilities::default())),
             redactor: Redactor::new(),
         },
+        &Silent,
     )
     .expect("run completes");
 
@@ -796,6 +806,7 @@ fn a_real_diff_reaches_the_model_as_one_chunk_per_surviving_file() {
         &workspace.settings(),
         &diff_source(),
         &diff_adapters(Arc::clone(&calls)),
+        &Silent,
     )
     .expect("run completes");
 
@@ -852,6 +863,7 @@ fn an_mbox_is_refused_instead_of_being_stripped() {
         &workspace.settings(),
         &source,
         &diff_adapters(Arc::clone(&calls)),
+        &Silent,
     )
     .expect_err("only unified diff is accepted");
 
@@ -872,6 +884,7 @@ fn a_budget_of_zero_still_finishes_the_run_and_names_what_it_could_not_review() 
         &workspace.settings(),
         &diff_source(),
         &diff_adapters(Arc::clone(&calls)),
+        &Silent,
     )
     .expect("the run finishes rather than aborting");
 
@@ -940,6 +953,7 @@ fn what_the_author_wrote_reaches_every_review_request_as_material() {
         &workspace.settings(),
         &Source::Url(URL.to_string()),
         &adapters,
+        &Silent,
     )
     .expect("run completes");
 
@@ -975,7 +989,8 @@ fn instructions_are_byte_identical_across_two_chunks() {
     let workspace = Workspace::new();
     let calls = Arc::new(Calls::default());
     let (adapters, requests) = capturing_diff_adapters(Arc::clone(&calls));
-    crate::review_with(&workspace.settings(), &diff_source(), &adapters).expect("run completes");
+    crate::review_with(&workspace.settings(), &diff_source(), &adapters, &Silent)
+        .expect("run completes");
 
     assert!(
         Calls::get(&calls.send) >= 2,
@@ -1015,8 +1030,8 @@ fn a_scored_run_writes_the_report_and_a_second_run_does_not_score_again() {
     let source = workspace.diff_file();
     let calls = Arc::new(Calls::default());
     let (adapters, _) = scripted_diff_adapters(Arc::clone(&calls), vec![FINDING, SCORE]);
-    let first =
-        crate::review_with(&workspace.settings(), &source, &adapters).expect("run completes");
+    let first = crate::review_with(&workspace.settings(), &source, &adapters, &Silent)
+        .expect("run completes");
 
     assert_eq!(
         Calls::get(&calls.send),
@@ -1059,7 +1074,7 @@ fn a_scored_run_writes_the_report_and_a_second_run_does_not_score_again() {
     rewind_to(&run_dir, 4);
     let second_calls = Arc::new(Calls::default());
     let (second_adapters, _) = scripted_diff_adapters(Arc::clone(&second_calls), Vec::new());
-    let second = crate::review_with(&workspace.settings(), &source, &second_adapters)
+    let second = crate::review_with(&workspace.settings(), &source, &second_adapters, &Silent)
         .expect("the second run completes");
 
     assert_eq!(second.run_id, first.run_id);
@@ -1097,6 +1112,7 @@ fn a_finished_run_entered_again_rewrites_the_report_and_says_nothing_twice() {
             Arc::clone(&mr),
             vec![FINDING, SCORE],
         ),
+        &Silent,
     )
     .expect("run completes");
 
@@ -1117,6 +1133,7 @@ fn a_finished_run_entered_again_rewrites_the_report_and_says_nothing_twice() {
         &settings,
         &Source::Url(URL.to_string()),
         &publishing_adapters(Arc::clone(&calls), Arc::clone(&mr), Vec::new()),
+        &Silent,
     )
     .expect("the second entry completes");
 
@@ -1158,8 +1175,8 @@ diff --git a/src/parse.c b/src/parse.c
 "
         ),
     };
-    let result =
-        crate::review_with(&workspace.settings(), &source, &adapters).expect("run completes");
+    let result = crate::review_with(&workspace.settings(), &source, &adapters, &Silent)
+        .expect("run completes");
 
     let captured = requests.lock().expect("requests");
     assert!(
@@ -1198,6 +1215,226 @@ diff --git a/src/parse.c b/src/parse.c
             );
         }
     }
+}
+
+/// A watcher that keeps everything it is told. The status screen is built out
+/// of exactly this sequence, so the sequence is what a test can hold on to —
+/// and it is all a test should hold on to, because how any of it looks is the
+/// consumer's business and not the run's.
+#[derive(Default)]
+struct Watcher {
+    events: Mutex<Vec<Event>>,
+}
+
+impl Progress for Watcher {
+    fn emit(&self, event: Event) {
+        self.events.lock().expect("events").push(event);
+    }
+}
+
+impl Watcher {
+    fn events(&self) -> Vec<Event> {
+        self.events.lock().expect("events").clone()
+    }
+
+    /// Every stage that finished, in order, paired with what it said it did.
+    /// The pairing is checked on the way through: a screen that shows one
+    /// line per stage cannot be written against a channel that opens a stage
+    /// before closing the last one.
+    fn stages(&self) -> Vec<(u8, &'static str, String)> {
+        let mut finished = Vec::new();
+        let mut open: Option<(u8, &'static str)> = None;
+        for event in self.events() {
+            match event {
+                Event::StageStarted { number, name } => {
+                    assert_eq!(open, None, "{name} started while another stage was open");
+                    open = Some((number, name));
+                }
+                Event::StageFinished {
+                    number,
+                    name,
+                    detail,
+                } => {
+                    assert_eq!(open, Some((number, name)), "{name} finished unannounced");
+                    open = None;
+                    finished.push((number, name, detail));
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(open, None, "a stage was announced and never finished");
+        finished
+    }
+
+    fn chunks(&self) -> Vec<(usize, usize, String)> {
+        self.events()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Chunk { index, of, path } => Some((index, of, path)),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// What a watcher hears from a run that does all the work: the run naming
+/// itself, then six stages in order, each with the numbers the final summary
+/// prints, and one `Chunk` per file the plan cut.
+#[test]
+fn a_full_run_announces_every_stage_and_numbers_the_chunks() {
+    let workspace = Workspace::new();
+    let watcher = Watcher::default();
+    let result = crate::review_with(
+        &workspace.settings(),
+        &diff_source(),
+        &diff_adapters(Arc::new(Calls::default())),
+        &watcher,
+    )
+    .expect("run completes");
+
+    assert_eq!(
+        watcher.events().first(),
+        Some(&Event::RunStarted {
+            run_id: result.run_id.clone(),
+            run_dir: workspace.run_dir(&result.run_id),
+            model: "deepseek-v4-flash".to_string(),
+            input: "change.diff".to_string(),
+        }),
+        "a run says what it is before it does anything"
+    );
+
+    let stages = watcher.stages();
+    let announced: Vec<(u8, &str)> = stages
+        .iter()
+        .map(|(number, name, _)| (*number, *name))
+        .collect();
+    assert_eq!(
+        announced,
+        STAGE_FILES.to_vec(),
+        "all six, in the order lib.rs runs them"
+    );
+    let details: Vec<&str> = stages
+        .iter()
+        .map(|(_, _, detail)| detail.as_str())
+        .collect();
+    assert_eq!(
+        details,
+        vec![
+            "2 files",
+            "2 chunks, 0 files skipped",
+            "2 chunks reviewed",
+            "0 comments, not scored",
+            "report.md and summary.json written",
+            "nothing posted: this run was not asked to publish",
+        ],
+        "a finished stage says what it produced, in the summary's own numbers"
+    );
+
+    assert_eq!(
+        watcher.chunks(),
+        vec![
+            (1, 2, "src/parse.c".to_string()),
+            (2, 2, "vendor/lib.c".to_string()),
+        ],
+        "chunks are counted from 1, for a reader rather than for the loop"
+    );
+    assert!(
+        watcher
+            .events()
+            .iter()
+            .any(|event| matches!(event, Event::Round { round: 1, of: 12 })),
+        "the tool loop's ceiling is what a round is counted against"
+    );
+    assert!(
+        watcher
+            .events()
+            .iter()
+            .any(|event| matches!(event, Event::Spend { currency, .. } if currency == "CNY")),
+        "every settled call says what the run has spent"
+    );
+}
+
+/// The one thing on the channel that nothing else in the run counts: a tool
+/// call, named as it goes out. Delivering a finding is a tool call like any
+/// other, which is why an ordinary run has one.
+#[test]
+fn a_tool_the_model_calls_is_named_as_it_goes_out() {
+    let workspace = Workspace::with_config(
+        &CONFIG.replace("[triage]", "[triage]\nskip_paths = [\"vendor/**\"]"),
+    );
+    let watcher = Watcher::default();
+    let (adapters, _) = scripted_diff_adapters(Arc::new(Calls::default()), vec![FINDING, SCORE]);
+    crate::review_with(
+        &workspace.settings(),
+        &workspace.diff_file(),
+        &adapters,
+        &watcher,
+    )
+    .expect("run completes");
+
+    let tools: Vec<String> = watcher
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Tool { name } => Some(name),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tools, vec!["submit_comment".to_string()]);
+}
+
+/// The reason a skipped stage still has to be announced: a run entered again
+/// does no work at all in the first four stages, and a screen that showed
+/// only what ran would show almost nothing. The numbers are still there, and
+/// they say where they came from.
+#[test]
+fn a_run_entered_again_reports_every_stage_off_its_checkpoints() {
+    let workspace = Workspace::new();
+    let source = workspace.diff_file();
+    let first = crate::review_with(
+        &workspace.settings(),
+        &source,
+        &diff_adapters(Arc::new(Calls::default())),
+        &Silent,
+    )
+    .expect("run completes");
+
+    let watcher = Watcher::default();
+    let calls = Arc::new(Calls::default());
+    let second = crate::review_with(
+        &workspace.settings(),
+        &source,
+        &diff_adapters(Arc::clone(&calls)),
+        &watcher,
+    )
+    .expect("the second entry completes");
+
+    assert_eq!(second.run_id, first.run_id);
+    assert_eq!(Calls::get(&calls.send), 0, "nothing was reviewed again");
+
+    let stages = watcher.stages();
+    let announced: Vec<(u8, &str)> = stages
+        .iter()
+        .map(|(number, name, _)| (*number, *name))
+        .collect();
+    assert_eq!(announced, STAGE_FILES.to_vec());
+    for (_, name, detail) in stages.iter().take(4) {
+        assert!(
+            detail.ends_with(", from checkpoint"),
+            "{name} was skipped and has to say so: {detail}"
+        );
+    }
+    assert_eq!(stages[1].2, "2 chunks, 0 files skipped, from checkpoint");
+    for (_, name, detail) in stages.iter().skip(4) {
+        assert!(
+            !detail.contains("checkpoint"),
+            "{name} runs every time: {detail}"
+        );
+    }
+    assert!(
+        watcher.chunks().is_empty(),
+        "no chunk was looked at, so none is reported"
+    );
 }
 
 /// The error every caller branches on stays small enough that returning it is
