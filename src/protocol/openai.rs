@@ -4,14 +4,13 @@
 //!
 //! Stateless by design: no `previous_response_id`, no `store`, no streaming.
 
-use std::error::Error as _;
-use std::io::ErrorKind;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::budget::TokenUsage;
-use crate::config::{Backoff, Secret};
+use crate::common::http::{self, Client, Failure};
+use crate::common::{Backoff, Secret};
 use crate::security::Redactor;
 
 use super::{InputItem, OutputItem, Protocol, ProtocolError, Request, Response, Role};
@@ -20,14 +19,11 @@ const PROTOCOL: &str = OpenAi::NAME;
 /// Thinking models can spend minutes inside one completion. 60s cut the
 /// JSON off while the model was still reasoning.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const ERROR_SNIPPET: usize = 160;
 
 pub struct OpenAi {
-    client: reqwest::blocking::Client,
+    http: Client,
     base_url: String,
     api_key: Secret,
-    backoff: Backoff,
     redactor: Redactor,
 }
 
@@ -37,16 +33,10 @@ impl OpenAi {
     pub fn new(base_url: String, api_key: Secret, backoff: Backoff) -> Self {
         let mut redactor = Redactor::new();
         redactor.hide_value(api_key.expose());
-        let client = reqwest::blocking::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .expect("reqwest TLS client");
         Self {
-            client,
+            http: Client::new(REQUEST_TIMEOUT, backoff),
             base_url,
             api_key,
-            backoff,
             redactor,
         }
     }
@@ -55,88 +45,84 @@ impl OpenAi {
         format!("{}/responses", self.base_url.trim_end_matches('/'))
     }
 
-    fn send_once(&self, body: &VendorRequest<'_>) -> Result<Response, SendFailure> {
-        let response = self
-            .client
-            .post(self.endpoint())
-            .header("Authorization", format!("Bearer {}", self.api_key.expose()))
-            .header("Content-Type", "application/json")
-            .json(body)
-            .send()
+    fn send_once(&self, body: &VendorRequest<'_>) -> Result<Response, Failure<ProtocolError>> {
+        let url = reqwest::Url::parse(&self.endpoint()).map_err(|error| {
+            Failure::fail(ProtocolError::Fatal {
+                protocol: PROTOCOL,
+                reason: error.to_string(),
+                status: None,
+            })
+        })?;
+        let reply = self
+            .http
+            .execute(
+                "POST /responses",
+                self.http
+                    .post(url)
+                    .header("Authorization", format!("Bearer {}", self.api_key.expose()))
+                    .header("Content-Type", "application/json")
+                    .json(body),
+            )
             .map_err(|error| self.transport_error(error))?;
 
-        let status = response.status();
-        let retry_after = retry_after_delay(response.headers());
-        let text = response
-            .text()
-            .map_err(|error| self.transport_error(error))?;
-        let code = status.as_u16();
-
-        if !status.is_success() {
-            return Err(self.status_error(code, &text, retry_after));
+        let retry_after = http::retry_after(&reply.headers);
+        let code = reply.status.as_u16();
+        if !reply.status.is_success() {
+            return Err(self.status_error(code, &reply.body, retry_after));
         }
-        parse_responses_body(&text, &self.redactor).map_err(|error| {
-            if error.is_transient() {
-                SendFailure::transient(error, retry_after)
-            } else {
-                SendFailure::fatal(error)
+        parse_responses_body(&reply.body, &self.redactor).map_err(|error| {
+            match error.is_transient() {
+                true => Failure::retry(error, retry_after),
+                false => Failure::fail(error),
             }
         })
     }
 
-    fn transport_error(&self, error: reqwest::Error) -> SendFailure {
+    fn transport_error(&self, error: reqwest::Error) -> Failure<ProtocolError> {
         let reason = self.redactor.redact(&error.to_string());
-        let transient = error.is_timeout()
-            || error.is_connect()
-            || error.is_request()
-            || is_connection_reset(&error);
-        let protocol_error = if transient {
-            ProtocolError::Transient {
+        let transient = http::transport_is_transient(&error);
+        let protocol_error = match transient {
+            true => ProtocolError::Transient {
                 protocol: PROTOCOL,
                 reason,
                 status: error.status().map(|status| status.as_u16()),
-            }
-        } else {
-            ProtocolError::Fatal {
+            },
+            false => ProtocolError::Fatal {
                 protocol: PROTOCOL,
                 reason,
                 status: error.status().map(|status| status.as_u16()),
-            }
+            },
         };
-        if transient {
-            SendFailure::transient(protocol_error, None)
-        } else {
-            SendFailure::fatal(protocol_error)
+        match transient {
+            true => Failure::retry(protocol_error, None),
+            false => Failure::fail(protocol_error),
         }
     }
 
-    fn status_error(&self, status: u16, body: &str, retry_after: Option<Duration>) -> SendFailure {
-        let reason = format!("HTTP {status}: {}", snippet(body, &self.redactor));
-        if is_transient_status(status) {
-            SendFailure::transient(
+    fn status_error(
+        &self,
+        status: u16,
+        body: &str,
+        retry_after: Option<Duration>,
+    ) -> Failure<ProtocolError> {
+        let reason = format!(
+            "HTTP {status}: {}",
+            http::snippet(&self.redactor.redact(body))
+        );
+        match http::status_is_transient(status) {
+            true => Failure::retry(
                 ProtocolError::Transient {
                     protocol: PROTOCOL,
                     reason,
                     status: Some(status),
                 },
                 retry_after,
-            )
-        } else {
-            SendFailure::fatal(ProtocolError::Fatal {
+            ),
+            false => Failure::fail(ProtocolError::Fatal {
                 protocol: PROTOCOL,
                 reason,
                 status: Some(status),
-            })
-        }
-    }
-
-    fn delay(&self, failure: &SendFailure, attempt: u32) -> Duration {
-        match failure.retry_after {
-            Some(after) => after,
-            None => Duration::from_millis(
-                self.backoff
-                    .delay_with_jitter_ms(attempt, jitter_fraction()),
-            ),
+            }),
         }
     }
 }
@@ -148,70 +134,8 @@ impl Protocol for OpenAi {
 
     fn send(&self, request: &Request) -> Result<Response, ProtocolError> {
         let body = VendorRequest::from(request);
-        let attempts = self.backoff.attempts();
-        let mut last_error = None;
-        for attempt in 0..attempts {
-            tracing::debug!(
-                url = %self.endpoint(),
-                model = body.model,
-                attempt = attempt + 1,
-                attempts,
-                "POST /responses"
-            );
-            match self.send_once(&body) {
-                Ok(response) => return Ok(response),
-                Err(failure) if failure.is_transient() && attempt + 1 < attempts => {
-                    let delay = self.delay(&failure, attempt);
-                    tracing::warn!(
-                        attempt = attempt + 1,
-                        attempts,
-                        delay_ms = delay.as_millis() as u64,
-                        status = failure.status(),
-                        reason = %failure.error,
-                        "retrying model call"
-                    );
-                    std::thread::sleep(delay);
-                    last_error = Some(failure.error);
-                }
-                Err(failure) => return Err(failure.error),
-            }
-        }
-        Err(last_error.unwrap_or_else(|| ProtocolError::Transient {
-            protocol: PROTOCOL,
-            reason: "retries exhausted".to_string(),
-            status: None,
-        }))
-    }
-}
-
-struct SendFailure {
-    error: ProtocolError,
-    retry_after: Option<Duration>,
-}
-
-impl SendFailure {
-    fn transient(error: ProtocolError, retry_after: Option<Duration>) -> Self {
-        Self { error, retry_after }
-    }
-
-    fn fatal(error: ProtocolError) -> Self {
-        Self {
-            error,
-            retry_after: None,
-        }
-    }
-
-    fn is_transient(&self) -> bool {
-        self.error.is_transient()
-    }
-
-    fn status(&self) -> Option<u16> {
-        match &self.error {
-            ProtocolError::Transient { status, .. } | ProtocolError::Fatal { status, .. } => {
-                *status
-            }
-            _ => None,
-        }
+        tracing::debug!(url = %self.endpoint(), model = body.model, "POST /responses");
+        self.http.retry("POST /responses", || self.send_once(&body))
     }
 }
 
@@ -431,7 +355,10 @@ fn parse_responses_body(body: &str, redactor: &Redactor) -> Result<Response, Pro
         Ok(parsed) => parsed.into_response(redactor),
         Err(error) if error.is_eof() => Err(ProtocolError::Transient {
             protocol: PROTOCOL,
-            reason: format!("truncated response: {}", snippet(body, redactor)),
+            reason: format!(
+                "truncated response: {}",
+                http::snippet(&redactor.redact(body))
+            ),
             status: Some(200),
         }),
         Err(error) if serde_json::from_str::<serde_json::Value>(body).is_ok() => {
@@ -439,13 +366,16 @@ fn parse_responses_body(body: &str, redactor: &Redactor) -> Result<Response, Pro
                 protocol: PROTOCOL,
                 reason: format!(
                     "response JSON is the wrong shape: {error}; {}",
-                    snippet(body, redactor)
+                    http::snippet(&redactor.redact(body))
                 ),
             })
         }
         Err(_) => Err(ProtocolError::Fatal {
             protocol: PROTOCOL,
-            reason: format!("response is not JSON: {}", snippet(body, redactor)),
+            reason: format!(
+                "response is not JSON: {}",
+                http::snippet(&redactor.redact(body))
+            ),
             status: Some(200),
         }),
     }
@@ -456,7 +386,10 @@ impl VendorResponse {
         if self.output.is_none() && self.output_text.is_none() {
             return Err(ProtocolError::Malformed {
                 protocol: PROTOCOL,
-                reason: format!("response has no output: {}", snippet("{}", redactor)),
+                reason: format!(
+                    "response has no output: {}",
+                    http::snippet(&redactor.redact("{}"))
+                ),
             });
         }
         let usage = usage_from(self.usage.as_ref());
@@ -593,51 +526,6 @@ fn usage_from(usage: Option<&VendorUsage>) -> TokenUsage {
         cached_input_tokens: cached,
         output_tokens: usage.output_tokens.unwrap_or(0),
     }
-}
-
-fn is_transient_status(status: u16) -> bool {
-    status == 429 || (500..600).contains(&status)
-}
-
-fn is_connection_reset(error: &reqwest::Error) -> bool {
-    let mut source = error.source();
-    while let Some(err) = source {
-        if let Some(io) = err.downcast_ref::<std::io::Error>()
-            && matches!(
-                io.kind(),
-                ErrorKind::ConnectionReset | ErrorKind::BrokenPipe | ErrorKind::ConnectionAborted
-            )
-        {
-            return true;
-        }
-        source = err.source();
-    }
-    false
-}
-
-fn retry_after_delay(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    let raw = headers.get("retry-after")?.to_str().ok()?.trim();
-    if let Ok(seconds) = raw.parse::<u64>() {
-        return Some(Duration::from_secs(seconds));
-    }
-    let when = httpdate::parse_http_date(raw).ok()?;
-    Some(
-        when.duration_since(SystemTime::now())
-            .unwrap_or(Duration::ZERO),
-    )
-}
-
-fn snippet(text: &str, redactor: &Redactor) -> String {
-    let redacted = redactor.redact(text);
-    redacted.chars().take(ERROR_SNIPPET).collect()
-}
-
-fn jitter_fraction() -> f64 {
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|elapsed| elapsed.subsec_nanos())
-        .unwrap_or(0);
-    f64::from(nanos) / 1_000_000_000.0
 }
 
 #[cfg(test)]
@@ -825,10 +713,8 @@ mod tests {
     fn error_snippets_are_redacted() {
         let mut redactor = Redactor::new();
         redactor.hide_value("sk-testkey12xxxxxxxx");
-        let shown = snippet(
-            "Authorization: Bearer sk-testkey12xxxxxxxx leaked",
-            &redactor,
-        );
+        let shown =
+            http::snippet(&redactor.redact("Authorization: Bearer sk-testkey12xxxxxxxx leaked"));
         assert!(!shown.contains("sk-testkey12xxxxxxxx"), "{shown}");
     }
 

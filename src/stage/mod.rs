@@ -20,7 +20,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::budget::{Budget, BudgetError};
-use crate::config::{ConfigError, Secret, SecretSource, Settings};
+use crate::common::{Secret, SecretSource};
+use crate::config::{ConfigError, Settings};
 use crate::platform::{Capabilities, ChangeRef, Platform, PlatformError};
 use crate::protocol::{Protocol, ProtocolError, Request, Response};
 use crate::record::{InputIdentity, InputRecord, RecordError, Recorder};

@@ -1,10 +1,12 @@
-//! Where a credential comes from. The config never holds the credential.
+//! Where a credential comes from, and the value once it is in memory.
+//!
+//! The config file never holds the credential: it names an environment
+//! variable or a path. This module is what that pointer becomes.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use super::ConfigError;
 use super::paths::expand_tilde;
 
 /// A credential value. Never serialized, never printed, never fingerprinted.
@@ -35,6 +37,22 @@ impl fmt::Display for Secret {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum SecretError {
+    #[error("{field} is empty; give an environment variable name or a path")]
+    Empty { field: String },
+    #[error("{field} looks like the credential itself; use an environment variable name or a path")]
+    Inline { field: String },
+    #[error("{field} points at {path}, which is inside the repository under review")]
+    InsideRepo { field: String, path: PathBuf },
+    #[error("cannot read {field} from {origin}: {reason}")]
+    Unreadable {
+        field: String,
+        origin: String,
+        reason: String,
+    },
+}
+
 /// The two accepted forms of `api_key` / `api_token`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SecretSource {
@@ -46,9 +64,9 @@ impl SecretSource {
     /// Values starting with `/`, `./` or `~` are paths; anything else is an
     /// environment variable name. A value that looks like the credential
     /// itself is rejected outright.
-    pub fn parse(field: &str, value: &str) -> Result<Self, ConfigError> {
+    pub fn parse(field: &str, value: &str) -> Result<Self, SecretError> {
         if value.is_empty() {
-            return Err(ConfigError::SecretEmpty {
+            return Err(SecretError::Empty {
                 field: field.to_string(),
             });
         }
@@ -56,7 +74,7 @@ impl SecretSource {
             return Ok(SecretSource::File(expand_tilde(value)));
         }
         if looks_like_secret(value) {
-            return Err(ConfigError::SecretInline {
+            return Err(SecretError::Inline {
                 field: field.to_string(),
             });
         }
@@ -72,12 +90,12 @@ impl SecretSource {
 
     /// Read the credential into memory. `repo_root`, when known, keeps
     /// credential files from living inside the repository under review.
-    pub fn read(&self, field: &str, repo_root: Option<&Path>) -> Result<Secret, ConfigError> {
+    pub fn read(&self, field: &str, repo_root: Option<&Path>) -> Result<Secret, SecretError> {
         match self {
             SecretSource::Env(name) => {
                 std::env::var(name)
                     .map(Secret)
-                    .map_err(|_| ConfigError::SecretUnreadable {
+                    .map_err(|_| SecretError::Unreadable {
                         field: field.to_string(),
                         origin: self.describe(),
                         reason: "environment variable is not set".to_string(),
@@ -92,16 +110,16 @@ impl SecretSource {
         field: &str,
         path: &Path,
         repo_root: Option<&Path>,
-    ) -> Result<Secret, ConfigError> {
+    ) -> Result<Secret, SecretError> {
         if let Some(root) = repo_root
             && path.starts_with(root)
         {
-            return Err(ConfigError::SecretInsideRepo {
+            return Err(SecretError::InsideRepo {
                 field: field.to_string(),
                 path: path.to_path_buf(),
             });
         }
-        let unreadable = |reason: String| ConfigError::SecretUnreadable {
+        let unreadable = |reason: String| SecretError::Unreadable {
             field: field.to_string(),
             origin: self.describe(),
             reason,

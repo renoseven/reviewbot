@@ -72,7 +72,7 @@ impl PathPolicy {
     pub fn for_settings(settings: &Settings) -> Result<Self, ConfigError> {
         Self::new(
             &settings.config.security,
-            &settings.written_paths(),
+            &settings.written_paths()?,
             settings.options.worktree.as_deref(),
         )
         .map_err(|error| ConfigError::InvalidGlob {

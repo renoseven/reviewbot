@@ -243,8 +243,12 @@ impl StageFixture {
             false,
         );
         let recorder = Recorder::open(storage, meta).expect("run directory");
-        let paths = PathPolicy::new(&settings.config.security, &settings.written_paths(), None)
-            .expect("valid globs");
+        let paths = PathPolicy::new(
+            &settings.config.security,
+            &settings.written_paths().expect("cwd"),
+            None,
+        )
+        .expect("valid globs");
 
         Self {
             _root: root,

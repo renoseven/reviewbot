@@ -7,7 +7,8 @@ use globset::{Glob, GlobMatcher};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::config::{Backoff, PlatformEntry, PlatformKind, Secret};
+use crate::common::{Backoff, Secret};
+use crate::config::{PlatformEntry, PlatformKind};
 use crate::domain::Narrative;
 
 use super::http::HttpClient;
@@ -848,7 +849,7 @@ diff --git a/src/parse.c b/src/parse.c
             ))
             .and(wiremock::matchers::header(
                 "User-Agent",
-                crate::platform::http::USER_AGENT,
+                crate::common::http::USER_AGENT,
             ))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(pull_json()))
             .expect(1)
@@ -1384,7 +1385,7 @@ diff --git a/src/parse.c b/src/parse.c
                 .headers
                 .get("User-Agent")
                 .map(|value| value.to_str().expect("ascii")),
-            Some(crate::platform::http::USER_AGENT)
+            Some(crate::common::http::USER_AGENT)
         );
     }
 }

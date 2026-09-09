@@ -12,7 +12,8 @@ pub mod url;
 
 use std::sync::Arc;
 
-use crate::config::{Backoff, Config, PlatformEntry, PlatformKind, Secret, SecretSource};
+use crate::common::{Backoff, Secret, SecretSource};
+use crate::config::{Config, PlatformEntry, PlatformKind};
 use crate::domain::Narrative;
 
 pub use source::{LineRange, Listing, RepoSource, SearchHit};

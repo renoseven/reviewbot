@@ -1,6 +1,8 @@
 //! The retry schedule for transient failures. One knob (`--retries`); the
 //! curve itself is written down here and nowhere else.
 
+use std::time::{Duration, SystemTime};
+
 /// Initial 500ms, doubling, capped at 8s, jitter applied by the caller so the
 /// curve stays a pure function.
 #[derive(Clone, Copy, Debug)]
@@ -35,6 +37,23 @@ impl Backoff {
         let base = self.delay_ms(attempt) as f64;
         (base * fraction.clamp(0.0, 1.0)) as u64
     }
+
+    /// Sleep duration after a failed attempt. Honours `Retry-After` when the
+    /// peer sent one; otherwise the jittered curve.
+    pub fn delay_now(&self, attempt: u32, retry_after: Option<Duration>) -> Duration {
+        match retry_after {
+            Some(after) => after,
+            None => Duration::from_millis(self.delay_with_jitter_ms(attempt, jitter_fraction())),
+        }
+    }
+}
+
+fn jitter_fraction() -> f64 {
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos())
+        .unwrap_or(0);
+    f64::from(nanos) / 1_000_000_000.0
 }
 
 #[cfg(test)]
@@ -55,5 +74,14 @@ mod tests {
         assert_eq!(backoff.delay_with_jitter_ms(1, 0.0), 0);
         assert_eq!(backoff.delay_with_jitter_ms(1, 0.5), 500);
         assert_eq!(backoff.delay_with_jitter_ms(1, 1.0), 1000);
+    }
+
+    #[test]
+    fn retry_after_wins_over_the_curve() {
+        let backoff = Backoff::new(2);
+        assert_eq!(
+            backoff.delay_now(0, Some(Duration::from_secs(3))),
+            Duration::from_secs(3)
+        );
     }
 }

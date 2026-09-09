@@ -16,8 +16,9 @@ use std::time::{Duration, Instant};
 use regex::Regex;
 use serde_json::{Map, Value};
 
-use crate::config::{Backoff, ToolEntry};
-use crate::security::{EnvPolicy, Limits, PathPolicy, truncate};
+use crate::common::{Backoff, truncate};
+use crate::config::ToolEntry;
+use crate::security::{EnvPolicy, Limits, PathPolicy};
 use crate::worktree::{Abilities, WorktreeSource};
 
 use super::availability::unavailable_description;

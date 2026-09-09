@@ -8,7 +8,8 @@ pub mod openai;
 use serde::{Deserialize, Serialize};
 
 use crate::budget::{TokenUsage, estimate_tokens};
-use crate::config::{Backoff, KNOWN_PROTOCOLS, Provider, Secret};
+use crate::common::{Backoff, Secret};
+use crate::config::{KNOWN_PROTOCOLS, Provider};
 
 pub use openai::OpenAi;
 

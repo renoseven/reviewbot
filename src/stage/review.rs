@@ -15,10 +15,11 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::budget::estimate_tokens;
+use crate::common::truncate;
 use crate::domain::Narrative;
 use crate::protocol::{InputItem, Request, Role, ToolSchema};
 use crate::record::{ContextFile, ToolCall, Trace};
-use crate::security::{Redactor, truncate};
+use crate::security::Redactor;
 use crate::tool::{Purpose, Registry, Round, SubmitComment, ToolError};
 use crate::worktree::{Abilities, Content, Reach};
 

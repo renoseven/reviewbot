@@ -20,10 +20,11 @@ use std::sync::Arc;
 use globset::Glob;
 use serde_json::Value;
 
+use crate::common::truncate;
 use crate::config::Config;
 use crate::platform::LineRange;
 use crate::record::ContextFile;
-use crate::security::{PathPolicy, truncate};
+use crate::security::PathPolicy;
 use crate::worktree::{Abilities, Content, Reach, Search, WorktreeError, WorktreeSource};
 
 use super::availability::unavailable_description;

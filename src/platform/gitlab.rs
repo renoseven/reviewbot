@@ -7,7 +7,8 @@ use globset::Glob;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::config::{Backoff, PlatformEntry, PlatformKind, Secret};
+use crate::common::{Backoff, Secret};
+use crate::config::{PlatformEntry, PlatformKind};
 use crate::domain::{DEV_NULL, Narrative};
 
 use super::http::HttpClient;

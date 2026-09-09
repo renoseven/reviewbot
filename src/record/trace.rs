@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::budget::TokenUsage;
-use crate::security::truncate;
+use crate::common::truncate;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct Trace {

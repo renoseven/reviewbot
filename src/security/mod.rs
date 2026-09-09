@@ -9,9 +9,8 @@
 pub mod path;
 pub mod redact;
 pub mod subprocess;
-pub mod truncate;
 
+pub use crate::common::{Truncated, truncate};
 pub use path::{PathPolicy, PathRejection};
 pub use redact::Redactor;
 pub use subprocess::{EnvPolicy, Limits};
-pub use truncate::{Truncated, truncate};

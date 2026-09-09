@@ -2,10 +2,11 @@
 //! entries. `publish_run` and `render_report` replay checkpoints.
 //!
 //! `stage::*` -> adapters (`platform` / `worktree` / `protocol` / `tool`) ->
-//! infrastructure (`config` / `security` / `budget` / `record`) -> `domain`.
-//! The order of the five stages exists only in `review` and `resume`.
+//! infrastructure (`common` / `config` / `security` / `budget` / `record`) ->
+//! `domain`. The order of the five stages exists only in `review` and `resume`.
 
 pub mod budget;
+pub(crate) mod common;
 pub mod config;
 pub mod domain;
 pub mod platform;

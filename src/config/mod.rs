@@ -2,26 +2,25 @@
 //! model -> provider -> protocol chain, compute the fingerprint, and say
 //! where credentials come from.
 //!
-//! Nothing here reaches the network and nothing here holds a credential
-//! beyond the caller's own `Secret`.
+//! Nothing here reaches the network. Credential *values* live in `common`;
+//! this module only stores the pointer the TOML named.
 
 pub mod file;
 pub mod fingerprint;
 pub mod paths;
-pub mod retry;
-pub mod secret;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use globset::Glob;
 
+use crate::common::{Secret, SecretSource};
+
+pub use crate::common::Backoff;
 pub use file::{
     Config, Model, ParamKind, ParamSpec, PlatformEntry, PlatformKind, Provider, ReviewSettings,
     SecuritySettings, ToolEntry, TriageSettings, builtin_kind,
 };
-pub use retry::Backoff;
-pub use secret::{Secret, SecretSource};
 
 /// Wire protocols this binary can speak. `protocol` resolves the same list;
 /// it is named here so `config` never has to look up at the adapter layer.
@@ -164,18 +163,8 @@ pub enum ConfigError {
         "tool {tool:?} sets requires_build, which needs [security].allow_build_tools and a sandbox"
     )]
     ToolBuildNotAllowed { tool: String },
-    #[error("{field} is empty; give an environment variable name or a path")]
-    SecretEmpty { field: String },
-    #[error("{field} looks like the credential itself; use an environment variable name or a path")]
-    SecretInline { field: String },
-    #[error("{field} points at {path}, which is inside the repository under review")]
-    SecretInsideRepo { field: String, path: PathBuf },
-    #[error("cannot read {field} from {origin}: {reason}")]
-    SecretUnreadable {
-        field: String,
-        origin: String,
-        reason: String,
-    },
+    #[error(transparent)]
+    Secret(#[from] crate::common::SecretError),
 }
 
 /// The model entry chosen for this run, together with the provider it hangs
@@ -249,9 +238,13 @@ impl Settings {
     /// Read and validate the file. `config_path` is the only path source;
     /// `None` means the XDG default, never the current directory.
     pub fn load(config_path: Option<&Path>, options: RunOptions) -> Result<Self, ConfigError> {
-        let path = config_path
-            .map(paths::absolute)
-            .unwrap_or_else(paths::default_config_path);
+        let path = match config_path {
+            Some(path) => std::path::absolute(path).map_err(|source| ConfigError::Unreadable {
+                path: path.to_path_buf(),
+                source,
+            })?,
+            None => paths::default_config_path(),
+        };
         if !path.exists() {
             return Err(ConfigError::Missing { path });
         }
@@ -277,7 +270,8 @@ impl Settings {
     /// warns. In CI nobody writes that path.
     fn warn_about_worktree_config(&self) {
         if let Some(worktree) = &self.options.worktree
-            && self.config_path.starts_with(paths::absolute(worktree))
+            && let Ok(root) = std::path::absolute(worktree)
+            && self.config_path.starts_with(root)
         {
             tracing::warn!(
                 config = %self.config_path.display(),
@@ -303,17 +297,23 @@ impl Settings {
     pub fn selected_api_key(&self) -> Result<Secret, ConfigError> {
         let provider = self.selection()?.provider;
         let field = format!("provider.{}.api_key", provider.name);
-        SecretSource::parse(&field, &provider.api_key)?
-            .read(&field, self.options.worktree.as_deref())
+        Ok(SecretSource::parse(&field, &provider.api_key)?
+            .read(&field, self.options.worktree.as_deref())?)
     }
 
     /// Paths reviewbot writes to this run, which are always denied for reads.
-    pub fn written_paths(&self) -> Vec<PathBuf> {
-        let mut written = vec![paths::absolute(&self.options.runs_dir)];
+    pub fn written_paths(&self) -> Result<Vec<PathBuf>, ConfigError> {
+        let to_abs = |path: &Path| {
+            std::path::absolute(path).map_err(|source| ConfigError::Unreadable {
+                path: path.to_path_buf(),
+                source,
+            })
+        };
+        let mut written = vec![to_abs(&self.options.runs_dir)?];
         if let Some(out_dir) = &self.options.out_dir {
-            written.push(paths::absolute(out_dir));
+            written.push(to_abs(out_dir)?);
         }
-        written
+        Ok(written)
     }
 }
 
