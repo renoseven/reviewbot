@@ -12,6 +12,15 @@ use reviewbot::{Error, RunResult};
 
 use super::args::Format;
 
+/// The widest label in a run summary. The live screen uses the same prefix,
+/// because its temporary rows should not jump sideways when the final rows
+/// replace them.
+pub(super) const SUMMARY_LABEL_WIDTH: usize = 10;
+
+pub(super) fn push_summary_line(out: &mut String, label: &str, value: &str) {
+    out.push_str(&format!("{label:<SUMMARY_LABEL_WIDTH$} {value}\n"));
+}
+
 /// stdout for a finished run.
 pub fn run_result(result: &RunResult, format: Format) -> String {
     let text = match format {
@@ -24,19 +33,25 @@ pub fn run_result(result: &RunResult, format: Format) -> String {
 
 fn text_summary(result: &RunResult) -> String {
     let mut out = String::new();
-    out.push_str(&format!("run_id     {}\n", result.run_id));
-    out.push_str(&format!("model      {}\n", result.model));
+    push_summary_line(&mut out, "run_id", &result.run_id);
+    push_summary_line(&mut out, "model", &result.model);
     match (result.overall_score, &result.summary) {
-        (Some(score), _) => out.push_str(&format!(
-            "overall    {score} / 100  (the model's judgement of what this run found)\n"
-        )),
-        (None, _) => out.push_str(&format!(
-            "overall    not scored  ({})\n",
-            result
-                .unscored_reason
-                .as_deref()
-                .unwrap_or("no reason given")
-        )),
+        (Some(score), _) => push_summary_line(
+            &mut out,
+            "overall",
+            &format!("{score} / 100  (the model's judgement of what this run found)"),
+        ),
+        (None, _) => push_summary_line(
+            &mut out,
+            "overall",
+            &format!(
+                "not scored  ({})",
+                result
+                    .unscored_reason
+                    .as_deref()
+                    .unwrap_or("no reason given")
+            ),
+        ),
     }
     let severity = Severity::ALL
         .iter()
@@ -48,30 +63,52 @@ fn text_summary(result: &RunResult) -> String {
         .map(|band| format!("{band} {}", result.count(*band)))
         .collect::<Vec<_>>()
         .join(" / ");
-    out.push_str(&format!("comments   {}\n", result.comments.len()));
-    out.push_str(&format!("severity   {severity}\n"));
-    out.push_str(&format!("confidence {bands}\n"));
-    out.push_str(&format!("skipped    {} files\n", result.skipped.len()));
+    push_summary_line(&mut out, "comments", &result.comments.len().to_string());
+    push_summary_line(&mut out, "severity", &severity);
+    push_summary_line(&mut out, "confidence", &bands);
+    push_summary_line(
+        &mut out,
+        "skipped",
+        &format!("{} files", result.skipped.len()),
+    );
     if !result.unreviewed.is_empty() {
-        out.push_str(&format!("unreviewed {} files\n", result.unreviewed.len()));
+        push_summary_line(
+            &mut out,
+            "unreviewed",
+            &format!("{} files", result.unreviewed.len()),
+        );
     }
     if let Some(reason) = &result.stopped {
-        out.push_str(&format!("stopped    {reason}\n"));
+        push_summary_line(&mut out, "stopped", reason);
     }
     match result.budget {
-        Some(ceiling) => out.push_str(&format!(
-            "budget     {:.4} / {:.4} {}\n",
-            result.spent, ceiling, result.currency
-        )),
-        None => out.push_str(&format!(
-            "budget     {:.4} {} (no ceiling)\n",
-            result.spent, result.currency
-        )),
+        Some(ceiling) => push_summary_line(
+            &mut out,
+            "budget",
+            &format!("{:.4} / {:.4} {}", result.spent, ceiling, result.currency),
+        ),
+        None => push_summary_line(
+            &mut out,
+            "budget",
+            &format!("{:.4} {} (no ceiling)", result.spent, result.currency),
+        ),
     }
-    out.push_str(&format!("report     {}\n", result.report_path.display()));
-    out.push_str(&format!("summary    {}\n", result.summary_path.display()));
+    push_summary_line(
+        &mut out,
+        "report",
+        &result.report_path.display().to_string(),
+    );
+    push_summary_line(
+        &mut out,
+        "summary",
+        &result.summary_path.display().to_string(),
+    );
     if !result.published.is_empty() {
-        out.push_str(&format!("published  {} comments\n", result.published.len()));
+        push_summary_line(
+            &mut out,
+            "published",
+            &format!("{} comments", result.published.len()),
+        );
     }
     out
 }

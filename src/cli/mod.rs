@@ -3,8 +3,9 @@
 
 pub mod args;
 pub mod render;
+mod status;
 
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -17,6 +18,7 @@ use args::{
     Cli, Command, ConfigCommand, GlobalArgs, ModelCommand, PlatformCommand, ProviderCommand,
     ReviewArgs, RunCommand, ToolCommand,
 };
+use status::Status;
 
 /// Parse, set up tracing, dispatch, and turn whatever comes back into an
 /// exit code. Successful runs write nothing to stderr.
@@ -68,10 +70,19 @@ fn dispatch(cli: &Cli) -> Result<Finished, Error> {
         Command::Review(review) => {
             let settings = load(&cli.global, review_options(&cli.global, review))?;
             let source = read_source(&review.target)?;
-            // Nothing watches a run yet: the status screen is the next step,
-            // and until it exists the live word on a run is the tracing
-            // output `init_tracing` set up.
-            let result = reviewbot::review(&settings, &source, &Silent)?;
+            let quiet = cli.global.quiet || cli.global.format == args::Format::Json;
+            let result = if quiet {
+                reviewbot::review(&settings, &source, &Silent)
+            } else {
+                let tty = std::io::stdout().is_terminal();
+                let status = Status::new(std::io::stdout(), tty, !cli.global.no_color);
+                let result = reviewbot::review(&settings, &source, &status);
+                // A failure also has to take the live block away before its
+                // message reaches stderr; otherwise the cursor is left below
+                // a stale run that appears to still be active.
+                status.finish();
+                result
+            }?;
             Ok(Finished {
                 output: render::run_result(&result, cli.global.format),
                 exit_code: result.exit_code(),
@@ -183,7 +194,7 @@ fn init_tracing(global: &GlobalArgs) {
         .with_env_filter(filter)
         .with_target(false)
         .without_time()
-        .with_ansi(!global.no_color && std::io::IsTerminal::is_terminal(&std::io::stdout()));
+        .with_ansi(!global.no_color && std::io::stdout().is_terminal());
     // JSON stdout must stay parseable: progress goes nowhere, same as `-q`.
     if global.quiet || global.format == args::Format::Json {
         let _ = builder.with_writer(std::io::sink).try_init();

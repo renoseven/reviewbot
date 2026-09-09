@@ -164,6 +164,68 @@ fn the_input_format_is_judged_by_content_not_by_extension() {
     );
 }
 
+/// A subprocess is the lowest layer that can prove stdout is a pipe. A zero
+/// budget keeps this offline while still completing all six stages and
+/// producing the ordinary final summary after the retained progress history.
+#[test]
+fn a_piped_review_appends_progress_then_the_text_summary() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let config = directory.path().join("reviewbot.toml");
+    let configured = std::fs::read_to_string(fixture("valid.toml"))
+        .expect("fixture")
+        .replace("budget_per_run = 10.0", "budget_per_run = 0.0");
+    std::fs::write(&config, configured).expect("config");
+    let diff = directory.path().join("change.diff");
+    std::fs::write(
+        &diff,
+        "\
+--- a/src/parse.c
++++ b/src/parse.c
+@@ -1,1 +1,2 @@
+ int before(void);
++int added(void);
+",
+    )
+    .expect("diff");
+    let runs = directory.path().join("runs");
+
+    let output = reviewbot()
+        .args(["--config", config.to_str().unwrap()])
+        .args(["--runs-dir", runs.to_str().unwrap()])
+        .args(["review", diff.to_str().unwrap()])
+        .output()
+        .expect("run");
+
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    assert!(output.stderr.is_empty(), "finished runs write no stderr");
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    assert!(
+        stdout.contains("[1/6] input     1 files\n"),
+        "the pipe retains finished stages: {stdout}"
+    );
+    assert!(
+        stdout.contains("[6/6] publish   nothing posted"),
+        "all six stages reach the pipe: {stdout}"
+    );
+
+    let summary = stdout
+        .split_once("run_id     ")
+        .map(|(_, summary)| summary)
+        .expect("final text summary");
+    let fields: Vec<&str> = summary.lines().collect();
+    assert!(fields[0].len() >= 16, "run id has a value: {summary}");
+    assert_eq!(fields[1], "model      deepseek-v4-flash");
+    assert!(fields.iter().any(|line| line.starts_with("comments   ")));
+    assert!(fields.iter().any(|line| line.starts_with("budget     ")));
+    assert!(fields.iter().any(|line| line.starts_with("report     ")));
+    assert!(
+        fields
+            .last()
+            .is_some_and(|line| line.starts_with("summary    ")),
+        "the canonical summary is last: {summary}"
+    );
+}
+
 #[test]
 fn a_target_that_is_neither_a_url_nor_a_file_says_so() {
     let output = reviewbot()
