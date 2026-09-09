@@ -313,7 +313,8 @@ fn tool_list_exits_zero_on_a_valid_config() {
         stdout.contains("read_file(path, [first_line, last_line])"),
         "{stdout}"
     );
-    assert!(stdout.contains("gcc(path)"), "{stdout}");
+    assert!(stdout.contains("cppcheck(path)"), "{stdout}");
+    assert!(stdout.contains("typecheck(path)"), "{stdout}");
     assert!(stdout.contains("Submit one finding"), "{stdout}");
     assert!(stdout.contains("rounds    investigation"), "{stdout}");
     assert!(stdout.contains("rounds    scoring"), "{stdout}");

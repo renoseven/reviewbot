@@ -123,7 +123,7 @@ This repo does not ship a canned PR report. Produce one by pointing `review` at 
 
 ## Add a tool without recompiling
 
-Uncomment the extra `[[tool]]` block in [`examples/reviewbot.toml`](examples/reviewbot.toml) (cppcheck). `tool list` will show its contract. The default enabled checker is `gcc -fsyntax-only` (`requires_build = false`), and it sets `requires_checkout = true`: a compiler needs the whole project, so it is not registered for a run whose worktree only holds the files fetched so far — a `.c` file without its headers produces a screen of missing includes, which is worse than not running. A checker that reads one file on its own leaves `requires_checkout` unset and runs either way. A `requires_build` tool also needs `[security].allow_build_tools` and a sandbox.
+[`examples/reviewbot.toml`](examples/reviewbot.toml) ships two checkers. `cppcheck` (`requires_build = false`, `requires_checkout` unset) reads one C/C++ file on its own, so it is registered either way. `typecheck` is the brief's named example of adding a tool without recompiling: another `[[tool]]` row, `gcc -fsyntax-only`, `requires_checkout = true` because a `.c` file without its headers produces a screen of missing includes, which is worse than not running. `tool list` prints both contracts. A `requires_build` tool also needs `[security].allow_build_tools` and a sandbox.
 
 ## Known limits
 

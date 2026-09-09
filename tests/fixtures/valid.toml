@@ -47,10 +47,21 @@ deny_paths = ["secrets/**", "**/*.tfvars"]
 allow_extensions = ["c", "h", "rs", "toml", "md"]
 
 [[tool]]
-name = "gcc"
-description = "compile one C file with warnings, no object file (gcc -fsyntax-only)"
+name = "cppcheck"
+description = "static analysis for one C/C++ file: memory, bounds, uninitialized values (no compile)"
+bin = "/usr/bin/cppcheck"
+args = ["--enable=warning,style", "--template=gcc", "--quiet", "--", "{path}"]
+params.path = { type = "path" }
+requires_checkout = false
+requires_build = false
+timeout_ms = 60000
+
+[[tool]]
+name = "typecheck"
+description = "type-check one C file with gcc -fsyntax-only (no object file)"
 bin = "/usr/bin/gcc"
 args = ["-Wall", "-Wextra", "-fsyntax-only", "--", "{path}"]
 params.path = { type = "path" }
 requires_checkout = true
+requires_build = false
 timeout_ms = 60000
