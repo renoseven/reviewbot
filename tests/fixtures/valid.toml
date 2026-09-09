@@ -44,7 +44,17 @@ skip_paths = ["**/*.lock", "vendor/**"]
 
 [security]
 deny_paths = ["secrets/**", "**/*.tfvars"]
-allow_extensions = ["c", "h", "rs", "toml", "md"]
+allow_extensions = [
+    "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx",
+    "rs", "go", "java", "kt", "kts", "scala", "cs", "swift", "zig",
+    "m", "mm",
+    "py", "pyi", "rb", "php", "lua", "pl", "sh",
+    "js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx", "vue", "svelte",
+    "html", "htm", "xhtml", "hbs", "ejs", "njk", "twig", "erb", "pug",
+    "css", "scss",
+    "sql", "proto", "dart", "ex", "exs", "hs",
+    "toml", "cmake", "tf", "nix",
+]
 
 [[tool]]
 name = "cppcheck"
