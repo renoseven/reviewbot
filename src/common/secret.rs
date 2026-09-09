@@ -7,8 +7,6 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use super::paths::expand_tilde;
-
 /// A credential value. Never serialized, never printed, never fingerprinted.
 #[derive(Clone)]
 pub struct Secret(String);
@@ -71,7 +69,9 @@ impl SecretSource {
             });
         }
         if value.starts_with('/') || value.starts_with("./") || value.starts_with('~') {
-            return Ok(SecretSource::File(expand_tilde(value)));
+            return Ok(SecretSource::File(PathBuf::from(
+                shellexpand::tilde(value).as_ref(),
+            )));
         }
         if looks_like_secret(value) {
             return Err(SecretError::Inline {
@@ -217,5 +217,15 @@ mod tests {
             SecretSource::parse("api_key", "/etc/reviewbot/openai.key").unwrap(),
             SecretSource::File(_)
         ));
+        let SecretSource::File(path) = SecretSource::parse("api_key", "~/.reviewbot/key").unwrap()
+        else {
+            panic!("tilde is a path");
+        };
+        assert!(
+            path.ends_with(".reviewbot/key"),
+            "tilde expands: {}",
+            path.display()
+        );
+        assert!(!path.starts_with("~"), "{}", path.display());
     }
 }

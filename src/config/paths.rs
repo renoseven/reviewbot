@@ -2,10 +2,8 @@
 
 use std::path::PathBuf;
 
-use crate::common::paths::home_dir;
-
 fn default_root() -> PathBuf {
-    home_dir()
+    dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".reviewbot")
 }
@@ -26,7 +24,7 @@ mod tests {
 
     #[test]
     fn defaults_live_under_dot_reviewbot() {
-        let home = crate::common::paths::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         assert_eq!(
             default_config_path(),
             home.join(".reviewbot").join("config.toml")

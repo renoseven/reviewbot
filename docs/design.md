@@ -1501,7 +1501,7 @@ code-review:
 
 crate 同时产出 `lib` 与 `bin` 两个 target。**业务逻辑一律针对 lib 测试**；只有输出流分配、退出码这类 CLI 契约必须起子进程才验得了，用一小组 `assert_cmd` 集成测试覆盖。
 
-依赖：`tokio`、`reqwest`(rustls)、`serde`/`serde_json`、`toml`、`clap`、`sha2`、`regex`、`thiserror`、`tracing`；dev-dependency 加 `assert_cmd`。
+依赖：`tokio`、`reqwest`(rustls)、`serde`/`serde_json`、`toml`、`clap`、`sha2`、`regex`、`thiserror`、`tracing`、`dirs`、`shellexpand`；dev-dependency 加 `assert_cmd`。
 
 测试必须能离线跑，否则 [§13](#13-验收) 的验收无法自动化。测试时适配器全换成假实现，`review()` 就能带着五个阶段整套在本地跑完。
 
