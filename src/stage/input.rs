@@ -11,14 +11,11 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{ChangeSet, DEV_NULL, FileChange, Hunk, Locator, Narrative};
+use crate::domain::{ChangeSet, DEV_NULL, FileChange, Hunk, Locator, Narrative, Stage};
 use crate::platform::ChangeRef;
 use crate::record::{InputIdentity, InputKind, InputRecord};
 
 use super::{Adapters, StageContext, StageError};
-
-pub const NUMBER: u8 = 1;
-pub const NAME: &str = "input";
 
 /// What the positional argument turned out to be. `http(s)://` is a platform
 /// URL, `-` is standard input, anything else is a diff file.
@@ -100,7 +97,7 @@ impl Input {
             files = changeset.files.len(),
             "input normalized into a change set"
         );
-        context.complete(NUMBER, NAME, &changeset)?;
+        context.complete(Stage::Input, &changeset)?;
         Ok(changeset)
     }
 

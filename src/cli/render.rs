@@ -12,6 +12,15 @@ use reviewbot::{Error, RunResult};
 
 use super::args::Format;
 
+/// Stages as a person reads them, in the order the run walks them.
+fn stage_list(stages: &[reviewbot::domain::Stage]) -> String {
+    stages
+        .iter()
+        .map(|stage| stage.name())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The widest label in a run summary. The live screen uses the same prefix,
 /// because its temporary rows should not jump sideways when the final rows
 /// replace them.
@@ -225,7 +234,7 @@ pub fn run_list(runs_dir: &Path, format: Format) -> Result<String, Error> {
                     vec![
                         row.run_id.clone(),
                         truncate(&row.input, 40),
-                        row.completed_stages.join(", "),
+                        stage_list(&row.completed_stages),
                         money(row.spent, &row.currency, 4),
                         format_unix_utc(row.updated_at),
                     ]
@@ -253,7 +262,7 @@ pub fn run_show(runs_dir: &Path, run_id: &str, format: Format) -> Result<String,
             out.push_str(&format!("model      {}\n", show.model));
             out.push_str(&format!(
                 "stages     {}\n",
-                show.completed_stages.join(", ")
+                stage_list(&show.completed_stages)
             ));
             let bands = show
                 .comments

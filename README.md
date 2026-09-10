@@ -61,7 +61,9 @@ A run always has exactly one worktree. With `--worktree` it is that checkout, wh
 
 Inside one run directory: `report.md`, `summary.json`, `stages/`, `traces/`, `published.json`, `worktree/`, and `log` — every line of tracing this run produced, appended, at the level `[log] level` asks for (`RUST_LOG` overrides). Nothing tracing writes reaches stdout or stderr. `run show` prints the log path.
 
-While a review runs, a terminal gets a live block whose fields are the ones the final summary prints, filled in as they become known, with a line underneath saying what is happening right now. A pipe gets one line per chunk and one per finished stage instead. `--format json` makes stdout a single JSON document with the live block suppressed; `-q` silences stdout entirely, live block included.
+While a review runs, a terminal gets a fixed-height live checklist: a title, all six stages, then three activity rows at the bottom. The review row counts chunks and files separately and carries current spend. The animated activity line says whether reviewbot is waiting for the model (`exchange 3/12`) or running a tool; completed tools remain visible as a per-chunk tally. The block is cleared before the final summary or an error is printed. If the terminal cannot support the inline viewport, reviewbot warns in the run log and falls back to plain appended lines.
+
+A pipe deliberately keeps less: one run header, one line per chunk (with spend), and one line per finished stage. Exchanges, tool calls, and spend updates do not each create another log line. `--format json` makes stdout a single JSON document with progress suppressed; `-q` silences stdout entirely, progress included.
 
 ```bash
 reviewbot --config examples/reviewbot.toml --format json -q review change.diff --output-dir artifacts/

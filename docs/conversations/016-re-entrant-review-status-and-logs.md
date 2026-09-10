@@ -137,3 +137,28 @@
 - **`design.md` 里那段被推翻的论证是重写不是打补丁。** 它原本论证的是「`publish` 兼写报告与发帖是正当的」，而拆分恰恰是反过来的结论；留着原句改几个词只会得到一段自相矛盾的话
 - **`tests/fixtures/valid.toml` 不补 `[log]`。** 它不写这一段，CLI 用例就顺带覆盖了「整段缺失退回 `info`」这条路径；`examples/reviewbot.toml` 是给人抄的文档，那份要写全
 - `docs/conversations/001-015` 是历史记录，不动
+
+---
+
+## 状态屏定型，阶段进度收成前缀
+
+**意图**：
+- 状态输出要有标题；要说清共有多少文件、已经看了多少；明显循环的动画放在底部活动区
+- 裸写 `round 3/12` 让人看不懂，工具调用也不能继续隐形；有充分理由可以采用 TUI 框架
+- 读代码时把 stage 改成 enum；阶段既然有固定顺序，`completed_stages: Vec<Stage>` 不是正确形状，`number()` 也不该写六臂 `match`
+
+**步骤**：
+- 代码把编号与名字合并为 `domain::Stage`；六个显式判别值保持 checkpoint 编号，序列化保持原阶段名，调用点不再传一对可能配错的参数
+- `meta.json` 改记 `completed_through: Option<Stage>`；给人看的完成清单按需从前缀展开，旧 run 缺字段时按未完成重算
+- progress 事件改为携带类型化 `Outcome`、worktree 与 tool 完成耗时；终端不再从英文句子反解析状态
+- TTY 改为 ratatui inline viewport：标题、六阶段、三活动行固定十行，由只负责绘制的线程约每 100ms 刷新；pipe 只保留 run header、每个 chunk 与每个完成阶段
+- `docs/design.md` 重写输出、串行预算约束、可恢复状态与依赖/测试说明，并换入真实 PTY 帧；`README.md` 补齐终端与 pipe 行为
+
+**决策**：
+- **用 ratatui inline viewport，不手写 ANSI 重绘。** 屏幕状态、布局与终端接管交给已有抽象，测试可用 `TestBackend` 直接核帧
+- **高度固定。** ratatui 创建 inline viewport 后不能调整高度（ratatui#984），所以十行从第一帧就保留；不调用 `insert_before`，因为连续重画时窗口 resize 会把 viewport 重复进 scrollback（ratatui#2666）
+- **动画由 draw-only 线程驱动。** 模型调用会阻塞流水线几十秒，事件驱动画面会在最需要反馈时冻结；绘制线程不运行阶段、不调用模型、不碰预算或 checkpoint，因此不违反为保护调用前预算检查而定的串行规则
+- **claim 失败退回 pipe。** inline viewport 需要查询光标位置，有些伪终端不回答；这时在 run 日志记 `warn` 并输出追加行，不能让运行过程失声
+- **`exchange` 只属于等待行。** 它表达模型与工具的一次往返，分母是撞上就提前结束 chunk 的上限，不是预计轮数；正在跑的工具放 spinner 行，已完成工具按 chunk 汇总
+- **完成状态只能是前缀。** `completed_through` 排除了不可能的离散集合，并让 `mark_incomplete` 真正把损坏阶段及其全部下游一起作废；后续结论依赖那份不可读 checkpoint，不能单独留下
+- **编号取 `#[repr(u8)]` 的显式判别值。** `number()` 直接转换，声明顺序同时给出 `Ord`；名字仍单独映射并作为序列化格式，从而不改旧 trace 与 checkpoint 文件名

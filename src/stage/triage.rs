@@ -9,14 +9,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::budget::{estimate_ascii_tokens, estimate_tokens};
 use crate::config::{Config, ConfigError, Model, PROMPT_SKELETON_TOKENS, TriageSettings};
-use crate::domain::{ChangeSet, DEV_NULL, FileChange};
+use crate::domain::{ChangeSet, DEV_NULL, FileChange, Stage};
 use crate::security::PathPolicy;
 use crate::tool::Registry;
 
 use super::{StageContext, StageError};
-
-pub const NUMBER: u8 = 2;
-pub const NAME: &str = "triage";
 
 /// Slack on top of the character based token estimate, which is conservative
 /// but not exact. One reserve for the whole formula rather than a fudge
@@ -337,7 +334,7 @@ impl Triage {
             prompt_tokens,
             "triage done"
         );
-        context.complete(NUMBER, NAME, &plan)?;
+        context.complete(Stage::Triage, &plan)?;
         Ok(plan)
     }
 

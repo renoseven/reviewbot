@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::budget::estimate_tokens;
 use crate::common::truncate;
-use crate::domain::Narrative;
+use crate::domain::{Narrative, Stage};
 use crate::progress::Event;
 use crate::protocol::{InputItem, Request, Role, ToolSchema};
 use crate::record::{ContextFile, ToolCall, Trace};
@@ -28,9 +28,6 @@ use super::orient::Orientation;
 use super::prompt::{CappedList, Fence, Keep, Overflow, Prompts, code_ref};
 use super::triage::TriagePlan;
 use super::{StageContext, StageError};
-
-pub const NUMBER: u8 = 3;
-pub const NAME: &str = "review";
 
 /// One chunk's raw model output, kept unprocessed for `merge` to parse.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -209,7 +206,7 @@ impl Review {
                 Err(other) => return Err(other),
             }
         }
-        context.complete(NUMBER, NAME, &output)?;
+        context.complete(Stage::Review, &output)?;
         Ok(output)
     }
 
@@ -262,8 +259,13 @@ impl Review {
         // one and every comment from the earlier piece would point at the
         // wrong evidence. A whole file keeps the plain name.
         let trace_id = match chunk.is_split() {
-            true => format!("{}-{}-{}", NAME, path.replace('/', "_"), chunk.piece + 1),
-            false => format!("{}-{}", NAME, path.replace('/', "_")),
+            true => format!(
+                "{}-{}-{}",
+                Stage::Review,
+                path.replace('/', "_"),
+                chunk.piece + 1
+            ),
+            false => format!("{}-{}", Stage::Review, path.replace('/', "_")),
         };
         let mut trace = Trace::new(trace_id.clone());
         trace.diff = redacted.clone();
@@ -291,7 +293,7 @@ impl Review {
             });
             // Into the trace verbatim: without it a reader cannot tell why a
             // piece knew about findings it never made.
-            trace.note(NAME, preface);
+            trace.note(Stage::Review, preface);
         }
         input.push(InputItem::Message {
             role: Role::User,
@@ -452,6 +454,10 @@ impl Review {
                 arguments,
                 path,
             );
+            context.progress.emit(Event::ToolDone {
+                name: name.clone(),
+                ms: call.duration_ms,
+            });
             if let Some(file) = call.context_file {
                 chat.trace.context_files.push(file);
             }
@@ -578,7 +584,7 @@ impl Conversation {
     /// One line on this chunk's trace. Everything a stage writes down goes
     /// through here, so what a stage owns is one thing rather than a habit.
     fn note(&mut self, note: String) {
-        self.trace.note(NAME, note);
+        self.trace.note(Stage::Review, note);
     }
 
     /// A checker that could have answered and never was called is a trace
@@ -599,7 +605,7 @@ impl Conversation {
         }
         let names = usable.join(", ");
         self.trace.note(
-            NAME,
+            Stage::Review,
             format!("external checkers were available ({names}) and the model called none of them"),
         );
         Some(UnusedCheckers {
@@ -752,7 +758,7 @@ fn clip(text: &str, chars: usize) -> String {
 /// a reader looking at forty traces does not want them forty times.
 fn chat_check(trace: &mut Trace, preface: &str) {
     trace.note(
-        NAME,
+        Stage::Review,
         format!(
             "the change description went out as material ({} bytes)",
             preface.len()
@@ -1397,7 +1403,7 @@ mod tests {
             .expect("the trace is on disk");
         assert!(
             trace
-                .notes_by(NAME)
+                .notes_by(Stage::Review)
                 .iter()
                 .any(|check| check.contains("called none of them")),
             "{:?}",
@@ -1527,7 +1533,7 @@ mod tests {
         assert!(trace.tool_calls[0].succeeded);
         assert!(
             trace
-                .notes_by(NAME)
+                .notes_by(Stage::Review)
                 .iter()
                 .any(|note| note.contains("nothing to file")),
             "{:?}",
@@ -1804,7 +1810,7 @@ mod tests {
             .expect("the trace is on disk");
         assert!(
             trace
-                .notes_by(NAME)
+                .notes_by(Stage::Review)
                 .iter()
                 .any(|check| check.contains("the conversation reached")),
             "{:?}",
@@ -1923,7 +1929,7 @@ mod tests {
             .expect("the trace is on disk");
         assert!(
             trace
-                .notes_by(NAME)
+                .notes_by(Stage::Review)
                 .iter()
                 .any(|note| note.contains("truncated before any finding")),
             "{:?}",

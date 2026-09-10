@@ -7,7 +7,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::Confidence;
+use crate::domain::{Confidence, Stage};
 
 use super::{LocalStorage, Meta, RecordError, Recorder, Storage, layout};
 
@@ -34,7 +34,10 @@ pub const WARN_AFTER_RUNS: usize = 10;
 pub struct RunRow {
     pub run_id: String,
     pub input: String,
-    pub completed_stages: Vec<String>,
+    /// Spelled out rather than kept as the one stage the run reached: what a
+    /// reader wants is the list, and deriving it here keeps `meta.json` free
+    /// of a fact it can work out.
+    pub completed_stages: Vec<Stage>,
     pub spent: f64,
     pub currency: String,
     pub updated_at: u64,
@@ -47,7 +50,7 @@ pub struct RunShow {
     pub run_id: String,
     pub input: String,
     pub model: String,
-    pub completed_stages: Vec<String>,
+    pub completed_stages: Vec<Stage>,
     pub comments: Vec<CommentCount>,
     pub spent: f64,
     pub budget: Option<f64>,
@@ -210,9 +213,9 @@ fn row_from_dir(directory: &Path) -> Result<RunRow, RecordError> {
     let storage = LocalStorage::open(directory.to_path_buf());
     match Recorder::peek_meta(&storage)? {
         Some(meta) => Ok(RunRow {
+            completed_stages: meta.completed_stages(),
             run_id: meta.run_id,
             input: meta.input.source,
-            completed_stages: meta.completed_stages,
             spent: meta.spent,
             currency: meta.currency,
             updated_at: meta.updated_at,

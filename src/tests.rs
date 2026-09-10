@@ -8,12 +8,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::config::{PlatformKind, RunOptions, Settings};
-use crate::domain::Confidence;
+use crate::domain::{Confidence, Stage};
 use crate::platform::{
     Capabilities, ChangeRef, DiffRefs, ExistingComment, LineRange, Listing, OutgoingComment,
     Platform, PlatformChange, PlatformError, RepoSource, SearchHit,
 };
-use crate::progress::{Event, Progress, Silent};
+use crate::progress::{Event, Outcome, Progress, Silent};
 use crate::protocol::{OutputItem, Protocol, ProtocolError, Request, Response};
 use crate::record::{LocalStorage, Storage, layout};
 use crate::security::Redactor;
@@ -407,19 +407,10 @@ fn review(workspace: &Workspace, calls: Arc<Calls>) -> Result<RunResult, Error> 
     )
 }
 
-const STAGE_FILES: [(u8, &str); 6] = [
-    (1, "input"),
-    (2, "triage"),
-    (3, "review"),
-    (4, "merge"),
-    (5, "report"),
-    (6, "publish"),
-];
-
 fn stage_paths(run_dir: &Path) -> Vec<PathBuf> {
-    STAGE_FILES
-        .iter()
-        .map(|(number, name)| run_dir.join(layout::stage_file(*number, name)))
+    Stage::ALL
+        .into_iter()
+        .map(|stage| run_dir.join(layout::stage_file(stage)))
         .collect()
 }
 
@@ -429,12 +420,12 @@ fn rewind_to(run_dir: &Path, keep: usize) {
     let meta_path = run_dir.join(layout::META);
     let mut meta: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&meta_path).expect("meta")).expect("meta json");
-    let completed: Vec<serde_json::Value> = STAGE_FILES
-        .iter()
-        .take(keep)
-        .map(|(_, name)| serde_json::Value::String(name.to_string()))
-        .collect();
-    meta["completed_stages"] = serde_json::Value::Array(completed);
+    // How far the run got is one value, so rewinding is naming the last stage
+    // that survives rather than listing the ones that do.
+    meta["completed_through"] = match keep {
+        0 => serde_json::Value::Null,
+        keep => serde_json::Value::String(Stage::ALL[keep - 1].name().to_string()),
+    };
     std::fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).expect("write meta");
     for path in stage_paths(run_dir).into_iter().skip(keep) {
         let _ = std::fs::remove_file(path);
@@ -481,11 +472,11 @@ fn the_same_command_again_leaves_a_finished_input_stage_alone() {
     let workspace = Workspace::new();
     let first = review(&workspace, Arc::new(Calls::default())).expect("run completes");
     let run_dir = workspace.run_dir(&first.run_id);
-    let input_file = run_dir.join(layout::stage_file(1, "input"));
+    let input_file = run_dir.join(layout::stage_file(Stage::Input));
     let input_before = std::fs::read(&input_file).expect("input checkpoint");
 
     rewind_to(&run_dir, 1);
-    assert!(!run_dir.join(layout::stage_file(2, "triage")).exists());
+    assert!(!run_dir.join(layout::stage_file(Stage::Triage)).exists());
 
     let calls = Arc::new(Calls::default());
     let second = review(&workspace, Arc::clone(&calls)).expect("the second run completes");
@@ -541,14 +532,17 @@ fn an_unreadable_checkpoint_falls_back_to_the_previous_snapshot() {
     let workspace = Workspace::new();
     let first = review(&workspace, Arc::new(Calls::default())).expect("run completes");
     let run_dir = workspace.run_dir(&first.run_id);
-    std::fs::write(run_dir.join(layout::stage_file(4, "merge")), b"{ not json")
-        .expect("corrupt the merge checkpoint");
+    std::fs::write(
+        run_dir.join(layout::stage_file(Stage::Merge)),
+        b"{ not json",
+    )
+    .expect("corrupt the merge checkpoint");
 
     let second = review(&workspace, Arc::new(Calls::default())).expect("the second run completes");
 
     assert_eq!(second.run_id, first.run_id);
     let merged: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(run_dir.join(layout::stage_file(4, "merge"))).unwrap(),
+        &std::fs::read(run_dir.join(layout::stage_file(Stage::Merge))).unwrap(),
     )
     .expect("the merge stage ran again and wrote valid json");
     assert!(merged.get("comments").is_some());
@@ -812,7 +806,7 @@ fn a_real_diff_reaches_the_model_as_one_chunk_per_surviving_file() {
 
     let run_dir = workspace.run_dir(&result.run_id);
     let input: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(run_dir.join(layout::stage_file(1, "input"))).unwrap(),
+        &std::fs::read(run_dir.join(layout::stage_file(Stage::Input))).unwrap(),
     )
     .expect("input checkpoint");
     let files = input["files"].as_array().expect("files");
@@ -825,7 +819,7 @@ fn a_real_diff_reaches_the_model_as_one_chunk_per_surviving_file() {
     assert_eq!(files[0]["changed_lines"], serde_json::json!([11, 12]));
 
     let plan: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(run_dir.join(layout::stage_file(2, "triage"))).unwrap(),
+        &std::fs::read(run_dir.join(layout::stage_file(Stage::Triage))).unwrap(),
     )
     .expect("triage checkpoint");
     let chunks = plan["chunks"].as_array().expect("chunks");
@@ -1241,23 +1235,23 @@ impl Watcher {
     /// The pairing is checked on the way through: a screen that shows one
     /// line per stage cannot be written against a channel that opens a stage
     /// before closing the last one.
-    fn stages(&self) -> Vec<(u8, &'static str, String)> {
+    fn stages(&self) -> Vec<(Stage, Outcome, bool)> {
         let mut finished = Vec::new();
-        let mut open: Option<(u8, &'static str)> = None;
+        let mut open: Option<Stage> = None;
         for event in self.events() {
             match event {
-                Event::StageStarted { number, name } => {
-                    assert_eq!(open, None, "{name} started while another stage was open");
-                    open = Some((number, name));
+                Event::StageStarted { stage } => {
+                    assert_eq!(open, None, "{stage} started while another stage was open");
+                    open = Some(stage);
                 }
                 Event::StageFinished {
-                    number,
-                    name,
-                    detail,
+                    stage,
+                    outcome,
+                    from_checkpoint,
                 } => {
-                    assert_eq!(open, Some((number, name)), "{name} finished unannounced");
+                    assert_eq!(open, Some(stage), "{stage} finished unannounced");
                     open = None;
-                    finished.push((number, name, detail));
+                    finished.push((stage, outcome, from_checkpoint));
                 }
                 _ => {}
             }
@@ -1299,33 +1293,55 @@ fn a_full_run_announces_every_stage_and_numbers_the_chunks() {
             run_dir: workspace.run_dir(&result.run_id),
             model: "deepseek-v4-flash".to_string(),
             input: "change.diff".to_string(),
+            worktree: None,
         }),
         "a run says what it is before it does anything"
     );
 
     let stages = watcher.stages();
-    let announced: Vec<(u8, &str)> = stages
-        .iter()
-        .map(|(number, name, _)| (*number, *name))
-        .collect();
+    let announced: Vec<Stage> = stages.iter().map(|(stage, _, _)| *stage).collect();
     assert_eq!(
         announced,
-        STAGE_FILES.to_vec(),
+        Stage::ALL.to_vec(),
         "all six, in the order lib.rs runs them"
     );
-    let details: Vec<&str> = stages
-        .iter()
-        .map(|(_, _, detail)| detail.as_str())
-        .collect();
     assert_eq!(
-        details,
+        stages
+            .iter()
+            .map(|(_, outcome, from_checkpoint)| (outcome, from_checkpoint))
+            .collect::<Vec<_>>(),
         vec![
-            "2 files",
-            "2 chunks, 0 files skipped",
-            "2 chunks reviewed",
-            "0 comments, not scored",
-            "report.md and summary.json written",
-            "nothing posted: this run was not asked to publish",
+            (&Outcome::Input { files: 2 }, &false),
+            (
+                &Outcome::Triage {
+                    chunks: 2,
+                    skipped: 0,
+                },
+                &false,
+            ),
+            (
+                &Outcome::Review {
+                    chunks: 2,
+                    unreviewed: 0,
+                },
+                &false,
+            ),
+            (
+                &Outcome::Merge {
+                    comments: 0,
+                    overall: None,
+                },
+                &false,
+            ),
+            (&Outcome::Report, &false),
+            (
+                &Outcome::Publish {
+                    posted: 0,
+                    already_there: 0,
+                    asked: false,
+                },
+                &false,
+            ),
         ],
         "a finished stage says what it produced, in the summary's own numbers"
     );
@@ -1354,11 +1370,11 @@ fn a_full_run_announces_every_stage_and_numbers_the_chunks() {
     );
 }
 
-/// The one thing on the channel that nothing else in the run counts: a tool
-/// call, named as it goes out. Delivering a finding is a tool call like any
-/// other, which is why an ordinary run has one.
+/// A tool call brackets the same work recorded in the trace. Delivering a
+/// finding is a tool call like any other, which is why an ordinary run has
+/// one complete pair.
 #[test]
-fn a_tool_the_model_calls_is_named_as_it_goes_out() {
+fn a_tool_the_model_calls_is_named_as_it_goes_out_and_returns() {
     let workspace = Workspace::with_config(
         &CONFIG.replace("[triage]", "[triage]\nskip_paths = [\"vendor/**\"]"),
     );
@@ -1372,15 +1388,22 @@ fn a_tool_the_model_calls_is_named_as_it_goes_out() {
     )
     .expect("run completes");
 
-    let tools: Vec<String> = watcher
+    let tools: Vec<(&str, String)> = watcher
         .events()
         .into_iter()
         .filter_map(|event| match event {
-            Event::Tool { name } => Some(name),
+            Event::Tool { name } => Some(("started", name)),
+            Event::ToolDone { name, .. } => Some(("finished", name)),
             _ => None,
         })
         .collect();
-    assert_eq!(tools, vec!["submit_comment".to_string()]);
+    assert_eq!(
+        tools,
+        vec![
+            ("started", "submit_comment".to_string()),
+            ("finished", "submit_comment".to_string()),
+        ]
+    );
 }
 
 /// The reason a skipped stage still has to be announced: a run entered again
@@ -1413,23 +1436,20 @@ fn a_run_entered_again_reports_every_stage_off_its_checkpoints() {
     assert_eq!(Calls::get(&calls.send), 0, "nothing was reviewed again");
 
     let stages = watcher.stages();
-    let announced: Vec<(u8, &str)> = stages
-        .iter()
-        .map(|(number, name, _)| (*number, *name))
-        .collect();
-    assert_eq!(announced, STAGE_FILES.to_vec());
-    for (_, name, detail) in stages.iter().take(4) {
-        assert!(
-            detail.ends_with(", from checkpoint"),
-            "{name} was skipped and has to say so: {detail}"
-        );
+    let announced: Vec<Stage> = stages.iter().map(|(stage, _, _)| *stage).collect();
+    assert_eq!(announced, Stage::ALL.to_vec());
+    for (stage, _, from_checkpoint) in stages.iter().take(4) {
+        assert!(from_checkpoint, "{stage} was skipped and has to say so");
     }
-    assert_eq!(stages[1].2, "2 chunks, 0 files skipped, from checkpoint");
-    for (_, name, detail) in stages.iter().skip(4) {
-        assert!(
-            !detail.contains("checkpoint"),
-            "{name} runs every time: {detail}"
-        );
+    assert_eq!(
+        stages[1].1,
+        Outcome::Triage {
+            chunks: 2,
+            skipped: 0
+        }
+    );
+    for (stage, _, from_checkpoint) in stages.iter().skip(4) {
+        assert!(!from_checkpoint, "{stage} runs every time");
     }
     assert!(
         watcher.chunks().is_empty(),

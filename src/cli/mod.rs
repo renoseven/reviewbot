@@ -4,6 +4,7 @@
 pub mod args;
 mod logging;
 pub mod render;
+mod screen;
 mod status;
 
 use std::io::{IsTerminal, Read};
@@ -77,13 +78,18 @@ fn dispatch(cli: &Cli, log: &LogSink) -> Result<Finished, Error> {
                 let progress = CliProgress::new(&Silent, log.clone());
                 reviewbot::review(&settings, &source, &progress)
             } else {
-                let tty = std::io::stdout().is_terminal();
-                let status = Status::new(std::io::stdout(), tty, !cli.global.no_color);
-                let progress = CliProgress::new(&status, log.clone());
-                let result = reviewbot::review(&settings, &source, &progress);
-                // A failure also has to take the live block away before its
-                // message reaches stderr; otherwise the cursor is left below
-                // a stale run that appears to still be active.
+                let status = match std::io::stdout().is_terminal() {
+                    true => Status::terminal(!cli.global.no_color),
+                    false => Status::pipe(Box::new(std::io::stdout())),
+                };
+                let result = {
+                    let progress = CliProgress::new(&status, log.clone());
+                    reviewbot::review(&settings, &source, &progress)
+                };
+                // The terminal goes back before anything else writes to it,
+                // failures included: a message printed into a block that is
+                // still being repainted leaves the cursor below a run that
+                // appears to still be going.
                 status.finish();
                 result
             }?;

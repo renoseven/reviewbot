@@ -1,6 +1,8 @@
 //! File names inside a run directory. Checkpoints are not a separate place;
 //! they are these files.
 
+use crate::domain::Stage;
+
 pub const META: &str = "meta.json";
 pub const LOCK: &str = "lock";
 pub const LOG: &str = "log";
@@ -9,8 +11,8 @@ pub const REPORT: &str = "report.md";
 pub const SUMMARY: &str = "summary.json";
 
 /// `stages/<n>-<stage>.json`, the name later milestones keep overwriting.
-pub fn stage_file(number: u8, stage: &str) -> String {
-    format!("stages/{number}-{stage}.json")
+pub fn stage_file(stage: Stage) -> String {
+    format!("stages/{}-{stage}.json", stage.number())
 }
 
 pub fn trace_file(trace_id: &str) -> String {

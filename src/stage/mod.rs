@@ -23,8 +23,9 @@ use serde::de::DeserializeOwned;
 use crate::budget::{Budget, BudgetError};
 use crate::common::{Secret, SecretSource};
 use crate::config::{ConfigError, Settings};
+use crate::domain::Stage;
 use crate::platform::{ChangeRef, Platform, PlatformError};
-use crate::progress::{Event, Progress};
+use crate::progress::{Event, Outcome, Progress};
 use crate::protocol::{Protocol, ProtocolError, Request, Response};
 use crate::record::{InputIdentity, InputRecord, RecordError, Recorder};
 use crate::security::{PathPolicy, Redactor};
@@ -231,38 +232,32 @@ pub struct StageContext<'a> {
 
 impl StageContext<'_> {
     /// A stage is beginning, whether or not there is work left in it.
-    pub fn stage_started(&self, number: u8, name: &'static str) {
-        self.progress.emit(Event::StageStarted { number, name });
+    pub fn stage_started(&self, stage: Stage) {
+        self.progress.emit(Event::StageStarted { stage });
     }
 
-    /// A stage is over, and `detail` is what it has to show for itself.
-    /// Said by the caller that knows the order rather than by the stage,
-    /// which is the same reason the order lives in `lib.rs`.
-    pub fn stage_finished(&self, number: u8, name: &'static str, detail: String) {
+    /// A stage is over, with the typed result the caller learned by placing
+    /// it in the sequence. Said here rather than inside a stage because only
+    /// `lib.rs` knows whether that result came from work or a checkpoint.
+    pub fn stage_finished(&self, stage: Stage, outcome: Outcome, from_checkpoint: bool) {
         self.progress.emit(Event::StageFinished {
-            number,
-            name,
-            detail,
+            stage,
+            outcome,
+            from_checkpoint,
         });
     }
 
     /// The stage's own checkpoint, when it already finished.
     pub fn completed<T: DeserializeOwned>(
         &mut self,
-        number: u8,
-        stage: &str,
+        stage: Stage,
     ) -> Result<Option<T>, StageError> {
-        Ok(self.recorder.completed(number, stage)?)
+        Ok(self.recorder.completed(stage)?)
     }
 
     /// Write the checkpoint and mark the stage done.
-    pub fn complete<T: Serialize>(
-        &mut self,
-        number: u8,
-        stage: &str,
-        output: &T,
-    ) -> Result<(), StageError> {
-        self.recorder.complete(number, stage, output)?;
+    pub fn complete<T: Serialize>(&mut self, stage: Stage, output: &T) -> Result<(), StageError> {
+        self.recorder.complete(stage, output)?;
         Ok(())
     }
 

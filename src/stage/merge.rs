@@ -11,7 +11,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{ChangeSet, Comment, CommentTarget, Confidence, FileChange, Severity};
+use crate::domain::{ChangeSet, Comment, CommentTarget, Confidence, FileChange, Severity, Stage};
 use crate::protocol::{InputItem, Request, Role, ToolSchema};
 use crate::record::{ToolCall, Trace};
 use crate::tool::{Round, SubmitSummary, whole_score};
@@ -20,9 +20,6 @@ use super::prompt::Prompts;
 
 use super::review::{ChunkOutput, ReviewOutput};
 use super::{StageContext, StageError};
-
-pub const NUMBER: u8 = 4;
-pub const NAME: &str = "merge";
 
 /// The two badges reviewbot may put on a comment. They say what reviewbot
 /// checked, never what it thinks: the number beside them is the model's.
@@ -303,7 +300,7 @@ impl Merge {
             unproduced = output.unproduced.len(),
             "merge done"
         );
-        context.complete(NUMBER, NAME, &output)?;
+        context.complete(Stage::Merge, &output)?;
         Ok(output)
     }
 
@@ -329,7 +326,7 @@ impl Merge {
         // conversation belongs to `review`, and clearing the lot used to erase
         // it, so a comment whose evidence was never really looked for read
         // exactly like one that was.
-        trace.forget(NAME);
+        trace.forget(Stage::Merge);
 
         let entries = match parse_document(&chunk.raw_output) {
             Ok(entries) => entries,
@@ -339,7 +336,7 @@ impl Merge {
                 // unreadable one is a damaged checkpoint rather than a badly
                 // behaved reply.
                 trace.note(
-                    NAME,
+                    Stage::Merge,
                     format!("the chunk document would not parse ({reason})"),
                 );
                 context.recorder.write_trace(&trace)?;
@@ -372,7 +369,7 @@ impl Merge {
             &mut notes,
         );
         for note in notes {
-            trace.note(NAME, note);
+            trace.note(Stage::Merge, note);
         }
         context.recorder.write_trace(&trace)?;
         Ok(findings)
@@ -389,7 +386,7 @@ impl Merge {
         let Some(mut trace) = context.recorder.read_trace(trace_id)? else {
             return Ok(());
         };
-        trace.note(NAME, note);
+        trace.note(Stage::Merge, note);
         context.recorder.write_trace(&trace)?;
         Ok(())
     }
@@ -713,7 +710,7 @@ impl Merge {
             content: context.redactor.redact(&note),
         });
         trace.note(
-            NAME,
+            Stage::Merge,
             format!("the scoring call did not arrive ({reason}); asked once more"),
         );
 
@@ -729,7 +726,7 @@ impl Merge {
                 let second = second.reason;
                 reason = format!("{reason}, then {second}");
                 trace.note(
-                    NAME,
+                    Stage::Merge,
                     format!("the second score reply would not read ({second})"),
                 );
                 tracing::warn!("no overall score: {reason}");
@@ -1244,7 +1241,7 @@ mod tests {
                 .expect("readable")
                 .expect("written");
             trace.note(
-                crate::stage::review::NAME,
+                Stage::Review,
                 "the tool loop reached its ceiling of 2 rounds",
             );
             fixture.recorder().write_trace(&trace).expect("written");
@@ -1252,16 +1249,16 @@ mod tests {
         let review = review(vec![chunk("src/parse.c", &raw)]);
 
         merge(&mut fixture, &changeset, &review);
-        let after_first = notes_by(&fixture, "review-src_parse.c", NAME).len();
+        let after_first = notes_by(&fixture, "review-src_parse.c", Stage::Merge).len();
         merge(&mut fixture, &changeset, &review);
 
         assert_eq!(
-            notes_by(&fixture, "review-src_parse.c", NAME).len(),
+            notes_by(&fixture, "review-src_parse.c", Stage::Merge).len(),
             after_first,
             "this stage's notes are rewritten, not doubled"
         );
         assert_eq!(
-            notes_by(&fixture, "review-src_parse.c", crate::stage::review::NAME),
+            notes_by(&fixture, "review-src_parse.c", Stage::Review),
             vec!["the tool loop reached its ceiling of 2 rounds".to_string()],
             "how far the investigation got is not this stage's to erase"
         );
@@ -1282,7 +1279,7 @@ mod tests {
 
     /// What one stage wrote on a trace, which is the only thing a test about
     /// that stage may assert on.
-    fn notes_by(fixture: &StageFixture, trace_id: &str, stage: &str) -> Vec<String> {
+    fn notes_by(fixture: &StageFixture, trace_id: &str, stage: Stage) -> Vec<String> {
         fixture
             .recorder()
             .read_trace(trace_id)
@@ -1295,7 +1292,7 @@ mod tests {
     }
 
     fn checks_of(fixture: &StageFixture, trace_id: &str) -> Vec<String> {
-        notes_by(fixture, trace_id, NAME)
+        notes_by(fixture, trace_id, Stage::Merge)
     }
 
     fn merge(

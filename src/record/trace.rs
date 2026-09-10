@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::budget::TokenUsage;
 use crate::common::truncate;
+use crate::domain::Stage;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct Trace {
@@ -41,14 +42,14 @@ pub struct Trace {
 /// where the next edit breaks the clearing.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Check {
-    pub stage: String,
+    pub stage: Stage,
     pub note: String,
 }
 
 impl Check {
-    pub fn new(stage: &str, note: impl Into<String>) -> Self {
+    pub fn new(stage: Stage, note: impl Into<String>) -> Self {
         Self {
-            stage: stage.to_string(),
+            stage,
             note: note.into(),
         }
     }
@@ -110,13 +111,13 @@ impl Trace {
     }
 
     /// Write one line down, in the name of the stage writing it.
-    pub fn note(&mut self, stage: &str, note: impl Into<String>) {
+    pub fn note(&mut self, stage: Stage, note: impl Into<String>) {
         self.checks.push(Check::new(stage, note));
     }
 
     /// Whether this stage already said this. Used where a note would otherwise
     /// be written twice by the same stage.
-    pub fn has_note(&self, stage: &str, note: &str) -> bool {
+    pub fn has_note(&self, stage: Stage, note: &str) -> bool {
         self.checks
             .iter()
             .any(|check| check.stage == stage && check.note == note)
@@ -126,12 +127,12 @@ impl Trace {
     /// that stage: the account of the conversation belongs to `review`, and a
     /// second `merge` used to wipe it, leaving a comment whose evidence looked
     /// like it had never been investigated at all.
-    pub fn forget(&mut self, stage: &str) {
+    pub fn forget(&mut self, stage: Stage) {
         self.checks.retain(|check| check.stage != stage);
     }
 
     /// What one stage wrote, in order.
-    pub fn notes_by(&self, stage: &str) -> Vec<&str> {
+    pub fn notes_by(&self, stage: Stage) -> Vec<&str> {
         self.checks
             .iter()
             .filter(|check| check.stage == stage)

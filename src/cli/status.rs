@@ -1,160 +1,262 @@
-//! The terminal's view of a run while the run still owns stdout.
+//! What the terminal knows about a run while the run is still going.
 //!
-//! A terminal gets one growing summary-shaped block, so finishing does not
-//! replace one vocabulary with another or spend rows on facts not known yet.
-//! A pipe gets a sparse event log instead: cursor motion is useful only when
-//! there is a cursor to move, and retaining each completed stage is what
-//! makes CI output useful after the process ends.
+//! One set of facts, two ways of showing them. A terminal gets the block in
+//! `screen`, repainted on a timer because a model call blocks the run for tens
+//! of seconds and a screen that only moves when something is reported is a
+//! dead screen for exactly those stretches. A pipe gets appended lines: cursor
+//! motion is useful only where there is a cursor, and what makes CI output
+//! worth keeping is that every finished stage is still in it afterwards.
+//!
+//! The facts live here rather than in either renderer, so the two cannot come
+//! to disagree about what the run said.
 
-use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::io::Write;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use reviewbot::progress::{Event, Progress};
+use reviewbot::domain::Stage;
+use reviewbot::progress::{Event, Outcome, Progress};
 
-use super::render::{SUMMARY_LABEL_WIDTH, push_summary_line};
+use super::screen::Screen;
 
-const STAGES: u8 = 6;
-
-/// A serial progress consumer. Both the accumulated facts and the writer use
-/// interior mutability because `Progress` is shared by all six stages.
-pub struct Status<W: Write> {
-    writer: RefCell<W>,
-    state: RefCell<State>,
-    tty: bool,
-    color: bool,
+/// A consumer of one run's progress. Shared by all six stages, so everything
+/// it holds is behind a lock: the terminal's painter reads the same facts from
+/// its own thread.
+pub struct Status {
+    state: Arc<Mutex<State>>,
+    view: View,
 }
 
-impl<W: Write> Status<W> {
-    pub fn new(writer: W, tty: bool, color: bool) -> Self {
+enum View {
+    /// A terminal, painted by `screen`'s thread rather than by `emit`.
+    Terminal(Screen),
+    /// Anything else: one line per thing worth keeping.
+    Pipe(Mutex<Box<dyn Write + Send>>),
+}
+
+impl Status {
+    /// Take the bottom of the terminal for the duration of the run, or fall
+    /// back to plain lines when this terminal will not hold a block. Some
+    /// things that pass for a terminal never answer the question an inline
+    /// viewport has to ask, and a run with nothing at all to show would be a
+    /// worse answer to that than a run whose progress simply scrolls.
+    pub fn terminal(color: bool) -> Self {
+        let state = Arc::new(Mutex::new(State::default()));
+        match Screen::start(Arc::clone(&state), color) {
+            Some(screen) => Self {
+                state,
+                view: View::Terminal(screen),
+            },
+            None => Self::pipe(Box::new(std::io::stdout())),
+        }
+    }
+
+    pub fn pipe(writer: Box<dyn Write + Send>) -> Self {
         Self {
-            writer: RefCell::new(writer),
-            state: RefCell::new(State::default()),
-            tty,
-            color: tty && color,
+            state: Arc::new(Mutex::new(State::default())),
+            view: View::Pipe(Mutex::new(writer)),
         }
     }
 
-    /// Remove the temporary terminal block before the one canonical final
-    /// renderer writes. Pipes retain their event history by design.
-    pub fn finish(&self) {
-        if !self.tty {
-            return;
+    /// Give the terminal back before anything else writes to it. Consuming
+    /// `self` is the point: the final summary and any failure message must not
+    /// land in a block that is still being repainted, and there is no way to
+    /// ask for that ordering here.
+    pub fn finish(self) {
+        match self.view {
+            View::Terminal(screen) => screen.stop(),
+            View::Pipe(_) => {}
         }
-        let mut state = self.state.borrow_mut();
-        if state.drawn_rows > 0 {
-            self.write(&format!("\x1b[{}A\x1b[J", state.drawn_rows));
-            state.drawn_rows = 0;
-        }
-    }
-
-    fn write(&self, text: &str) {
-        let mut writer = self.writer.borrow_mut();
-        let _ = writer.write_all(text.as_bytes());
-        let _ = writer.flush();
-    }
-
-    fn redraw(&self, state: &mut State) {
-        let mut out = String::new();
-        if state.drawn_rows > 0 {
-            out.push_str(&format!("\x1b[{}A\x1b[J", state.drawn_rows));
-        }
-        state.drawn_rows = state.push_block(&mut out, self.color);
-        self.write(&out);
-    }
-
-    fn append(&self, line: String) {
-        self.write(&line);
     }
 }
 
-impl<W: Write> Progress for Status<W> {
+impl Progress for Status {
     fn emit(&self, event: Event) {
-        let mut state = self.state.borrow_mut();
-        let line = state.apply(event);
-        if self.tty {
-            self.redraw(&mut state);
-        } else if let Some(line) = line {
-            self.append(line);
+        let line = match self.state.lock() {
+            Ok(mut state) => state.apply(event, Instant::now()),
+            Err(_) => return,
+        };
+        // A terminal is repainted from the facts, so there is nothing to write
+        // here; a pipe only ever gains lines.
+        if let (View::Pipe(writer), Some(line)) = (&self.view, line)
+            && let Ok(mut writer) = writer.lock()
+        {
+            let _ = writer.write_all(line.as_bytes());
+            let _ = writer.flush();
         }
     }
 }
 
-#[derive(Default)]
-struct State {
-    run_id: String,
-    model: String,
-    overall: String,
-    comments: String,
-    skipped: String,
-    unreviewed: String,
-    budget: String,
-    report: String,
-    summary: String,
-    published: String,
-    stage_number: Option<u8>,
-    stage: String,
-    stage_detail: Option<String>,
-    chunk: Option<(usize, usize, String)>,
-    round: Option<(u32, u32)>,
-    tool: Option<String>,
-    drawn_rows: usize,
+/// Everything either renderer might show, in the order it becomes known.
+pub(super) struct State {
+    pub(super) run_id: String,
+    pub(super) input: String,
+    pub(super) model: String,
+    pub(super) worktree: Option<PathBuf>,
+    pub(super) stages: Vec<StageRow>,
+    /// Which chunk of the review stage, and how many there are.
+    pub(super) chunk: Option<(usize, usize)>,
+    pub(super) path: Option<String>,
+    /// Files, which are not chunks: one file too big for a single request is
+    /// reviewed as several. Both are counted so neither can be read as the
+    /// other.
+    pub(super) files_seen: usize,
+    pub(super) files_total: Option<usize>,
+    pub(super) spend: Option<String>,
+    /// Which turn of the tool loop, and the ceiling that ends the chunk.
+    pub(super) exchange: Option<(u32, u32)>,
+    pub(super) waiting_since: Option<Instant>,
+    pub(super) tool: Option<(String, Instant)>,
+    input_files: Option<usize>,
+    paths_seen: BTreeSet<String>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            run_id: String::new(),
+            input: String::new(),
+            model: String::new(),
+            worktree: None,
+            // Every stage is on screen from the first frame. What is still
+            // coming is as much a fact about a run as what is done.
+            stages: Stage::ALL
+                .into_iter()
+                .map(|stage| StageRow {
+                    stage,
+                    step: Step::Pending,
+                })
+                .collect(),
+            chunk: None,
+            path: None,
+            files_seen: 0,
+            files_total: None,
+            spend: None,
+            exchange: None,
+            waiting_since: None,
+            tool: None,
+            input_files: None,
+            paths_seen: BTreeSet::new(),
+        }
+    }
+}
+
+pub(super) struct StageRow {
+    pub(super) stage: Stage,
+    pub(super) step: Step,
+}
+
+pub(super) enum Step {
+    Pending,
+    Running {
+        since: Instant,
+    },
+    Done {
+        took: Duration,
+        sentence: String,
+        from_checkpoint: bool,
+    },
 }
 
 impl State {
-    fn apply(&mut self, event: Event) -> Option<String> {
+    /// Take one event in, and say what a pipe should keep about it. `now` is
+    /// passed rather than read so the elapsed times a test asserts are the
+    /// times it chose.
+    pub(super) fn apply(&mut self, event: Event, now: Instant) -> Option<String> {
         match event {
             Event::RunStarted {
                 run_id,
-                run_dir,
                 model,
                 input,
+                worktree,
+                ..
             } => {
                 self.run_id = run_id;
                 self.model = model;
-                self.report = run_dir.join("report.md").display().to_string();
-                self.summary = run_dir.join("summary.json").display().to_string();
-                Some(format!(
-                    "run {}  model {}  input {}\n",
-                    self.run_id, self.model, input
-                ))
+                self.input = input;
+                self.worktree = worktree;
+                let mut line = format!("run  {}  model {}", self.input, self.model);
+                if let Some(worktree) = &self.worktree {
+                    line.push_str(&format!("  worktree {}", worktree.display()));
+                }
+                line.push('\n');
+                Some(line)
             }
-            Event::StageStarted { number, name } => {
-                self.stage_number = Some(number);
-                self.stage = name.to_string();
-                self.stage_detail = None;
-                self.chunk = None;
-                self.round = None;
-                self.tool = None;
+            Event::StageStarted { stage } => {
+                self.begin(stage, now);
                 None
             }
             Event::StageFinished {
-                number,
-                name,
-                detail,
+                stage,
+                outcome,
+                from_checkpoint,
             } => {
-                self.stage_number = Some(number);
-                self.stage = name.to_string();
-                self.learn_stage(name, &detail);
-                self.stage_detail = Some(detail.clone());
-                self.chunk = None;
-                self.round = None;
-                self.tool = None;
-                Some(format!("[{number}/{STAGES}] {name:<9} {detail}\n"))
+                self.learn(&outcome);
+                let sentence = outcome.sentence();
+                let line = format!(
+                    "[{}/{}] {:<9} {sentence}{}\n",
+                    stage.number(),
+                    Stage::ALL.len(),
+                    stage.name(),
+                    match from_checkpoint {
+                        true => ", from checkpoint",
+                        false => "",
+                    }
+                );
+                let took = self
+                    .row(stage)
+                    .and_then(|row| match row.step {
+                        Step::Running { since } => Some(now.saturating_duration_since(since)),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                if let Some(row) = self.row_mut(stage) {
+                    row.step = Step::Done {
+                        took,
+                        sentence,
+                        from_checkpoint,
+                    };
+                }
+                self.forget_chunk();
+                Some(line)
             }
             Event::Chunk { index, of, path } => {
-                self.stage_detail = None;
-                self.chunk = Some((index, of, path));
-                self.round = None;
+                self.chunk = Some((index, of));
+                if self.paths_seen.insert(path.clone()) {
+                    self.files_seen += 1;
+                }
+                self.path = Some(path.clone());
+                self.exchange = None;
+                self.waiting_since = None;
                 self.tool = None;
-                self.chunk_line()
+                Some(format!(
+                    "[{}/{}] {:<9} chunk {index}/{of}  {path}{}\n",
+                    Stage::Review.number(),
+                    Stage::ALL.len(),
+                    Stage::Review.name(),
+                    match &self.spend {
+                        Some(spend) => format!("  {spend}"),
+                        None => String::new(),
+                    }
+                ))
             }
             Event::Round { round, of } => {
-                self.round = Some((round, of));
+                self.exchange = Some((round, of));
+                self.waiting_since = Some(now);
                 self.tool = None;
                 None
             }
             Event::Tool { name } => {
-                self.tool = Some(name);
+                self.waiting_since = None;
+                self.tool = Some((name, now));
+                None
+            }
+            // Only that the wait is over: which tool answered, and how long it
+            // took, are the log's business and the trace's.
+            Event::ToolDone { .. } => {
+                self.tool = None;
                 None
             }
             Event::Spend {
@@ -162,169 +264,112 @@ impl State {
                 budget,
                 currency,
             } => {
-                self.budget = match budget {
+                self.spend = Some(match budget {
                     Some(ceiling) => format!("{spent:.4} / {ceiling:.4} {currency}"),
                     None => format!("{spent:.4} {currency} (no ceiling)"),
-                };
+                });
                 None
             }
         }
     }
 
-    /// Stage details deliberately use the final summary's nouns. Reading the
-    /// small numeric claims here avoids coupling the terminal to checkpoints;
-    /// facts the channel does not carry remain visibly unknown.
-    fn learn_stage(&mut self, name: &str, detail: &str) {
-        let current = detail.strip_suffix(", from checkpoint").unwrap_or(detail);
-        match name {
-            "triage" => {
-                if let Some(count) = number_before(current, " files skipped") {
-                    self.skipped = format!("{count} files");
-                }
-            }
-            "review" => {
-                self.unreviewed = number_before(current, " files unreviewed")
-                    .map(|count| format!("{count} files"))
-                    .unwrap_or_else(|| "0 files".to_string());
-            }
-            "merge" => {
-                if let Some(count) = number_before(current, " comments") {
-                    self.comments = count.to_string();
-                }
-                if let Some(score) = number_after(current, "overall ", " / 100") {
-                    self.overall = format!("{score} / 100");
-                } else if current.contains("not scored") {
-                    self.overall = "not scored".to_string();
-                }
-            }
-            "publish" => {
-                self.published = number_before(current, " comments published")
-                    .map(|count| format!("{count} comments"))
-                    .unwrap_or_else(|| "0 comments".to_string());
+    fn begin(&mut self, stage: Stage, now: Instant) {
+        if let Some(row) = self.row_mut(stage) {
+            row.step = Step::Running { since: now };
+        }
+        self.forget_chunk();
+    }
+
+    fn forget_chunk(&mut self) {
+        self.chunk = None;
+        self.path = None;
+        self.exchange = None;
+        self.waiting_since = None;
+        self.tool = None;
+    }
+
+    /// The two counts a later row needs: how many files there were, and how
+    /// many of them were never going to be read.
+    fn learn(&mut self, outcome: &Outcome) {
+        match outcome {
+            Outcome::Input { files } => self.input_files = Some(*files),
+            Outcome::Triage { skipped, .. } => {
+                self.files_total = self.input_files.map(|files| files.saturating_sub(*skipped));
             }
             _ => {}
         }
     }
 
-    fn chunk_line(&self) -> Option<String> {
-        let number = self.stage_number?;
-        let mut facts = Vec::new();
-        if let Some((index, of, path)) = &self.chunk {
-            facts.push(format!("chunk {index}/{of}"));
-            facts.push(path.clone());
-        }
-        if !self.budget.is_empty() {
-            facts.push(self.budget.clone());
-        }
-        if facts.is_empty() {
-            return None;
-        }
-        Some(format!(
-            "[{number}/{STAGES}] {:<9} {}\n",
-            self.stage,
-            facts.join("  ")
-        ))
+    fn row(&self, stage: Stage) -> Option<&StageRow> {
+        self.stages.iter().find(|row| row.stage == stage)
     }
 
-    fn push_block(&self, out: &mut String, color: bool) -> usize {
-        let mut rows = 0;
-        for (label, value) in [
-            ("run_id", self.run_id.as_str()),
-            ("model", self.model.as_str()),
-            ("overall", self.overall.as_str()),
-            ("comments", self.comments.as_str()),
-            ("skipped", self.skipped.as_str()),
-            ("unreviewed", self.unreviewed.as_str()),
-            ("budget", self.budget.as_str()),
-            ("report", self.report.as_str()),
-            ("summary", self.summary.as_str()),
-            ("published", self.published.as_str()),
-        ] {
-            if value.is_empty() {
-                continue;
-            }
-            if color {
-                out.push_str(&format!(
-                    "\x1b[36m{label:<SUMMARY_LABEL_WIDTH$}\x1b[0m {value}\n"
-                ));
-            } else {
-                push_summary_line(out, label, value);
-            }
-            rows += 1;
-        }
-        let activity = self.activity();
-        if color {
-            out.push_str(&format!("\x1b[1;32m{activity}\x1b[0m\n"));
-        } else {
-            out.push_str(&activity);
-            out.push('\n');
-        }
-        rows + 1
+    fn row_mut(&mut self, stage: Stage) -> Option<&mut StageRow> {
+        self.stages.iter_mut().find(|row| row.stage == stage)
     }
-
-    fn activity(&self) -> String {
-        if self.stage.is_empty() {
-            return "starting".to_string();
-        }
-        let mut facts = vec![self.stage.clone()];
-        if let Some(detail) = &self.stage_detail {
-            facts.push(detail.clone());
-            return facts.join("  ");
-        }
-        if let Some((index, of, path)) = &self.chunk {
-            facts.push(format!("chunk {index}/{of}"));
-            facts.push(path.clone());
-        }
-        if let Some((round, of)) = self.round {
-            facts.push(format!("round {round}/{of}"));
-        }
-        if let Some(tool) = &self.tool {
-            facts.push(format!("tool {tool}"));
-        }
-        facts.join("  ")
-    }
-}
-
-fn number_before(text: &str, suffix: &str) -> Option<usize> {
-    let before = text.split(suffix).next()?;
-    before.split_whitespace().next_back()?.parse().ok()
-}
-
-fn number_after(text: &str, prefix: &str, suffix: &str) -> Option<usize> {
-    let after = text.split_once(prefix)?.1;
-    after.split_once(suffix)?.0.parse().ok()
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::Path;
 
-    fn events() -> Vec<Event> {
+    /// A writer the test can read back afterwards.
+    #[derive(Clone, Default)]
+    struct Shared(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Shared {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("lock").extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// One run getting as far as the third chunk of the review stage, with a
+    /// tool answered and another in flight. Shared with `screen`'s tests,
+    /// which draw the block this leaves behind.
+    pub(crate) fn mid_review(now: Instant) -> State {
+        let mut state = State::default();
+        for event in events() {
+            state.apply(event, now);
+        }
+        state
+    }
+
+    pub(crate) fn events() -> Vec<Event> {
         vec![
             Event::RunStarted {
                 run_id: "7f3a9c1e".to_string(),
                 run_dir: PathBuf::from("/tmp/runs/7f3a9c1e"),
                 model: "deepseek-v4-flash".to_string(),
                 input: "change.diff".to_string(),
+                worktree: Some(PathBuf::from("/repo")),
             },
             Event::StageStarted {
-                number: 2,
-                name: "triage",
+                stage: Stage::Input,
             },
             Event::StageFinished {
-                number: 2,
-                name: "triage",
-                detail: "7 chunks, 2 files skipped".to_string(),
+                stage: Stage::Input,
+                outcome: Outcome::Input { files: 9 },
+                from_checkpoint: false,
             },
             Event::StageStarted {
-                number: 3,
-                name: "review",
+                stage: Stage::Triage,
             },
-            Event::Spend {
-                spent: 0.75,
-                budget: Some(10.0),
-                currency: "CNY".to_string(),
+            Event::StageFinished {
+                stage: Stage::Triage,
+                outcome: Outcome::Triage {
+                    chunks: 7,
+                    skipped: 2,
+                },
+                from_checkpoint: false,
+            },
+            Event::StageStarted {
+                stage: Stage::Review,
             },
             Event::Chunk {
                 index: 3,
@@ -332,157 +377,177 @@ mod tests {
                 path: "src/foo.c".to_string(),
             },
             Event::Round { round: 2, of: 6 },
-            Event::Tool {
-                name: "ripgrep".to_string(),
-            },
             Event::Spend {
                 spent: 1.83,
                 budget: Some(10.0),
                 currency: "CNY".to_string(),
             },
-            Event::StageFinished {
-                number: 3,
-                name: "review",
-                detail: "3 chunks reviewed, 2 files unreviewed".to_string(),
+            Event::Tool {
+                name: "read_file".to_string(),
+            },
+            Event::ToolDone {
+                name: "read_file".to_string(),
+                ms: 18,
+            },
+            Event::Tool {
+                name: "search_repo".to_string(),
             },
         ]
     }
 
-    /// Pipes preserve one record for each useful change and never emit a byte
-    /// that asks a cursor to move.
+    /// A pipe keeps one line for each thing that changed what a reader would
+    /// conclude, and never asks a cursor to move.
     #[test]
-    fn a_pipe_appends_progress_and_the_finished_stage() {
-        let status = Status::new(Vec::new(), false, true);
+    fn a_pipe_appends_the_run_its_chunks_and_its_finished_stages() {
+        let shared = Shared::default();
+        let status = Status::pipe(Box::new(shared.clone()));
+        let now = Instant::now();
         for event in events() {
             status.emit(event);
         }
+        status.emit(Event::StageFinished {
+            stage: Stage::Review,
+            outcome: Outcome::Review {
+                chunks: 7,
+                unreviewed: 0,
+            },
+            from_checkpoint: false,
+        });
+        let _ = now;
         status.finish();
 
-        let text = String::from_utf8(status.writer.into_inner()).expect("utf8");
+        let text = String::from_utf8(shared.0.lock().expect("lock").clone()).expect("utf8");
         assert_eq!(
             text,
             "\
-run 7f3a9c1e  model deepseek-v4-flash  input change.diff
+run  change.diff  model deepseek-v4-flash  worktree /repo
+[1/6] input     9 files
 [2/6] triage    7 chunks, 2 files skipped
-[3/6] review    chunk 3/7  src/foo.c  0.7500 / 10.0000 CNY
-[3/6] review    3 chunks reviewed, 2 files unreviewed
+[3/6] review    chunk 3/7  src/foo.c
+[3/6] review    7 chunks reviewed
 "
         );
-        assert!(!text.contains("\x1b["));
+        assert!(!text.contains("\x1b["), "a pipe gets no escape sequences");
     }
 
-    /// Early in review only facts already heard from the run have rows.
-    /// Rounds and tools still change the activity line, while the row count
-    /// used by the next redraw follows the block's actual height.
+    /// Rounds, tools and spend change what the terminal shows without adding
+    /// a line each: a chunk with six rounds and three tools apiece would
+    /// otherwise bury a CI log in near-identical lines.
     #[test]
-    fn an_early_terminal_block_has_only_known_rows() {
-        let status = Status::new(Vec::new(), true, false);
-        for event in events().into_iter().take(8) {
-            status.emit(event);
-        }
-
-        let written = String::from_utf8(status.writer.borrow().clone()).expect("utf8");
-        let block = written
-            .rsplit_once("\x1b[J")
-            .map(|(_, block)| block)
-            .unwrap_or(&written);
-        assert_eq!(
-            block,
-            "\
-run_id     7f3a9c1e
-model      deepseek-v4-flash
-skipped    2 files
-budget     0.7500 / 10.0000 CNY
-report     /tmp/runs/7f3a9c1e/report.md
-summary    /tmp/runs/7f3a9c1e/summary.json
-review  chunk 3/7  src/foo.c  round 2/6  tool ripgrep
-"
-        );
-
-        status.finish();
-        let written = String::from_utf8(status.writer.into_inner()).expect("utf8");
-        assert!(written.ends_with("\x1b[7A\x1b[J"));
-    }
-
-    /// As stages finish the block grows by exactly the rows their details can
-    /// establish. Fields absent from the channel never create dash-only rows.
-    #[test]
-    fn a_late_terminal_block_grows_with_known_stage_results() {
-        let status = Status::new(Vec::new(), true, false);
-        for event in events() {
-            status.emit(event);
-        }
+    fn the_events_inside_a_chunk_do_not_each_get_a_line() {
+        let shared = Shared::default();
+        let status = Status::pipe(Box::new(shared.clone()));
         for event in [
-            Event::StageStarted {
-                number: 4,
-                name: "merge",
+            Event::Round { round: 4, of: 6 },
+            Event::Tool {
+                name: "read_file".to_string(),
             },
-            Event::StageFinished {
-                number: 4,
-                name: "merge",
-                detail: "4 comments, overall 54 / 100".to_string(),
+            Event::ToolDone {
+                name: "read_file".to_string(),
+                ms: 3,
             },
-            Event::StageStarted {
-                number: 5,
-                name: "report",
-            },
-            Event::StageFinished {
-                number: 5,
-                name: "report",
-                detail: "report.md and summary.json written".to_string(),
-            },
-            Event::StageStarted {
-                number: 6,
-                name: "publish",
-            },
-            Event::StageFinished {
-                number: 6,
-                name: "publish",
-                detail: "nothing posted: this run was not asked to publish".to_string(),
+            Event::Spend {
+                spent: 0.5,
+                budget: None,
+                currency: "CNY".to_string(),
             },
         ] {
             status.emit(event);
         }
-
-        let written = String::from_utf8(status.writer.borrow().clone()).expect("utf8");
-        let block = written.rsplit_once("\x1b[J").expect("redraw").1;
-        assert_eq!(
-            block,
-            "\
-run_id     7f3a9c1e
-model      deepseek-v4-flash
-overall    54 / 100
-comments   4
-skipped    2 files
-unreviewed 2 files
-budget     1.8300 / 10.0000 CNY
-report     /tmp/runs/7f3a9c1e/report.md
-summary    /tmp/runs/7f3a9c1e/summary.json
-published  0 comments
-publish  nothing posted: this run was not asked to publish
-"
-        );
-        assert!(!block.contains("severity"));
-        assert!(!block.contains("confidence"));
-        assert!(!block.contains("stopped"));
-
         status.finish();
-        let written = String::from_utf8(status.writer.into_inner()).expect("utf8");
-        assert!(written.ends_with("\x1b[11A\x1b[J"));
+
+        assert!(shared.0.lock().expect("lock").is_empty());
     }
 
-    /// Colour decorates the already-padded label and activity, so turning it
-    /// off changes only escape bytes, never the in-place redraw contract.
+    /// Spend is known by the time a later chunk starts, so it rides on that
+    /// line rather than needing one of its own.
     #[test]
-    fn no_color_keeps_redraw_and_removes_only_color_sequences() {
-        let plain = Status::new(Vec::new(), true, false);
-        plain.emit(events().remove(0));
-        let plain = String::from_utf8(plain.writer.into_inner()).expect("utf8");
-        assert!(!plain.contains("\x1b[36m"));
+    fn a_chunk_line_carries_the_running_spend() {
+        let shared = Shared::default();
+        let status = Status::pipe(Box::new(shared.clone()));
+        status.emit(Event::Spend {
+            spent: 1.83,
+            budget: Some(10.0),
+            currency: "CNY".to_string(),
+        });
+        status.emit(Event::Chunk {
+            index: 2,
+            of: 4,
+            path: "src/bar.c".to_string(),
+        });
+        status.finish();
 
-        let colored = Status::new(Vec::new(), true, true);
-        colored.emit(events().remove(0));
-        let colored = String::from_utf8(colored.writer.into_inner()).expect("utf8");
-        assert!(colored.contains("\x1b[36mrun_id    \x1b[0m 7f3a9c1e"));
+        let text = String::from_utf8(shared.0.lock().expect("lock").clone()).expect("utf8");
+        assert_eq!(
+            text,
+            "[3/6] review    chunk 2/4  src/bar.c  1.8300 / 10.0000 CNY\n"
+        );
+    }
+
+    #[test]
+    fn the_facts_a_chunk_establishes_are_the_ones_a_screen_needs() {
+        let now = Instant::now();
+        let state = mid_review(now);
+
+        assert_eq!(state.chunk, Some((3, 7)));
+        assert_eq!(state.path.as_deref(), Some("src/foo.c"));
+        assert_eq!(state.files_seen, 1);
+        assert_eq!(state.files_total, Some(7), "9 files, 2 of them skipped");
+        assert_eq!(state.exchange, Some((2, 6)));
+        assert_eq!(state.run_id, "7f3a9c1e");
+        assert_eq!(
+            state.tool.as_ref().map(|(name, _)| name.as_str()),
+            Some("search_repo"),
+            "the tool in flight is what the wait is for"
+        );
+        assert_eq!(state.worktree.as_deref(), Some(Path::new("/repo")));
+    }
+
+    /// A tool coming back ends the wait it was the reason for, and the next
+    /// round starts a new one. Which tool answered is the log's business.
+    #[test]
+    fn a_tool_coming_back_ends_the_wait_it_explained() {
+        let now = Instant::now();
+        let mut state = mid_review(now);
+        state.apply(
+            Event::ToolDone {
+                name: "search_repo".to_string(),
+                ms: 4,
+            },
+            now,
+        );
+        assert!(state.tool.is_none());
+        assert!(state.waiting_since.is_none());
+
+        state.apply(Event::Round { round: 3, of: 6 }, now);
+        assert!(state.waiting_since.is_some());
+    }
+
+    #[test]
+    fn a_new_file_is_counted_once_however_many_chunks_it_takes() {
+        let now = Instant::now();
+        let mut state = mid_review(now);
+        state.apply(
+            Event::Chunk {
+                index: 4,
+                of: 7,
+                path: "src/baz.c".to_string(),
+            },
+            now,
+        );
+        assert_eq!(state.files_seen, 2);
+
+        state.apply(
+            Event::Chunk {
+                index: 5,
+                of: 7,
+                path: "src/baz.c".to_string(),
+            },
+            now,
+        );
+        assert_eq!(
+            state.files_seen, 2,
+            "the same file split in two is one file"
+        );
     }
 }

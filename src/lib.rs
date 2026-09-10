@@ -29,9 +29,9 @@ use serde::{Deserialize, Serialize};
 
 use budget::{Budget, BudgetError, Limit};
 use config::{ConfigError, Settings};
-use domain::{Comment, Confidence, Severity};
+use domain::{Comment, Confidence, Severity, Stage};
 use platform::PlatformError;
-use progress::{Event, Progress};
+use progress::{Event, Outcome, Progress};
 use protocol::ProtocolError;
 use record::{DirLock, LocalStorage, Meta, RecordError, Recorder, RunIdentity, Storage, layout};
 use stage::input::Input;
@@ -258,6 +258,7 @@ pub(crate) fn review_with(
         run_dir: recorder.run_dir().to_path_buf(),
         model: started.model.clone(),
         input: started.input.describe(),
+        worktree: settings.options.worktree.clone(),
     });
     let result = finish(settings, adapters, recorder, source, progress)
         .map_err(|error| error.in_run(&run_id));
@@ -334,18 +335,6 @@ fn finish(
     result
 }
 
-/// What a finished stage has to show for itself, in the terms the final
-/// summary uses. A stage whose checkpoint was already there says the same
-/// numbers and says where they came from: it never ran this time, and a
-/// watcher that could not tell the difference would be reporting work
-/// nobody did.
-fn detail(counts: String, from_checkpoint: bool) -> String {
-    match from_checkpoint {
-        true => format!("{counts}, from checkpoint"),
-        false => counts,
-    }
-}
-
 /// Everything a request carries before the diff, assembled once for the run.
 /// `tokens` is its measured size, which `triage` reserves before it cuts the
 /// first chunk.
@@ -359,22 +348,21 @@ struct Preamble {
 /// checkpoint is already on disk; the last two are finishing work and run
 /// every time. Every stage writes one checkpoint.
 fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResult, Error> {
-    context.stage_started(stage::input::NUMBER, stage::input::NAME);
-    let (changeset, from_checkpoint) =
-        match context.completed(stage::input::NUMBER, stage::input::NAME)? {
-            Some(done) => (done, true),
-            None => (Input::run(context, source)?, false),
-        };
+    context.stage_started(Stage::Input);
+    let (changeset, from_checkpoint) = match context.completed(Stage::Input)? {
+        Some(done) => (done, true),
+        None => (Input::run(context, source)?, false),
+    };
     context.stage_finished(
-        stage::input::NUMBER,
-        stage::input::NAME,
-        detail(format!("{} files", changeset.files.len()), from_checkpoint),
+        Stage::Input,
+        Outcome::Input {
+            files: changeset.files.len(),
+        },
+        from_checkpoint,
     );
 
-    let planned: Option<TriagePlan> =
-        context.completed(stage::triage::NUMBER, stage::triage::NAME)?;
-    let reviewed_before: Option<ReviewOutput> =
-        context.completed(stage::review::NUMBER, stage::review::NAME)?;
+    let planned: Option<TriagePlan> = context.completed(Stage::Triage)?;
+    let reviewed_before: Option<ReviewOutput> = context.completed(Stage::Review)?;
     // One set of bytes for both stages: `review` sends them and `triage`
     // holds their measured size back from the window, and those two have to
     // agree. Assembled only when one of them is going to run, because the
@@ -407,7 +395,7 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
         }
         false => None,
     };
-    context.stage_started(stage::triage::NUMBER, stage::triage::NAME);
+    context.stage_started(Stage::Triage);
     let from_checkpoint = planned.is_some();
     let plan: TriagePlan = match planned {
         Some(done) => done,
@@ -417,19 +405,15 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
         }
     };
     context.stage_finished(
-        stage::triage::NUMBER,
-        stage::triage::NAME,
-        detail(
-            format!(
-                "{} chunks, {} files skipped",
-                plan.chunks.len(),
-                plan.skipped.len()
-            ),
-            from_checkpoint,
-        ),
+        Stage::Triage,
+        Outcome::Triage {
+            chunks: plan.chunks.len(),
+            skipped: plan.skipped.len(),
+        },
+        from_checkpoint,
     );
 
-    context.stage_started(stage::review::NUMBER, stage::review::NAME);
+    context.stage_started(Stage::Review);
     let from_checkpoint = reviewed_before.is_some();
     let reviewed: ReviewOutput = match reviewed_before {
         Some(done) => done,
@@ -444,41 +428,26 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
         }
     };
     context.stage_finished(
-        stage::review::NUMBER,
-        stage::review::NAME,
-        detail(
-            match reviewed.unreviewed.is_empty() {
-                true => format!("{} chunks reviewed", reviewed.chunks.len()),
-                false => format!(
-                    "{} chunks reviewed, {} files unreviewed",
-                    reviewed.chunks.len(),
-                    reviewed.unreviewed.len()
-                ),
-            },
-            from_checkpoint,
-        ),
+        Stage::Review,
+        Outcome::Review {
+            chunks: reviewed.chunks.len(),
+            unreviewed: reviewed.unreviewed.len(),
+        },
+        from_checkpoint,
     );
 
-    context.stage_started(stage::merge::NUMBER, stage::merge::NAME);
-    let (merged, from_checkpoint): (MergeOutput, bool) =
-        match context.completed(stage::merge::NUMBER, stage::merge::NAME)? {
-            Some(done) => (done, true),
-            None => (Merge::run(context, &changeset, &reviewed)?, false),
-        };
+    context.stage_started(Stage::Merge);
+    let (merged, from_checkpoint): (MergeOutput, bool) = match context.completed(Stage::Merge)? {
+        Some(done) => (done, true),
+        None => (Merge::run(context, &changeset, &reviewed)?, false),
+    };
     context.stage_finished(
-        stage::merge::NUMBER,
-        stage::merge::NAME,
-        detail(
-            format!(
-                "{} comments, {}",
-                merged.comments.len(),
-                match merged.overall_score {
-                    Some(score) => format!("overall {score} / 100"),
-                    None => "not scored".to_string(),
-                }
-            ),
-            from_checkpoint,
-        ),
+        Stage::Merge,
+        Outcome::Merge {
+            comments: merged.comments.len(),
+            overall: merged.overall_score,
+        },
+        from_checkpoint,
     );
     // Here the rule changes. Each of the four stages above costs a fetch or a
     // model call, and its checkpoint is how a re-entered run avoids paying
@@ -487,7 +456,7 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
     // that never reached the MR -- a skip keyed on a checkpoint would take
     // both of those away. They still write their checkpoints and mark
     // themselves complete: `run show` and the run's terminal state read those.
-    context.stage_started(stage::report::NUMBER, stage::report::NAME);
+    context.stage_started(Stage::Report);
     let summary = Report::run(
         context,
         &ReportInput {
@@ -500,13 +469,9 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
     )?;
     // No checkpoint to have been read back: these two run every time, so
     // what they say is always what this process just did.
-    context.stage_finished(
-        stage::report::NUMBER,
-        stage::report::NAME,
-        format!("{} and {} written", layout::REPORT, layout::SUMMARY),
-    );
+    context.stage_finished(Stage::Report, Outcome::Report, false);
 
-    context.stage_started(stage::publish::NUMBER, stage::publish::NAME);
+    context.stage_started(Stage::Publish);
     let published = Publish::run(
         context,
         &PublishInput {
@@ -516,16 +481,13 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
         },
     )?;
     context.stage_finished(
-        stage::publish::NUMBER,
-        stage::publish::NAME,
-        match published.posted_to_platform {
-            true => format!(
-                "{} comments published, {} already on the change",
-                published.published.len(),
-                published.skipped_as_duplicate
-            ),
-            false => "nothing posted: this run was not asked to publish".to_string(),
+        Stage::Publish,
+        Outcome::Publish {
+            posted: published.published.len(),
+            already_there: published.skipped_as_duplicate,
+            asked: published.posted_to_platform,
         },
+        false,
     );
 
     Ok(Finished {

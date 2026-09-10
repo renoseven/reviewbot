@@ -11,16 +11,13 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{Confidence, Severity};
+use crate::domain::{Confidence, Severity, Stage};
 use crate::record::layout;
 
 use super::merge::MergeOutput;
 use super::review::CutShort;
 use super::triage::TriagePlan;
 use super::{StageContext, StageError};
-
-pub const NUMBER: u8 = 5;
-pub const NAME: &str = "report";
 
 /// Everything the report is rendered from, gathered by the caller so the
 /// stage takes one argument. No changeset and no platform: this stage reads
@@ -128,7 +125,7 @@ impl Report {
     ) -> Result<Summary, StageError> {
         let summary = Self::summary(context, input);
         Self::write_artifacts(context, input, &summary)?;
-        context.complete(NUMBER, NAME, &summary)?;
+        context.complete(Stage::Report, &summary)?;
         Ok(summary)
     }
 
@@ -367,10 +364,7 @@ mod tests {
         trace.diff = "@@ -10,2 +10,3 @@\n+buf[5] = 0;\n".to_string();
         trace.prompt = format!("instructions\n\ncontext of src/parse.h:\n{SECRET_BODY}\n");
         trace.model_output = r#"{"comments":[{"path":"src/parse.c"}]}"#.to_string();
-        trace.note(
-            crate::stage::merge::NAME,
-            "line 12 is not commentable; moved -1 to 11",
-        );
+        trace.note(Stage::Merge, "line 12 is not commentable; moved -1 to 11");
         trace.context_files.push(ContextFile {
             path: "src/parse.h".to_string(),
             first_line: 1,

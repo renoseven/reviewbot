@@ -13,16 +13,13 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::PlatformKind;
-use crate::domain::ChangeSet;
+use crate::domain::{ChangeSet, Stage};
 use crate::platform::{ChangeRef, DiffPaths, DiffRefs, OutgoingComment};
 use crate::record::layout;
 
 use super::merge::MergeOutput;
 use super::report::{Summary, badge_suffix, trace_line};
 use super::{StageContext, StageError};
-
-pub const NUMBER: u8 = 6;
-pub const NAME: &str = "publish";
 
 /// Everything that goes on the MR, gathered by the caller so the stage takes
 /// one argument. The changeset is here for the diff paths a comment has to be
@@ -62,7 +59,7 @@ impl Publish {
     ) -> Result<PublishOutput, StageError> {
         let output = Self::post(context, input)?;
         Self::persist_published(context, &output.published)?;
-        context.complete(NUMBER, NAME, &output)?;
+        context.complete(Stage::Publish, &output)?;
         Ok(output)
     }
 
@@ -257,8 +254,8 @@ impl Publish {
             return Ok(());
         };
         let note = "line is not commentable; posted as a file-level comment";
-        if !trace.has_note(NAME, note) {
-            trace.note(NAME, note);
+        if !trace.has_note(Stage::Publish, note) {
+            trace.note(Stage::Publish, note);
             context.recorder.write_trace(&trace)?;
         }
         Ok(())

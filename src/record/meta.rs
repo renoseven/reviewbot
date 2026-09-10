@@ -5,6 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::domain::Stage;
+
 use super::run_id::InputIdentity;
 use crate::budget::{Budget, Price};
 
@@ -64,8 +66,14 @@ pub struct Meta {
     /// recomputed, so a run re-entered without `--publish` still knows what it
     /// was asked for.
     pub publish: bool,
-    /// Stage names that finished, so a run re-entered can skip them.
-    pub completed_stages: Vec<String>,
+    /// How far this run got: this stage finished, and so did every stage
+    /// before it. One value rather than a set, because the stages are walked
+    /// in order and so progress can only ever be a prefix — and because
+    /// dropping a stage has to drop everything after it, which a set cannot
+    /// say. A run recorded before this field existed reads as "nothing
+    /// finished" and is worked out again rather than half trusted.
+    #[serde(default)]
+    pub completed_through: Option<Stage>,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -99,29 +107,37 @@ impl Meta {
             price: *budget.price(),
             spent: 0.0,
             publish,
-            completed_stages: Vec::new(),
+            completed_through: None,
             created_at: timestamp,
             updated_at: timestamp,
         }
     }
 
-    pub fn is_complete(&self, stage: &str) -> bool {
-        self.completed_stages.iter().any(|name| name == stage)
+    pub fn is_complete(&self, stage: Stage) -> bool {
+        self.completed_through.is_some_and(|done| stage <= done)
     }
 
-    pub fn mark_complete(&mut self, stage: &str) {
-        if !self.is_complete(stage) {
-            self.completed_stages.push(stage.to_string());
-        }
+    /// Stages finish in order, so the run keeps the furthest one it reached.
+    pub fn mark_complete(&mut self, stage: Stage) {
+        self.completed_through = Some(self.completed_through.map_or(stage, |done| done.max(stage)));
         self.updated_at = now();
     }
 
     /// A checkpoint that will not parse means the stage did not really
     /// finish; drop it and everything after it so the run continues from the
-    /// last complete snapshot.
-    pub fn mark_incomplete(&mut self, stage: &str) {
-        self.completed_stages.retain(|name| name != stage);
+    /// last complete snapshot. Later stages went on what this one produced,
+    /// so keeping them would mean trusting conclusions drawn from a file
+    /// nobody can read.
+    pub fn mark_incomplete(&mut self, stage: Stage) {
+        self.completed_through = stage.previous();
         self.updated_at = now();
+    }
+
+    /// The stages that finished, for anything that shows a run to a person.
+    pub fn completed_stages(&self) -> Vec<Stage> {
+        self.completed_through
+            .map(|done| done.through().collect())
+            .unwrap_or_default()
     }
 }
 

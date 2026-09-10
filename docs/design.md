@@ -115,7 +115,7 @@ input → triage → review ⇄ tools → merge → report → publish
 
 | 模块 | 职责 |
 |---|---|
-| `domain` | 只有三个类型：`ChangeSet`（进来的变更）、`Comment` 与 `Confidence`（出去的意见）。不依赖任何模块，也不放逻辑 |
+| `domain` | 五个共享类型：`ChangeSet`（进来的变更）、`Comment` 与它的两个分数档 `Severity` / `Confidence`（出去的意见），以及六阶段唯一身份 `Stage`。不依赖任何模块；`Stage` 只表达固定身份与顺序，不决定编排 |
 | `config` | 解析校验 `reviewbot.toml`，解析 `model` → `provider` → `protocol` 链，算配置指纹 |
 | `security` | 脱敏、路径校验、子进程环境清洗与资源上限、输出截断。**只提供检查，不提供强制**：这些都是可调用的函数，谁在什么时候调由调用方负责，不用类型把调用顺序焊死（[§6 安全](#安全)） |
 | `budget` | 预算冻结、调用前估算、usage 累计与结算 |
@@ -145,7 +145,7 @@ input → triage → review ⇄ tools → merge → report → publish
 
 ## 4. 核心数据模型
 
-`domain` 只有三个类型：`ChangeSet`、`Comment`、`Confidence`。`Trace` 归 `record`，`RunResult` 归 `lib.rs`，`Request` / `Response` 归 `protocol`。
+`domain` 只有五个共享类型：`ChangeSet`、`Comment`、`Severity`、`Confidence`、`Stage`。`Stage` 把阶段的编号、名字与顺序收成一个不会配错的身份；`Trace` 归 `record`，`RunResult` 归 `lib.rs`，`Request` / `Response` 归 `protocol`。
 
 ### ChangeSet
 
@@ -200,7 +200,7 @@ input → triage → review ⇄ tools → merge → report → publish
 | 后处理 | 解析、剔越界、对齐（偏移量）、引文核对结果、`external_files` 比对结果、去重 | 同左 |
 | usage | tokens in/out、单价、累计花费 | 同左 |
 
-**每条记录都带写它的阶段名**：`review` 记的是这场对话怎么走的（工具轮撑到上限、回复被截断、检查器一次没调、自述发出去了多少字节），`merge` 记的是定稿时发生了什么（丢了哪一条、行号挪了几位、引文过没过），`publish` 记的是发出去时降级成了文件级评论。阶段名是一个字段，不是正文前缀：重跑一个阶段只清它自己那些记录，靠字符串前缀去认就等于把阶段名变成了正文措辞的一部分，下次改一个字就清不掉了。从前 `merge` 每次运行前清空全部记录，把 `review` 写的会话经过一起抹掉——于是「模型只查了半程」和「行号被移了一位」在读的人眼里长得一样，而这两件事对同一条意见的可信度说的是完全不同的话。
+**每条记录都带写它的 `Stage`**：`review` 记的是这场对话怎么走的（工具轮撑到上限、回复被截断、检查器一次没调、自述发出去了多少字节），`merge` 记的是定稿时发生了什么（丢了哪一条、行号挪了几位、引文过没过），`publish` 记的是发出去时降级成了文件级评论。它是一个类型化字段，不是正文前缀，也不是一对可能配错的「编号 + 名字」参数；序列化仍是原来的小写名字，因此已有 trace 的格式不变。重跑一个阶段只清它自己那些记录，靠字符串前缀去认就等于把阶段身份变成正文措辞的一部分，下次改一个字就清不掉了。从前 `merge` 每次运行前清空全部记录，把 `review` 写的会话经过一起抹掉——于是「模型只查了半程」和「行号被移了一位」在读的人眼里长得一样，而这两件事对同一条意见的可信度说的是完全不同的话。
 
 一个 `trace_id` 对应一条或多条 comment，禁止多条共用含糊的「本次 run 日志」。
 
@@ -506,8 +506,8 @@ diff 模式认**内容**不认路径：同一份 diff 改个文件名，命中�
 
 ```
 <runs_dir>/<run_id>/
-  meta.json                 # 输入、选中的模型、配置指纹、冻结的预算与货币、本次是否要发布
-  stages/<n>-<stage>.json   # 每阶段结果
+  meta.json                 # 输入、模型、指纹、预算、发布意图，以及 completed_through
+  stages/<n>-<stage>.json   # 每阶段结果；编号与名字都由同一个 Stage 给出
   traces/<trace_id>.json    # internal 视图。`review-<path>`，被切开的文件是
                             # `review-<path>-<第几片>`（[§7](#分片交接单文件被切开时)）
   published.json            # 已发布 comment 的幂等键
@@ -543,6 +543,10 @@ diff 模式认**内容**不认路径：同一份 diff 改个文件名，命中�
 至少这些边界落盘后才进下一阶段：输入解析完成、每个 tool 调用完成、每次模型调用完成（含 usage）、每条 comment 定稿、每条 comment 发布成功。
 
 启动时按 `run_id` 加载最新完整 checkpoint，跳过已成功阶段，只重试失败点及其下游，已成功的 tool 与模型调用结果原样复用。Checkpoint 原子写入（临时文件 + rename）；损坏回退到上一个完整快照，而不是当作空 run。禁止捕获错误后整次重跑。
+
+`meta.json` 不存一组互相独立的「已完成阶段」，只存 `completed_through: Option<Stage>`。六阶段只能按顺序走，合法进度因此必然是一个前缀；用一个最远位置表达它，比一个允许 `{input, review}` 这种不可能状态的集合更诚实，也让判断与展示各归其位：跳过时比较某阶段是否不晚于 `completed_through`，`run list` / `run show` 要给人看清单时再由这个前缀展开。旧 run 没有这个字段，`#[serde(default)]` 把它读作「一个阶段也没完成」，宁可重新做，也不半信一份无法证明连续性的旧集合。
+
+这也终于让「checkpoint 损坏就退回上一份完整快照」从愿望变成了状态能表达的动作：某阶段文件读不出来，`mark_incomplete` 就把 `completed_through` 退到它的前一阶段，于是该阶段和它之后的全部阶段一起失效。后续结论建立在这份已不可读的产物上，不能只从集合里删掉坏掉的那一个、却继续信任下游。
 
 **「跳过已成功阶段」只管前四个。** `input` / `triage` / `review` / `merge` 每一个都要么摸网络要么花模型的钱，checkpoint 就是让第二次进入不必再付这笔钱的东西，有就跳过。`report` 与 `publish` 反过来：一个纯本地渲染、一个本来就幂等，两个都不贵，而它们**每次进入都跑**恰恰是替掉那两个删掉的补救命令的办法——重新渲染一份报告、把没发出去的评论补齐，从此都只是「把同一条命令再跑一遍」。它们照样各写一份 checkpoint 并标记自己完成，`run show` 和 run 的终态读的就是那个。
 
@@ -758,7 +762,7 @@ published 视图仍是去掉文件正文的那份——给需要外发一份 tra
 - **调用前检查**：`已花费 + 本次估算 > limit` 就停，不允许超支后补救。Tool 间接触发的模型调用同样计入。`budget = -1` 时这道检查恒通过，`budget = 0` 时恒不通过。
 - **结算**：响应回来后用真实 `usage` 换算实际花费覆盖估算值，累计写进 checkpoint 和相关 trace；缓存命中走 `cached_input_per_1m`。`usage.output_tokens` **已经含思维链**（`output_tokens_details.reasoning_tokens` 是其中的拆分，不是另开一笔）；按输出单价乘 `output_tokens`，不要把 `reasoning_tokens` 再加一遍。
 - **中止**：预算耗尽时输出已定稿 comments + 明确的中止原因 + **未评审文件清单**，不静默丢弃、不偷偷换便宜模型继续跑。
-- **全程串行**：六个阶段串行，`review` 的分片也逐个跑，不并发。
+- **全程串行**：这条规则约束的是评审流水线——六个阶段串行，`review` 的分片也逐个跑，不并发；否则两个调用都可能通过同一份调用前预算检查，预算闸就失效。状态屏另有一个只读共享状态、约每 100ms 画一帧的线程，但它只画终端，不运行阶段、不发模型调用、不碰预算或 checkpoint，因此没有削弱这条规则。
 
 ### 严重程度与置信度
 
@@ -1505,7 +1509,36 @@ summary    ./runs/75e8b18e48cbe7a3/summary.json
 
 「从 checkpoint 读回来的」这句不是装饰：一个看不出差别的观察者会把没人干过的活报成干过了，而这两次屏幕上的数字一模一样。
 
-TTY 上则不是这样逐行追加，而是就地重画一块摘要形状的东西——`run_id` / `model` / `overall` / `comments` / `skipped` / `unreviewed` / `budget` / `report` / `summary` / `published`，知道一个长一行，底下一行说此刻在做什么（`review  chunk 3/7  src/foo.c  round 2/6  tool cppcheck`）。跑完这块被抹掉，最终摘要写在同一处。
+TTY 上不是一串会把终端往下推的事件，而是一块固定十行的 checklist：标题一行、六个阶段各一行、底部三行活动。六阶段从第一帧就都在，完成、正在跑、尚未开始分别用 `✓`、`▸`、`·`；`review` 那一行把 chunk 与 file 分开计数，因为一个大文件会拆成多个 chunk，把两者混成一个分母会谎报「看完了多少文件」。底部才放当前路径、带 spinner 的等待或工具执行、以及本 chunk 已完成工具的 tally；花费跟着 `review` 行更新。工具因此有两个互补视角：正在执行的是 `running cppcheck  ·  2s`，已经答完的是 `tools  read_file ×3  search_repo ×2`。
+
+固定高度不是审美偏好，而是 ratatui inline viewport 的边界：viewport 创建后不能改高度（ratatui#984），所以不能再沿用「知道一个字段才长一行」的布局。也不靠 `insert_before` 把完成事件塞进上方 scrollback；连续重画时调整窗口会把 viewport 重复进 scrollback（ratatui#2666）。管道才负责保留历史，而且有意收得很窄：一个 run header、每个 chunk 一行（带当时花费）、每个完成阶段一行；轮次、工具与单次 spend 只改变 TTY 当前帧，不制造日志洪水。
+
+动画必须由独立线程按约 100ms 一帧重画。模型调用会把评审流水线阻塞几十秒，如果只在收到事件时画，最需要 reassurance 的等待期恰好完全静止。这个线程只从共享状态画屏，不碰流水线；`finish()` 消耗状态屏、清掉整块并归还终端，之后最终摘要或失败信息才有机会输出，调用顺序因而不会写反。inline viewport 初始化时必须询问光标位置，有些看似终端的环境不会回答；claim 失败会在 run 日志留一条 `warn`，并退回只追加行的 pipe 形态，不能因为画不了 TUI 就让运行过程彻底失声。全程不用 raw mode，也不读按键。
+
+`round 3/12` 被删掉，因为裸数字既不说明在数什么，也会把上限误读成预计总轮数。它只在模型等待行里写成 `exchange 3/12`：这是模型索取上下文、工具回答的一次往返，12 是会提前结束这个 chunk 的上限而不是预测；接近上限时用 warning 色正是因为撞顶意味着证据只收了一半。下面两帧来自同一次真实 PTY 运行，不另编一套示例：
+
+```
+reviewbot  ·  diff only, no checkout
+  · 1 input
+  · 2 triage
+  · 3 review
+  · 4 merge
+  · 5 report
+  · 6 publish
+  ⠋ starting
+```
+
+```
+reviewbot  /tmp/change.diff  ·  deepseek-v4-flash  ·  diff only, no checkout
+  ✓ 1 input     2 files                                                   0.0s
+  ✓ 2 triage    2 chunks, 0 files skipped                                 0.0s
+  ▸ 3 review    chunk 1/2  ·  file 1/2                                    0.1s
+  · 4 merge
+  · 5 report
+  · 6 publish
+  a.c
+  ⠙ waiting for the model  ·  exchange 1/12  ·  0.0s
+```
 
 失败时 stderr 上是这样：
 
@@ -1571,7 +1604,7 @@ code-review:
 
 crate 同时产出 `lib` 与 `bin` 两个 target。**业务逻辑一律针对 lib 测试**；只有输出流分配、退出码这类 CLI 契约必须起子进程才验得了，用一小组 `assert_cmd` 集成测试覆盖。
 
-依赖：`tokio`、`reqwest`(rustls)、`serde`/`serde_json`、`toml`、`clap`、`sha2`、`regex`、`thiserror`、`tracing`、`dirs`、`shellexpand`；dev-dependency 加 `assert_cmd`。
+依赖：`tokio`、`reqwest`(rustls)、`serde`/`serde_json`、`toml`、`clap`、`sha2`、`regex`、`thiserror`、`tracing`、`ratatui`、`dirs`、`shellexpand`；dev-dependency 加 `assert_cmd`。
 
 测试必须能离线跑，否则 [§13](#13-验收) 的验收无法自动化。测试时适配器全换成假实现，`review()` 就能带着六个阶段整套在本地跑完；`progress` 那一端传 `Silent`，或者传一个只把收到的事件记下来的实现。
 
@@ -1634,8 +1667,8 @@ crate 同时产出 `lib` 与 `bin` 两个 target。**业务逻辑一律针对 li
 - **分片交接**：把一个文件切成两片，断言两片的 `trace_id` 不同、两份 trace 文件都还在（此前它们同名，后写的覆盖了先写的）；断言未切开的文件仍拿 `review-<path>` 这个名字、且它的 `input` 里没有任何交接段；断言第二片的 `input` 首条消息里写着「第 2 片 / 共 2 片」、带着第一片已提交意见的行号与摘要、带着第一片模型留下的那句话，而第一片自己那段里没有「已经提过」；断言末片不再被要求留交接。
 - **上下文**：断言硬顶随 `--model` 的 `context_window` 变化、工作大小取 `max_chunk_tokens` 且被硬顶夹住；断言调大 `max_tool_rounds` 会把分片上限压小，即 `工具余量` 确实进了公式；断言余量大到分片装不下一份最小 diff 时**启动即失败**、错误点名那两个旋钮，而同一份配置在没注册检视类 tool（余量为 0）时照常能跑；假模型一轮返回多个 `function_call`，断言这一轮回填进 `input` 的工具输出合计不超过 `max_tool_output_bytes`；假 tool 每轮返回大段输出，断言循环在撑爆 `context_window` 前主动停止并要到最后一轮结论，全程没有一个请求是靠厂商 400 拦下的；断言 `context_window` 缺失或不大于 `max_output_tokens` 时启动失败。
 - **命令树的帮助文案**：遍历整棵命令树，断言每个子命令与每个参数至少有一份说明（短说明与长说明都缺就失败），并断言 `review`、`run prune`、`config check`、`tool list` 四条各有长说明。
-- **trace 的阶段归属**：断言每条记录都带写它的阶段名；断言 `merge` 重跑只清掉自己那些记录、`review` 记的会话经过还在（这正是从前被整份清空的东西）；断言 `publish` 降级成文件级评论时那句话记在 `publish` 名下且不重复记第二遍。
-- **状态屏**：不起子进程，直接把一串事件喂给它、比对写出来的字节。断言非 TTY 那一版只增不减、一个移动光标的字节都不出，且每个完成的阶段各留一行；断言 TTY 那一版只为**已知的**字段留行（早期的块比后期短），活动行随分片、轮次、工具变，重画时上移的行数等于上次真正画出来的行数；断言 `finish()` 把整块抹掉，好让最终摘要写在同一处；断言关掉颜色只少了转义字节、重画契约不变；断言块里的标签与 `render::run_result()` 用的是同一组词、同样的宽度。
+- **trace 的阶段归属**：断言每条记录都带写它的 `Stage`；断言 `merge` 重跑只清掉自己那些记录、`review` 记的会话经过还在（这正是从前被整份清空的东西）；断言 `publish` 降级成文件级评论时那句话记在 `publish` 名下且不重复记第二遍。
+- **状态屏**：不起真实子进程，用 ratatui `TestBackend` 直接画共享状态并读回十行。断言 inline viewport 高度固定为「标题 + 六阶段 + 三活动行」、六阶段第一帧就齐全，spinner 随 tick 前进；断言 review 行把 chunk / file / spend 分开，等待行写 `exchange`，工具执行与完成 tally 分列；断言 `finish()` 先停画线程、清掉整块再交还终端。另断言非 TTY 只留下 run header、每个 chunk 与每个完成阶段，不为 round、tool、spend 单独出行；claim inline viewport 失败则回退到同一 pipe 渲染。
 - **日志落在 run 目录**：断言 run 起来之前产生的诊断先攒着、run 目录一确定就连同后续一起写进 `<run dir>/log`；断言同一个 run 再进来一次是**追加**、上一次那半程还在；断言 `tracing` 一个字节都没上 stdout 或 stderr；断言 `[log].level` 改了级别跟着变、`RUST_LOG` 盖得过它、配置缺失或写坏时退回 `info` 而不是启动失败；断言改 `[log].level` **不换 `run_id`**；断言 `run show` 印出这个路径。
 - **CLI 契约**（`assert_cmd`）：断言成功的 run 在 stderr 上一个字节都不写；`-q` 下成功的 run 在 stdout 上也一个字节都不写（状态屏也没有），而失败时 stderr 仍有那句错误；断言失败输出里 `run_id` 那行必有，`next:` 那行是本次 `argv` 的原文、带空格或 shell 元字符的词被引起来、而不进 run 的子命令（如 `config check`）不印这一行；`--format json` 时 stdout 是可解析的纯 JSON、没有状态屏混入（`-q` 同时给也照出），`run list --format json` 同样可解析且生效的 runs 目录是文档里的字段而非前置的一行文本；`--output-dir` 单独给时 stdout 仍有状态屏，且拷出去的两份内容不随 `--format` 改变；断言一个 flag 都不给时 run 目录里 `report.md` 与 `summary.json` 都在，给了 `--output-dir` 时该目录下落的是 `report-<run_id>.md` 与 `summary-<run_id>.json`、内容与 run 目录里的逐字节相同；断言同一个 `--output-dir` 连着跑两个不同输入时四个文件都在，没有互相覆盖；断言各类失败对应的退出码；断言 `tool list` 按用途分组印出契约（调用签名、描述、逐参数一行、轮次、前置条件）且**一个字都不说「是否注册」**，`--format json` 同构；断言假 key 不出现在任何一条日志与错误信息里；断言不给 `--publish` 时假 platform 收不到任何写请求，而 diff 输入加 `--publish` 启动即失败；断言位置参数的三种形态各自被认成对的输入，且把 URL 写错成不存在的路径时报的是「打不开文件」而非静默当空 diff；喂 `git format-patch` 的 mbox 输出时断言明确报「只收 unified diff」，而存成 `.patch` 扩展名的 unified diff 照常能跑。
 
@@ -1649,7 +1682,7 @@ crate 同时产出 `lib` 与 `bin` 两个 target。**业务逻辑一律针对 li
 
 **第一步：分层骨架（M1）**
 
-1. **M1 由下往上把层立齐**：`domain` 三个类型 → 设施（`config` 的 `model` → `[[model]]` → `[[provider]]` → `protocol` 解析链、`record` 的 `run_id` 与落盘、`budget`、`security`）→ **那三个扩展点适配器的 trait 及其假实现** → `stage::*` 六个空阶段 → `lib.rs` 里 `review()` 那段顺序 → CLI 外壳（`review` / `config check` 先落地，其余子命令随能力补）。验收标准是**假实现下六个阶段能空跑到底并正确落盘、把同一条命令再跑一遍能从任一阶段接上**——此时它还不会评审任何代码，但分层已经成立，往后每一层都能单独换真实现。
+1. **M1 由下往上把层立齐**：`domain` 的共享类型（含六阶段唯一身份 `Stage`）→ 设施（`config` 的 `model` → `[[model]]` → `[[provider]]` → `protocol` 解析链、`record` 的 `run_id` 与落盘、`budget`、`security`）→ **那三个扩展点适配器的 trait 及其假实现** → `stage::*` 六个空阶段 → `lib.rs` 里 `review()` 那段顺序 → CLI 外壳（`review` / `config check` 先落地，其余子命令随能力补）。验收标准是**假实现下六个阶段能空跑到底并正确落盘、把同一条命令再跑一遍能从任一阶段接上**——此时它还不会评审任何代码，但分层已经成立，往后每一层都能单独换真实现。
 
 **第二步：把流程走完（M2–M5）**。这一步的完成标准只有一句：**喂一个真的 MR URL，评审意见真的出现在那个 MR 上（带可追溯的 `trace_id`）**。每个里程碑仍以「整条链跑得完」为准。
 
@@ -1764,7 +1797,7 @@ crate 同时产出 `lib` 与 `bin` 两个 target。**业务逻辑一律针对 li
 
 - 模块依赖单向：`stage::*` → 适配器 → 设施 → `domain`，反向依赖不允许；`stage::*` 之间不互相依赖，**顺序只出现在 `lib.rs` 的 `review()` 里**，没有编排模块，那个函数除这段顺序外只有模块声明与再导出（[§10](#10-库与-cli)）
 - 每一层都能单独测：单元 / 契约 / 阶段 / 整装 / CLI 五档各自可跑，没有哪个行为非得起端到端才验得了（[§11](#11-依赖与测试)）
-- `domain` 里只有 `ChangeSet`/`Comment`/`Confidence` 三个类型且不含逻辑，新增类型须先证明它没有主人
+- `domain` 里只有 `ChangeSet` / `Comment` / `Severity` / `Confidence` / `Stage` 五个共享类型；`Stage` 只固化身份与顺序，不承担编排，新增类型仍须先证明它没有别的主人
 
 ## 14. 待定与已知空白
 

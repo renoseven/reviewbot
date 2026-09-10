@@ -18,6 +18,8 @@ use std::sync::Arc;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::domain::Stage;
+
 pub use listing::{
     DEFAULT_KEEP, PruneReport, RunRow, RunShow, WARN_AFTER_RUNS, count_runs, list_run_dirs,
     list_runs, prune_runs, show_run,
@@ -120,15 +122,14 @@ impl Recorder {
     /// complete snapshot instead of being restarted from scratch.
     pub fn completed<T: DeserializeOwned>(
         &mut self,
-        number: u8,
-        stage: &str,
+        stage: Stage,
     ) -> Result<Option<T>, RecordError> {
         if !self.meta.is_complete(stage) {
             return Ok(None);
         }
-        let file = layout::stage_file(number, stage);
+        let file = layout::stage_file(stage);
         let Some(bytes) = self.storage.read(&file)? else {
-            tracing::warn!(stage, "checkpoint is missing; running the stage again");
+            tracing::warn!(%stage, "checkpoint is missing; running the stage again");
             self.meta.mark_incomplete(stage);
             self.write_meta()?;
             return Ok(None);
@@ -136,7 +137,7 @@ impl Recorder {
         match serde_json::from_slice(&bytes) {
             Ok(value) => Ok(Some(value)),
             Err(error) => {
-                tracing::warn!(stage, %error, "checkpoint will not parse; running the stage again");
+                tracing::warn!(%stage, %error, "checkpoint will not parse; running the stage again");
                 self.meta.mark_incomplete(stage);
                 self.write_meta()?;
                 Ok(None)
@@ -146,13 +147,8 @@ impl Recorder {
 
     /// Write the checkpoint, then record the stage as done. In that order:
     /// a success flag with no file behind it would be a lie.
-    pub fn complete<T: Serialize>(
-        &mut self,
-        number: u8,
-        stage: &str,
-        output: &T,
-    ) -> Result<(), RecordError> {
-        let file = layout::stage_file(number, stage);
+    pub fn complete<T: Serialize>(&mut self, stage: Stage, output: &T) -> Result<(), RecordError> {
+        let file = layout::stage_file(stage);
         self.write_json(&file, output)?;
         self.meta.mark_complete(stage);
         self.write_meta()

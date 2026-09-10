@@ -99,8 +99,7 @@ fn an_unreadable_credential_is_a_config_error() {
 #[test]
 fn a_diff_input_with_publish_fails_before_anything_is_written() {
     let directory = tempfile::tempdir().expect("temp dir");
-    let diff = directory.path().join("change.diff");
-    std::fs::write(&diff, "--- a/src/parse.c\n+++ b/src/parse.c\n").expect("write diff");
+    let diff = fixture("change.diff");
     let runs = directory.path().join("runs");
 
     let output = reviewbot()
@@ -118,13 +117,9 @@ fn a_diff_input_with_publish_fails_before_anything_is_written() {
 fn the_input_format_is_judged_by_content_not_by_extension() {
     let directory = tempfile::tempdir().expect("temp dir");
     let runs = directory.path().join("runs");
-    let diff = "\
---- a/src/parse.c
-+++ b/src/parse.c
-@@ -1,1 +1,2 @@
- int before(void);
-+int added(void);
-";
+    // The same bytes the fixture holds, so the mbox this wraps differs from a
+    // real diff only by the header git format-patch puts on it.
+    let diff = std::fs::read_to_string(fixture("change.diff")).expect("fixture");
 
     // git format-patch output is refused outright rather than stripped.
     let mbox = directory.path().join("series.patch");
@@ -175,18 +170,7 @@ fn a_piped_review_appends_progress_then_the_text_summary() {
         .expect("fixture")
         .replace("budget_per_run = 10.0", "budget_per_run = 0.0");
     std::fs::write(&config, configured).expect("config");
-    let diff = directory.path().join("change.diff");
-    std::fs::write(
-        &diff,
-        "\
---- a/src/parse.c
-+++ b/src/parse.c
-@@ -1,1 +1,2 @@
- int before(void);
-+int added(void);
-",
-    )
-    .expect("diff");
+    let diff = fixture("change.diff");
     let runs = directory.path().join("runs");
 
     let output = reviewbot()
@@ -209,7 +193,7 @@ fn a_piped_review_appends_progress_then_the_text_summary() {
         "tracing never reaches stderr"
     );
     assert!(
-        stdout.contains("[1/6] input     1 files\n"),
+        stdout.contains("[1/6] input     1 file\n"),
         "the pipe retains finished stages: {stdout}"
     );
     assert!(
@@ -346,7 +330,7 @@ fn run_list_text_aligns_spent_with_currency_and_utc() {
             "price": {"input_per_1m_tokens": 3.0, "cached_input_per_1m_tokens": 0.1, "output_per_1m_tokens": 9.0},
             "spent": 0.0316,
             "publish": false,
-            "completed_stages": ["input", "triage", "review", "merge", "report", "publish"],
+            "completed_through": "publish",
             "created_at": 1788936240,
             "updated_at": 1788936240
         }"#,
