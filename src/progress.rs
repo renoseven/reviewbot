@@ -107,6 +107,12 @@ fn count(value: usize, singular: &'static str, plural: &'static str) -> &'static
 /// it happened in.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
+    /// Before the run has an id. What happens first is working out which
+    /// change this is — for a URL that means fetching the merge request and its
+    /// diff, which is seconds of a watcher having nothing else to say — and then
+    /// taking the run directory the id names. Said so that those seconds are
+    /// accounted for rather than looking like a run that has not started.
+    Opening,
     /// The run has a directory and an id, and has spent nothing yet.
     /// `input` names what is being reviewed the way the run's own record
     /// does: the platform locator, or where the diff came from.
@@ -119,6 +125,12 @@ pub enum Event {
         /// run's own directory, opened empty and filled only as needed.
         worktree: Option<PathBuf>,
     },
+    /// The preamble both `triage` and `review` need is being assembled: the
+    /// list of files this change touches, and the digest of the repository's
+    /// layout — which is a tree fetch, and on a large project several seconds
+    /// of it. It belongs to neither stage, so the checklist has no row for it
+    /// and a watcher would otherwise have nothing to say for those seconds.
+    Preparing,
     /// A stage is about to run, or about to be skipped. Both are said, so a
     /// watcher can show all six without knowing which of them cost anything.
     StageStarted { stage: Stage },
@@ -130,16 +142,29 @@ pub enum Event {
         outcome: Outcome,
         from_checkpoint: bool,
     },
-    /// One chunk of the review stage, counted from 1 for the reader rather
-    /// than from 0 for the loop.
+    /// The review stage has moved on to a file. Counted from 1 for the reader
+    /// rather than from 0 for the loop.
+    ///
+    /// A file too big for one request is reviewed in several pieces, so `piece`
+    /// says which one this is and `pieces` how many there are — 1 of 1 for a
+    /// file that fitted. What a watcher shows is files: pieces are how the diff
+    /// had to be cut, not progress through the change.
     Chunk {
         index: usize,
         of: usize,
         path: String,
+        piece: usize,
+        pieces: usize,
     },
-    /// One round of the tool loop inside the current chunk. `of` is the
-    /// configured ceiling, not a forecast: most chunks end far short of it.
+    /// One round of the tool loop inside the current file. `of` is the ceiling
+    /// this run worked out, not a forecast: most files end far short of it.
+    /// Never emitted for the concluding turn, which is not a round of the loop
+    /// — saying so was how a screen came to show `round 13/12`.
     Round { round: u32, of: u32 },
+    /// The loop is over and the model is being asked to conclude: either it
+    /// used every round, or the conversation reached the window. `why` is the
+    /// same sentence the trace and the report carry.
+    Concluding { why: String },
     /// A tool the model asked for, as the call goes out. Its answer goes to
     /// the model and to the trace, not here.
     Tool { name: String },

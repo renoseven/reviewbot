@@ -204,6 +204,9 @@ pub(crate) fn review_with(
     if settings.options.publish && !matches!(source, Source::Url(_)) {
         return Err(Error::PublishNeedsPlatform);
     }
+    // Everything from here to `RunStarted` is one wait with nothing to show for
+    // it: a URL has its change fetched before anything can be named.
+    progress.emit(Event::Opening);
     let input = Input::identify(adapters, source)?;
     // The head sha is settled now, and repository reads are always by it.
     adapters.bind_repo(&input);
@@ -370,6 +373,10 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
     // with only the report and the posting left has no business fetching a tree.
     let preamble = match planned.is_none() || reviewed_before.is_none() {
         true => {
+            // Between two stages and belonging to neither, so it says so
+            // itself: the tree this fetches is seconds of work on a large
+            // project, and no stage is running to account for them.
+            context.progress.emit(Event::Preparing);
             let orientation = Orientation::build(context, &changeset);
             let instructions = stage::review::assemble_instructions(
                 &context.adapters.tools,

@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::budget::{Budget, Limit, Price, TokenUsage};
 use crate::config::{RunOptions, Settings};
-use crate::progress::Silent;
+use crate::progress::{Event, Progress};
 use crate::protocol::{OutputItem, Protocol, ProtocolError, Request, Response};
 use crate::record::{LocalStorage, Meta, Recorder, RunIdentity, Storage, layout};
 use crate::security::{PathPolicy, Redactor};
@@ -161,6 +161,26 @@ pub struct StageFixture {
     budget: Budget,
     paths: PathPolicy,
     sent: Arc<Mutex<Vec<Request>>>,
+    progress: Heard,
+}
+
+/// A watcher that keeps what it was told, so a stage test can assert what the
+/// stage said as well as what it did.
+#[derive(Default)]
+pub struct Heard {
+    events: Mutex<Vec<Event>>,
+}
+
+impl Heard {
+    fn heard(&self) -> Vec<Event> {
+        self.events.lock().expect("watcher").clone()
+    }
+}
+
+impl Progress for Heard {
+    fn emit(&self, event: Event) {
+        self.events.lock().expect("watcher").push(event);
+    }
 }
 
 impl StageFixture {
@@ -260,6 +280,7 @@ impl StageFixture {
             budget,
             paths,
             sent,
+            progress: Heard::default(),
         }
     }
 
@@ -271,11 +292,15 @@ impl StageFixture {
             budget: &mut self.budget,
             redactor: &self.adapters.redactor,
             paths: &self.paths,
-            // What a stage emits is asserted where a whole run can be seen;
-            // a stage test hands in the watcher that hears everything and
-            // keeps nothing.
-            progress: &Silent,
+            progress: &self.progress,
         }
+    }
+
+    /// What the stage said about itself. Kept here as well as asserted over a
+    /// whole run, because some of it is only decidable inside one stage: that
+    /// the turn after the last round is not announced as another round, for one.
+    pub fn progress(&self) -> Vec<Event> {
+        self.progress.heard()
     }
 
     pub fn recorder(&self) -> &Recorder {

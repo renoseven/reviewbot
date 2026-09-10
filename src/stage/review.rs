@@ -176,6 +176,8 @@ impl Review {
                 index: chunk.index + 1,
                 of,
                 path: chunk.path.clone(),
+                piece: chunk.piece + 1,
+                pieces: chunk.pieces,
             });
             let carried = handoff
                 .take()
@@ -363,10 +365,17 @@ impl Review {
                 round = chat.rounds + 1,
             )
             .entered();
-            context.progress.emit(Event::Round {
-                round: chat.rounds + 1,
-                of: max_rounds,
-            });
+            // The concluding turn is not a round of the tool loop: counting it
+            // as one is how this came out as `round 13/12`.
+            match chat.concluding {
+                true => context.progress.emit(Event::Concluding {
+                    why: chat.cut_short.clone().unwrap_or_default(),
+                }),
+                false => context.progress.emit(Event::Round {
+                    round: chat.rounds + 1,
+                    of: max_rounds,
+                }),
+            }
             let response = context.send_and_settle(&request)?;
             chat.trace.usage.add(&response.usage);
             chat.record_turn(&response);
@@ -1449,6 +1458,42 @@ mod tests {
                 .any(|check| check.contains("called none of them")),
             "{:?}",
             trace.checks
+        );
+    }
+
+    /// The concluding turn is not a round of the loop, and a watcher that was
+    /// told it was showed `round 13/12`.
+    #[test]
+    fn the_concluding_turn_is_not_announced_as_another_round() {
+        let (tools, _) = counted("clean");
+        let mut fixture = StageFixture::scripted(
+            vec![
+                Reply::calls(&[("cppcheck", r#"{"path":"a"}"#)]),
+                Reply::calls(&[("cppcheck", r#"{"path":"b"}"#)]),
+                Reply::calls(&[("submit_comment", COMMENT)]),
+            ],
+            Limit::Amount(10.0),
+        )
+        .with_tools(with_submit(tools));
+
+        review_over(&mut fixture, &plan_with("src/parse.c", 2, 32_768));
+
+        let rounds: Vec<(u32, u32)> = fixture
+            .progress()
+            .iter()
+            .filter_map(|event| match event {
+                Event::Round { round, of } => Some((*round, *of)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rounds, vec![(1, 2), (2, 2)], "no round past the ceiling");
+        assert!(
+            fixture
+                .progress()
+                .iter()
+                .any(|event| matches!(event, Event::Concluding { why } if why.contains("ceiling"))),
+            "the turn that replaces a round says what it is: {:?}",
+            fixture.progress()
         );
     }
 

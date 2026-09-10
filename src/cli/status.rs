@@ -12,7 +12,7 @@
 
 use std::collections::BTreeSet;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -51,6 +51,19 @@ impl Status {
             },
             None => Self::pipe(Box::new(std::io::stdout())),
         }
+    }
+
+    /// What the caller already knows before the run does: which model was
+    /// selected, what it was pointed at, and which checkout it may read. The
+    /// run replaces all three the moment it can name itself, but until then a
+    /// screen that shows them is a screen that says what is about to happen.
+    pub fn about(self, input: &str, model: Option<&str>, worktree: Option<&Path>) -> Self {
+        if let Ok(mut state) = self.state.lock() {
+            state.input = input.to_string();
+            state.model = model.unwrap_or_default().to_string();
+            state.worktree = worktree.map(Path::to_path_buf);
+        }
+        self
     }
 
     pub fn pipe(writer: Box<dyn Write + Send>) -> Self {
@@ -96,8 +109,10 @@ pub(super) struct State {
     pub(super) model: String,
     pub(super) worktree: Option<PathBuf>,
     pub(super) stages: Vec<StageRow>,
-    /// Which chunk of the review stage, and how many there are.
-    pub(super) chunk: Option<(usize, usize)>,
+    /// Which piece of the current file, and how many pieces it was cut into.
+    /// `None` while nothing is being reviewed; `(1, 1)` for a file that fitted
+    /// in one request, which is the ordinary case and says nothing worth a row.
+    pub(super) piece: Option<(usize, usize)>,
     pub(super) path: Option<String>,
     /// Files, which are not chunks: one file too big for a single request is
     /// reviewed as several. Both are counted so neither can be read as the
@@ -109,6 +124,15 @@ pub(super) struct State {
     pub(super) exchange: Option<(u32, u32)>,
     pub(super) waiting_since: Option<Instant>,
     pub(super) tool: Option<(String, Instant)>,
+    /// Why the loop is over, once it is: the model is being asked to conclude
+    /// on what it has rather than on everything it wanted.
+    pub(super) concluding: bool,
+    /// Since when the run has been working out which change this is. Cleared by
+    /// the first stage, which is the moment there is something better to say.
+    pub(super) opening: Option<Instant>,
+    /// Since when the prompt both `triage` and `review` need has been being
+    /// assembled. Cleared by the next stage to start, for the same reason.
+    pub(super) preparing: Option<Instant>,
     input_files: Option<usize>,
     paths_seen: BTreeSet<String>,
 }
@@ -129,7 +153,7 @@ impl Default for State {
                     step: Step::Pending,
                 })
                 .collect(),
-            chunk: None,
+            piece: None,
             path: None,
             files_seen: 0,
             files_total: None,
@@ -137,6 +161,13 @@ impl Default for State {
             exchange: None,
             waiting_since: None,
             tool: None,
+            concluding: false,
+            // Starting from the moment there is a screen at all: the run says
+            // so too, a moment later, but the frames before that would
+            // otherwise show a checklist of six things not started — and then
+            // take it away again when the run finally speaks.
+            opening: Some(Instant::now()),
+            preparing: None,
             input_files: None,
             paths_seen: BTreeSet::new(),
         }
@@ -184,6 +215,18 @@ impl State {
                 line.push('\n');
                 Some(line)
             }
+            // Nothing is named yet; what there is to say is that the wait has
+            // started and what it is for.
+            Event::Opening => {
+                self.opening = Some(now);
+                None
+            }
+            // Work that belongs to no stage, so the row that moves says what
+            // it is instead of going quiet.
+            Event::Preparing => {
+                self.preparing = Some(now);
+                None
+            }
             Event::StageStarted { stage } => {
                 self.begin(stage, now);
                 None
@@ -222,8 +265,14 @@ impl State {
                 self.forget_chunk();
                 Some(line)
             }
-            Event::Chunk { index, of, path } => {
-                self.chunk = Some((index, of));
+            Event::Chunk {
+                index: _,
+                of,
+                path,
+                piece,
+                pieces,
+            } => {
+                self.piece = Some((piece, pieces));
                 if self.paths_seen.insert(path.clone()) {
                     self.files_seen += 1;
                 }
@@ -232,10 +281,16 @@ impl State {
                 self.waiting_since = None;
                 self.tool = None;
                 Some(format!(
-                    "[{}/{}] {:<9} chunk {index}/{of}  {path}{}\n",
+                    "[{}/{}] {:<9} file {}/{}  {path}{}{}\n",
                     Stage::Review.number(),
                     Stage::ALL.len(),
                     Stage::Review.name(),
+                    self.files_seen,
+                    self.files_total.unwrap_or(of),
+                    match pieces {
+                        1 => String::new(),
+                        pieces => format!("  piece {piece}/{pieces}"),
+                    },
                     match &self.spend {
                         Some(spend) => format!("  {spend}"),
                         None => String::new(),
@@ -244,6 +299,13 @@ impl State {
             }
             Event::Round { round, of } => {
                 self.exchange = Some((round, of));
+                self.waiting_since = Some(now);
+                self.tool = None;
+                None
+            }
+            Event::Concluding { .. } => {
+                self.concluding = true;
+                self.exchange = None;
                 self.waiting_since = Some(now);
                 self.tool = None;
                 None
@@ -274,6 +336,8 @@ impl State {
     }
 
     fn begin(&mut self, stage: Stage, now: Instant) {
+        self.opening = None;
+        self.preparing = None;
         if let Some(row) = self.row_mut(stage) {
             row.step = Step::Running { since: now };
         }
@@ -281,8 +345,9 @@ impl State {
     }
 
     fn forget_chunk(&mut self) {
-        self.chunk = None;
+        self.piece = None;
         self.path = None;
+        self.concluding = false;
         self.exchange = None;
         self.waiting_since = None;
         self.tool = None;
@@ -375,6 +440,8 @@ pub(crate) mod tests {
                 index: 3,
                 of: 7,
                 path: "src/foo.c".to_string(),
+                piece: 1,
+                pieces: 1,
             },
             Event::Round { round: 2, of: 6 },
             Event::Spend {
@@ -398,7 +465,7 @@ pub(crate) mod tests {
     /// A pipe keeps one line for each thing that changed what a reader would
     /// conclude, and never asks a cursor to move.
     #[test]
-    fn a_pipe_appends_the_run_its_chunks_and_its_finished_stages() {
+    fn a_pipe_appends_the_run_its_files_and_its_finished_stages() {
         let shared = Shared::default();
         let status = Status::pipe(Box::new(shared.clone()));
         let now = Instant::now();
@@ -423,7 +490,7 @@ pub(crate) mod tests {
 run  change.diff  model deepseek-v4-flash  worktree /repo
 [1/6] input     9 files
 [2/6] triage    7 chunks, 2 files skipped
-[3/6] review    chunk 3/7  src/foo.c
+[3/6] review    file 1/7  src/foo.c
 [3/6] review    7 chunks reviewed
 "
         );
@@ -459,10 +526,10 @@ run  change.diff  model deepseek-v4-flash  worktree /repo
         assert!(shared.0.lock().expect("lock").is_empty());
     }
 
-    /// Spend is known by the time a later chunk starts, so it rides on that
+    /// Spend is known by the time a later file starts, so it rides on that
     /// line rather than needing one of its own.
     #[test]
-    fn a_chunk_line_carries_the_running_spend() {
+    fn a_file_line_carries_the_running_spend() {
         let shared = Shared::default();
         let status = Status::pipe(Box::new(shared.clone()));
         status.emit(Event::Spend {
@@ -474,13 +541,15 @@ run  change.diff  model deepseek-v4-flash  worktree /repo
             index: 2,
             of: 4,
             path: "src/bar.c".to_string(),
+            piece: 1,
+            pieces: 1,
         });
         status.finish();
 
         let text = String::from_utf8(shared.0.lock().expect("lock").clone()).expect("utf8");
         assert_eq!(
             text,
-            "[3/6] review    chunk 2/4  src/bar.c  1.8300 / 10.0000 CNY\n"
+            "[3/6] review    file 1/4  src/bar.c  1.8300 / 10.0000 CNY\n"
         );
     }
 
@@ -489,7 +558,7 @@ run  change.diff  model deepseek-v4-flash  worktree /repo
         let now = Instant::now();
         let state = mid_review(now);
 
-        assert_eq!(state.chunk, Some((3, 7)));
+        assert_eq!(state.piece, Some((1, 1)), "one request was enough for it");
         assert_eq!(state.path.as_deref(), Some("src/foo.c"));
         assert_eq!(state.files_seen, 1);
         assert_eq!(state.files_total, Some(7), "9 files, 2 of them skipped");
@@ -532,6 +601,8 @@ run  change.diff  model deepseek-v4-flash  worktree /repo
                 index: 4,
                 of: 7,
                 path: "src/baz.c".to_string(),
+                piece: 1,
+                pieces: 1,
             },
             now,
         );
@@ -542,6 +613,8 @@ run  change.diff  model deepseek-v4-flash  worktree /repo
                 index: 5,
                 of: 7,
                 path: "src/baz.c".to_string(),
+                piece: 1,
+                pieces: 1,
             },
             now,
         );

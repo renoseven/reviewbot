@@ -81,7 +81,15 @@ fn dispatch(cli: &Cli, log: &LogSink) -> Result<Finished, Error> {
                 let status = match std::io::stdout().is_terminal() {
                     true => Status::terminal(!cli.global.no_color),
                     false => Status::pipe(Box::new(std::io::stdout())),
-                };
+                }
+                // Resolving a URL takes seconds, and the run cannot name
+                // itself until it is done. What is already known says what
+                // those seconds are for.
+                .about(
+                    &review.target,
+                    settings.selection().ok().map(|it| it.model.name.as_str()),
+                    settings.options.worktree.as_deref(),
+                );
                 let result = {
                     let progress = CliProgress::new(&status, log.clone());
                     reviewbot::review(&settings, &source, &progress)

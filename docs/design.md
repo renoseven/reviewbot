@@ -1483,10 +1483,10 @@ reviewbot provider list                 # provider 条目：protocol、base_url�
 
 ```
 $ reviewbot --config ./reviewbot.toml --runs-dir ./runs review change.diff
-run 75e8b18e48cbe7a3  model deepseek-v4-flash  input change.diff
+run  change.diff  model deepseek-v4-flash
 [1/6] input     2 files
 [2/6] triage    2 chunks, 0 files skipped
-[3/6] review    chunk 1/2  src/parse.c
+[3/6] review    file 1/2  src/parse.c
 [3/6] review    0 chunks reviewed, 2 files unreviewed
 [4/6] merge     0 comments, not scored
 [5/6] report    report.md and summary.json written
@@ -1518,35 +1518,43 @@ summary    ./runs/75e8b18e48cbe7a3/summary.json
 
 「从 checkpoint 读回来的」这句不是装饰：一个看不出差别的观察者会把没人干过的活报成干过了，而这两次屏幕上的数字一模一样。
 
-TTY 上不是一串会把终端往下推的事件，而是一块固定十行的 checklist：标题一行、六个阶段各一行、底部三行活动。六阶段从第一帧就都在，完成、正在跑、尚未开始分别用 `✓`、`▸`、`·`；`review` 那一行把 chunk 与 file 分开计数，因为一个大文件会拆成多个 chunk，把两者混成一个分母会谎报「看完了多少文件」。底部才放当前路径、带 spinner 的等待或工具执行、以及本 chunk 已完成工具的 tally；花费跟着 `review` 行更新。工具因此有两个互补视角：正在执行的是 `running cppcheck  ·  2s`，已经答完的是 `tools  read_file ×3  search_repo ×2`。
+TTY 上不是一串会把终端往下推的事件，而是一块**高度随内容变的** checklist：抬头最多两行、一行空隙、六个阶段各一行，再有话说时才有下一段空隙与底部那两行活动。**run 还没有名字的那几秒也要有东西可看**：URL 输入要先把 MR 与 diff 取回来才算得出 `run_id`，这中间可以是好几秒。CLI 已经知道选中的模型、指到哪儿、能读哪份检出（配置是它加载的），所以这三样先填上抬头，活动行写 `starting` 并计时（计时才是「它还活着」的证据），`run_id` 等算出来再补。跑完那一刻这一行也不写 `done`——紧接着整块就被抹掉、最终摘要落在同一处，那句话它说得更全。**这一刻六个阶段一行都不画**：一个还没开始的 run 底下摆六行「未开始」，读起来像卡在原地。于是这一刻的块只有三行——抬头、空行、那句 `starting`——而高度随内容变，所以它就是三行高，下面不留一片空白。这个状态从有屏幕的那一刻算起，不等库发事件：否则最初那几帧会先画一张全是「未开始」的清单，等 run 开口再把它收掉，屏幕上闪一下。
+
+**阶段之间也有活干，那几秒同样要有人认领。** `input` 完成之后、`triage` 开始之前，`lib.rs` 要装配两个阶段共用的 preamble，其中布局摘要是一次目录树请求——大项目上就是好几秒。它不属于任何阶段，清单上因此没有它的行；不为它单独发一个事件的话，屏幕会停在「`input` 已完成、其余未开始」而底下那行是空的，看着像 run 卡死了。所以这段有自己的事件，活动行写「正在读仓库布局」并计时，下一个阶段一开始就交回去。**抬头能一行放下就放一行**，放不下才用到第二行，那时第一行说这是哪次 run（版本、`run_id`、模型），第二行说评审什么、能读到什么。**inline viewport 的高度锚定后改不了（ratatui#984），所以高度变了就在原地重新锚一个**：把旧块抹掉、光标放回它的第一行，再要一个新高度的 viewport——锚点落在同一行，块因此不会每次改尺寸就往下爬一截。实测一次 run 是 8 行（刚起步）→ 9 行（抬头折成两行）→ 12 行（进了 review，多出文件行与等待行），三帧都从屏幕同一行开始。做不到这一点的备选是按最高的情形恒定预留，那样一个还没开始的 run 底下会挂着满屏空行。问光标位置这件事每次重新锚定都要做一次，终端不肯答就保留旧高度：块矮一点仍然什么都说得清，屏幕整块消失就不是了。**抬头以下没有缩进**：每一行都从抬头那一列开始，缩进会让它们读成某样东西的子清单。六阶段从第一帧就都在，完成、正在跑、尚未开始分别用 `✓`、`▸`、`·`，右侧耗时**对齐到固定的表格列而不是终端右边缘**——拉到边缘时它离自己那行有半屏远，看着就不像一张表。`review` 那一行**按文件计数**；一个大文件会被切成几片送审，那件事只在「这个文件」这个尺度上有意义，所以只有真被切开时才多出一个 `piece 2/3`，不拿它当第二个进度条。底部放当前在读哪个文件（**轮次跟在这一行末尾**，因为它数的是这个文件的对话、换文件就清零），以及带 spinner 的那一句「正在等什么」；花费跟着 `review` 行更新。轮次不放在等待那一行：那行只说此刻在等谁、等了多久，而轮次原来一到工具执行就整行消失了。这一行只有一个句式：一句话、一个 `...`（它还没完），以及——在等别人的时候，因为「等了多久」正是那时唯一的问题——一个括号里的秒表。秒表用括号而不是 `·`：那个分隔号在别处都是隔开两件平级的事，而这里的时间不是又一件事，是前面那件事已经进行了多久。`waiting for model... (0.9s)`、`waiting for cppcheck... (2s)`、`waiting for conclusion... (3s)` 里只有「在等谁」不同。没有等待可言时它说这个阶段在做什么（`reading changes...`、`planning the review...`、`merging findings...`、`writing the report...`、`posting comments...`），而不是重复一遍阶段名：阶段名在上面那张清单里，写在这儿等于把「跑到哪了」答两遍、把「正在做什么」一遍都没答。这时不带秒表，那个阶段自己的耗时就在清单那一行上。
 
 固定高度不是审美偏好，而是 ratatui inline viewport 的边界：viewport 创建后不能改高度（ratatui#984），所以不能再沿用「知道一个字段才长一行」的布局。也不靠 `insert_before` 把完成事件塞进上方 scrollback；连续重画时调整窗口会把 viewport 重复进 scrollback（ratatui#2666）。管道才负责保留历史，而且有意收得很窄：一个 run header、每个 chunk 一行（带当时花费）、每个完成阶段一行；轮次、工具与单次 spend 只改变 TTY 当前帧，不制造日志洪水。
 
 动画必须由独立线程按约 100ms 一帧重画。模型调用会把评审流水线阻塞几十秒，如果只在收到事件时画，最需要 reassurance 的等待期恰好完全静止。这个线程只从共享状态画屏，不碰流水线；`finish()` 消耗状态屏、清掉整块并归还终端，之后最终摘要或失败信息才有机会输出，调用顺序因而不会写反。inline viewport 初始化时必须询问光标位置，有些看似终端的环境不会回答；claim 失败会在 run 日志留一条 `warn`，并退回只追加行的 pipe 形态，不能因为画不了 TUI 就让运行过程彻底失声。全程不用 raw mode，也不读按键。
 
-`round 3/12` 被删掉，因为裸数字既不说明在数什么，也会把上限误读成预计总轮数。它只在模型等待行里写成 `exchange 3/12`：这是模型索取上下文、工具回答的一次往返，12 是会提前结束这个 chunk 的上限而不是预测；接近上限时用 warning 色正是因为撞顶意味着证据只收了一半。下面两帧来自同一次真实 PTY 运行，不另编一套示例：
+`round 3/12` 被删掉，因为裸数字既不说明在数什么，也会把上限误读成预计总轮数。它写成 `round 3/12` 跟在当前文件那一行末尾：这是模型索取上下文、工具回答的一次往返，12 是会提前结束这个文件的上限而不是预测；撞顶那一轮标成 `round 12/12 (last)` 并变色，因为那意味着证据只收了一半。**收尾那一轮不算一轮**——把它也报成一轮，屏幕上就会出现 `round 13/12` 这种自相矛盾的东西；它有自己的事件，活动行写「正在要结论」。下面两帧来自同一次真实 PTY 运行，不另编一套示例（115 列与 70 列各一帧，后者的抬头折成了两行）：
 
 ```
-reviewbot  ·  diff only, no checkout
-  · 1 input
-  · 2 triage
-  · 3 review
-  · 4 merge
-  · 5 report
-  · 6 publish
-  ⠋ starting
+reviewbot 0.1.0  ·  run ef86888d86346b7a  ·  deepseek-v4-flash  ·  /tmp/x.diff  ·  worktree .
+
+✓ 1 input     1 file                                                   0.0s
+✓ 2 triage    1 chunk, 0 files skipped                                 0.0s
+▸ 3 review    file 1/1                                                 0.1s
+· 4 merge
+· 5 report
+· 6 publish
+
+reviewing  src/lib.rs  ·  round 1/24
+⠴ waiting for model... (0.1s)
 ```
 
 ```
-reviewbot  /tmp/change.diff  ·  deepseek-v4-flash  ·  diff only, no checkout
-  ✓ 1 input     2 files                                                   0.0s
-  ✓ 2 triage    2 chunks, 0 files skipped                                 0.0s
-  ▸ 3 review    chunk 1/2  ·  file 1/2                                    0.1s
-  · 4 merge
-  · 5 report
-  · 6 publish
-  a.c
-  ⠙ waiting for the model  ·  exchange 1/12  ·  0.0s
+reviewbot 0.1.0  ·  run ef86888d86346b7a  ·  deepseek-v4-flash
+/tmp/x.diff  ·  worktree .
+
+✓ 1 input     1 file                                              0.0s
+✓ 2 triage    1 chunk, 0 files skipped                            0.0s
+▸ 3 review    file 1/1                                            0.1s
+· 4 merge
+· 5 report
+· 6 publish
+
+reviewing  src/lib.rs  ·  round 1/24
+⠴ waiting for model... (0.1s)
 ```
 
 失败时 stderr 上是这样：
@@ -1677,7 +1685,7 @@ crate 同时产出 `lib` 与 `bin` 两个 target。**业务逻辑一律针对 li
 - **上下文**：断言可用量随 `--model` 的 `context_window` 变化、工作大小取 `max_chunk_tokens` 且被可用量夹住；断言**轮数是算出来的**——窗口更宽就更多轮、分片切得更小也更多轮，而注册一个检视类工具改变的是轮数、不再压小分片；断言没有检视类工具答得上来时轮数是 1；断言可用量装不下一份最小 diff 时**启动即失败**、错误点名这个模型的窗口与 `max_output_tokens`；断言每一轮结束后模型收到「用掉几轮 / 共几轮」，最后一轮之前那句还多带一句提醒；假模型一轮返回多个 `function_call`，断言这一轮回填进 `input` 的工具输出合计不超过 `max_tool_output_bytes`；假 tool 每轮返回大段输出，断言循环在撑爆 `context_window` 前主动停止并要到最后一轮结论，全程没有一个请求是靠厂商 400 拦下的；断言 `context_window` 缺失或不大于 `max_output_tokens` 时启动失败。
 - **命令树的帮助文案**：遍历整棵命令树，断言每个子命令与每个参数至少有一份说明（短说明与长说明都缺就失败），并断言 `review`、`run prune`、`config check`、`tool list` 四条各有长说明。
 - **trace 的阶段归属**：断言每条记录都带写它的 `Stage`；断言 `merge` 重跑只清掉自己那些记录、`review` 记的会话经过还在（这正是从前被整份清空的东西）；断言 `publish` 降级成文件级评论时那句话记在 `publish` 名下且不重复记第二遍。
-- **状态屏**：不起真实子进程，用 ratatui `TestBackend` 直接画共享状态并读回十行。断言 inline viewport 高度固定为「标题 + 六阶段 + 三活动行」、六阶段第一帧就齐全，spinner 随 tick 前进；断言 review 行把 chunk / file / spend 分开，等待行写 `exchange`，工具执行与完成 tally 分列；断言 `finish()` 先停画线程、清掉整块再交还终端。另断言非 TTY 只留下 run header、每个 chunk 与每个完成阶段，不为 round、tool、spend 单独出行；claim inline viewport 失败则回退到同一 pipe 渲染。
+- **状态屏**：不起真实子进程，用 ratatui `TestBackend` 在 inline viewport 上画共享状态并逐行读回。断言高度固定为「抬头两行 + 空行 + 六阶段 + 空行 + 两行活动」、六阶段第一帧就齐全、每行都从第 0 列起（没有缩进）、耗时落在固定的表格列上；断言抬头放得下就一行、放不下折两行且空行仍紧随其后，省下的那行留在最底下；断言 review 行按文件计数、只有被切开的文件才多出 `piece`；断言等待行写 `round n/m`，撞顶那轮标 `(last)`，而**收尾那一轮不产生轮次事件**（`round 13/12` 就是这么来的）；断言 spinner 随 tick 前进、跑完不再说 `starting`；断言 `finish()` 先停画线程、清掉整块、把光标放回块的起点再交还终端。另断言非 TTY 只留下 run header、每个文件与每个完成阶段，不为 round、tool、spend 单独出行；claim inline viewport 失败则回退到同一 pipe 渲染。
 - **日志落在 run 目录**：断言 run 起来之前产生的诊断先攒着、run 目录一确定就连同后续一起写进 `<run dir>/log`；断言同一个 run 再进来一次是**追加**、上一次那半程还在；断言 `tracing` 一个字节都没上 stdout 或 stderr；断言 `[log].level` 改了级别跟着变、`RUST_LOG` 盖得过它、配置缺失或写坏时退回 `info` 而不是启动失败；断言改 `[log].level` **不换 `run_id`**；断言 `run show` 印出这个路径。
 - **CLI 契约**（`assert_cmd`）：断言成功的 run 在 stderr 上一个字节都不写；`-q` 下成功的 run 在 stdout 上也一个字节都不写（状态屏也没有），而失败时 stderr 仍有那句错误；断言失败输出里 `run_id` 那行必有，`next:` 那行是本次 `argv` 的原文、带空格或 shell 元字符的词被引起来、而不进 run 的子命令（如 `config check`）不印这一行；`--format json` 时 stdout 是可解析的纯 JSON、没有状态屏混入（`-q` 同时给也照出），`run list --format json` 同样可解析且生效的 runs 目录是文档里的字段而非前置的一行文本；`--output-dir` 单独给时 stdout 仍有状态屏，且拷出去的两份内容不随 `--format` 改变；断言一个 flag 都不给时 run 目录里 `report.md` 与 `summary.json` 都在，给了 `--output-dir` 时该目录下落的是 `report-<run_id>.md` 与 `summary-<run_id>.json`、内容与 run 目录里的逐字节相同；断言同一个 `--output-dir` 连着跑两个不同输入时四个文件都在，没有互相覆盖；断言各类失败对应的退出码；断言 `tool list` 按用途分组印出契约（调用签名、描述、逐参数一行、轮次、前置条件）且**一个字都不说「是否注册」**，`--format json` 同构；断言假 key 不出现在任何一条日志与错误信息里；断言不给 `--publish` 时假 platform 收不到任何写请求，而 diff 输入加 `--publish` 启动即失败；断言位置参数的三种形态各自被认成对的输入，且把 URL 写错成不存在的路径时报的是「打不开文件」而非静默当空 diff；喂 `git format-patch` 的 mbox 输出时断言明确报「只收 unified diff」，而存成 `.patch` 扩展名的 unified diff 照常能跑。
 

@@ -1263,7 +1263,9 @@ impl Watcher {
         self.events()
             .into_iter()
             .filter_map(|event| match event {
-                Event::Chunk { index, of, path } => Some((index, of, path)),
+                Event::Chunk {
+                    index, of, path, ..
+                } => Some((index, of, path)),
                 _ => None,
             })
             .collect()
@@ -1287,6 +1289,11 @@ fn a_full_run_announces_every_stage_and_numbers_the_chunks() {
 
     assert_eq!(
         watcher.events().first(),
+        Some(&Event::Opening),
+        "the wait before a run can name itself is accounted for"
+    );
+    assert_eq!(
+        watcher.events().get(1),
         Some(&Event::RunStarted {
             run_id: result.run_id.clone(),
             run_dir: workspace.run_dir(&result.run_id),
@@ -1294,7 +1301,7 @@ fn a_full_run_announces_every_stage_and_numbers_the_chunks() {
             input: "change.diff".to_string(),
             worktree: None,
         }),
-        "a run says what it is before it does anything"
+        "and then it says what it is, before doing anything"
     );
 
     let stages = watcher.stages();
