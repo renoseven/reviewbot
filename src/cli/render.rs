@@ -120,21 +120,26 @@ fn text_summary(result: &RunResult) -> String {
     out
 }
 
-/// How everything that went wrong reaches a terminal: one blank line, then
-/// `error:` and the sentence. The blank line is what separates it from
-/// whatever the command was printing until then — a summary's fields, or a
-/// pipe's worth of progress — so it is not read as one more field.
+/// How a problem lands at the end of a summary: a blank line, then
+/// `error:` and the sentence. The blank line separates it from the fields
+/// above so it is not read as one more field.
 fn problem(reason: &str) -> String {
-    format!("\nerror: {reason}\n")
+    format!("\n{}", error_line(reason))
+}
+
+fn error_line(reason: &str) -> String {
+    format!("error: {reason}\n")
 }
 
 /// stderr for a failure — every one of them, a command line that did not
-/// parse included, because they all arrive here as one value.
+/// parse included, because they all arrive here as one value. This stream
+/// has printed nothing yet, so there is no blank line to set the sentence
+/// off from; that blank belongs on stdout, after a summary's fields.
 pub(super) fn failure(failure: &Failure) -> String {
     let text = match failure {
         // clap wrote its own `error:` sentence, and the usage hint below it
         // is worth keeping, so the shape is all this has left to add.
-        Failure::Usage(complaint) => format!("\n{}", complaint.render()),
+        Failure::Usage(complaint) => complaint.render().to_string(),
         Failure::Command { error, invocation } => command_failure(error, invocation.as_deref()),
     };
     Redactor::new().redact(&text)
@@ -147,7 +152,7 @@ pub(super) fn failure(failure: &Failure) -> String {
 /// that enter no run, so nothing here claims that repeating one of those
 /// would continue anything.
 fn command_failure(error: &Error, invocation: Option<&[OsString]>) -> String {
-    let mut out = problem(&error.to_string());
+    let mut out = error_line(&error.to_string());
     if let Some(run_id) = error.run_id() {
         out.push_str(&format!("run_id: {run_id}\n"));
         if let Some(invocation) = invocation.filter(|words| !words.is_empty()) {
@@ -836,8 +841,8 @@ mod tests {
             invocation: Some(words.to_vec()),
         });
         assert!(
-            text.starts_with("\nerror: "),
-            "every error opens the same way, set off from whatever came before: {text:?}"
+            text.starts_with("error: "),
+            "a failure on stderr is the whole of that stream: {text:?}"
         );
         assert!(text.contains("run_id: 7f3a9c1e\n"), "{text}");
         assert!(
@@ -864,7 +869,7 @@ mod tests {
                 .expect_err("review needs something to review");
 
         let text = failure(&Failure::Usage(complaint));
-        assert!(text.starts_with("\nerror: "), "{text:?}");
+        assert!(text.starts_with("error: "), "{text:?}");
         assert!(text.contains("Usage:"), "{text}");
     }
 

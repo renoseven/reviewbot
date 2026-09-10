@@ -528,7 +528,7 @@ fn a_parse_error_is_set_off_like_every_other_error_and_help_is_not() {
     assert_eq!(refused.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(
-        stderr.starts_with("\nerror: "),
+        stderr.starts_with("error: "),
         "a parse error opens like the rest: {stderr:?}"
     );
     assert!(refused.stdout.is_empty(), "and says nothing on stdout");
