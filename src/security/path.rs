@@ -110,6 +110,13 @@ impl PathPolicy {
         self.deny.is_match(path)
     }
 
+    /// Whether this path's extension is on the whitelist. The answer without
+    /// the rest of the checks, for callers that only need to name a reason
+    /// rather than open the file.
+    pub fn allows_extension(&self, path: &str) -> bool {
+        self.check_extension(path).is_ok()
+    }
+
     /// Whether a listing or search pattern aims into denied territory. A glob
     /// is answered with names rather than content, but the names inside a
     /// denied directory are exactly what `deny_paths` is keeping back, so the
@@ -354,6 +361,9 @@ mod tests {
             ),
             "known limitation: files without an extension are unreadable"
         );
+        assert!(policy.allows_extension("src/main.rs"));
+        assert!(!policy.allows_extension("deploy/server.pem"));
+        assert!(!policy.allows_extension("Makefile"));
     }
 
     /// A listing answers with names, and the names inside a denied directory

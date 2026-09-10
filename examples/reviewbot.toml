@@ -93,8 +93,9 @@ max_tool_output_bytes = 32768
 # no command line flag may override any of it.
 [security]
 deny_paths = ["secrets/**", "**/*.tfvars"]
-# No builtin list: the read-a-file tools touch nothing outside it. A
-# whitelist, so extensionless files (Makefile, Dockerfile) stay unreadable.
+# No builtin list: files outside it are not reviewed, and the read-a-file
+# tools refuse them again. A whitelist, so extensionless files (Makefile,
+# Dockerfile) stay unreadable.
 allow_extensions = [
     "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx",
     "rs", "go", "java", "kt", "kts", "scala", "cs", "swift", "zig",

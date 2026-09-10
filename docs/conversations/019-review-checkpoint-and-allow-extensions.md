@@ -23,6 +23,27 @@
 
 ---
 
+## allow_extensions 没拦住 markdown 进评审
+
+**意图**：`allow_extensions` 没有拦住 review 一些文件，比如 markdown；重新考虑它应用的位置与时机。示例名单不含 `md`，但 `README_zh.md` 仍被送到模型。
+
+**步骤**：
+1. 查清现状：白名单只在工具读文件时检查；review 送的是平台 API 给的 diff，不经过那道门。`deny_paths` 已经在 triage 跳过，`allow_extensions` 没有
+2. `PathPolicy` 增加 `allows_extension`，`FileFilter::reason` 在 `deny_paths` 之后、`skip_paths` 之前检查 `new_path`；删除文件（`new_path` 为 `/dev/null`）跳过这道，仍报「整个文件被删」
+3. 工具读、列表不按扩展名滤、布局摘要按扩展名滤，这三处不变
+4. 阶段测试：`README.md` / `Makefile` 进跳过清单并点名 `allow_extensions`，删除的 `docs/old.md` 仍报 deleted，`src/kept.c` 进分片
+5. 同步 `docs/design.md`、`README.md`、`examples/reviewbot.toml` 的口径
+
+**决策**：
+- **主闸在 triage，和 `deny_paths` 同一层。** 「不许碰」如果只挡补上下文、不挡把 diff 送给模型，名单去掉 `md` 仍然会给 markdown 花钱
+- **只看 `new_path`。** 评审的是改完之后的那个文件；删掉的文件走已有的 deleted 理由，避免 `/dev/null` 被报成没有扩展名
+- **工具读仍再拦一次。** 评 `.c` 时模型仍可能去读一篇 `.md`，那次拒绝留着
+- **列表与搜索仍不按扩展名滤。** 存在与否本身是答案（`Makefile` 在那儿说明这是 make 工程）
+- **input 不滤。** changeset 要完整，跳过的文件进报告，而不是假装没出现过
+- 为什么不是让用户把 `**/*.md` 写进 `skip_paths`：那是成本策略，白名单已经在说「这类文件不许碰」
+
+---
+
 ## 未决
 
 无

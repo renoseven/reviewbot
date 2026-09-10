@@ -162,10 +162,11 @@ pub struct SecuritySettings {
     pub deny_paths: Vec<String>,
     #[serde(default)]
     pub follow_symlinks: bool,
-    /// The whitelist of extensions the read-a-file tools may touch. There is
+    /// The whitelist of extensions that may be reviewed or read. There is
     /// no builtin list: which extensions are safe depends on the repository,
     /// and a default would decide that for the config author silently.
-    /// `Config::validate` refuses an empty one.
+    /// `Config::validate` refuses an empty one. Triage skips anything
+    /// outside it; the read-a-file tools refuse it again.
     #[serde(default)]
     pub allow_extensions: Vec<String>,
     #[serde(default)]

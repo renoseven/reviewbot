@@ -200,8 +200,9 @@ impl Window {
     }
 }
 
-/// The skip rules, built once per run. `deny_paths` is not in here: that one
-/// is `security`'s hard boundary, and this type only owns the cost policy.
+/// The skip rules, built once per run. `deny_paths` and `allow_extensions`
+/// are not in here: those are `security`'s hard boundary, and this type
+/// only owns the cost policy.
 pub struct FileFilter {
     skip_paths: GlobSet,
     skip_generated: bool,
@@ -231,13 +232,19 @@ impl FileFilter {
         })
     }
 
-    /// Why this file is not reviewed, or `None` when it is. `deny_paths`
-    /// comes first: it is the one rule the config cannot take away, and a
-    /// file that lands on it is skipped even though the diff carries it.
+    /// Why this file is not reviewed, or `None` when it is. The security
+    /// rules come first: they are the ones the config cannot take away, and
+    /// a file that lands on them is skipped even though the diff carries it.
+    /// `allow_extensions` looks at `new_path` only — that is the file as it
+    /// exists after the change — and not at a deletion, whose `new_path` is
+    /// `/dev/null` and whose reason is "deleted", not "no extension".
     pub fn reason(&self, file: &FileChange, paths: &PathPolicy) -> Option<String> {
         let diff = FileDiff::new(file);
         if paths.is_denied(&file.new_path) || paths.is_denied(&file.old_path) {
             return Some("denied by deny_paths".to_string());
+        }
+        if file.new_path != DEV_NULL && !paths.allows_extension(&file.new_path) {
+            return Some("extension is not in allow_extensions".to_string());
         }
         if self.skip_paths.is_match(&file.new_path) {
             return Some("matches [triage].skip_paths".to_string());
@@ -558,8 +565,13 @@ max_output_tokens = 4096
     }
 
     fn policy(deny: &[&str]) -> PathPolicy {
+        policy_with(deny, &["rs", "toml", "md", "c", "h", "py"])
+    }
+
+    fn policy_with(deny: &[&str], extensions: &[&str]) -> PathPolicy {
         let settings = SecuritySettings {
             deny_paths: deny.iter().map(|pattern| pattern.to_string()).collect(),
+            allow_extensions: extensions.iter().map(|kind| kind.to_string()).collect(),
             ..SecuritySettings::for_tests()
         };
         PathPolicy::new(
@@ -681,7 +693,7 @@ max_output_tokens = 4096
 
     #[test]
     fn every_skip_rule_names_its_reason_and_yields_no_chunk() {
-        let mut binary = file("doc/logo.png", 1, 1);
+        let mut binary = file("src/logo.c", 1, 1);
         binary.binary = true;
 
         let mut deleted = file("src/gone.c", 1, 1);
@@ -733,7 +745,7 @@ max_output_tokens = 4096
         assert!(
             reasons
                 .iter()
-                .any(|(path, reason)| *path == "doc/logo.png" && *reason == "binary")
+                .any(|(path, reason)| *path == "src/logo.c" && *reason == "binary")
         );
         assert!(reasons.iter().any(
             |(path, reason)| *path == "src/gone.c" && reason.contains("whole file was deleted")
@@ -754,6 +766,61 @@ max_output_tokens = 4096
             "the runs directory is denied even when the diff carries it: {reasons:?}"
         );
 
+        assert_eq!(plan.chunks.len(), 1);
+        assert_eq!(plan.chunks[0].path, "src/kept.c");
+    }
+
+    /// `allow_extensions` is a security boundary, not a cost policy, so it
+    /// sits with `deny_paths`: the file is not reviewed, and the skip list
+    /// names why. Reviewing from the diff would otherwise spend money on a
+    /// file the tools are forbidden to touch.
+    #[test]
+    fn files_outside_allow_extensions_are_skipped() {
+        let mut deleted = file("docs/old.md", 1, 1);
+        deleted.new_path = DEV_NULL.to_string();
+
+        let settings = TriageSettings {
+            skip_files_over_bytes: 1_024,
+            ..TriageSettings::for_tests()
+        };
+        let plan = Triage::plan(
+            &changeset(vec![
+                file("README.md", 1, 1),
+                file("Makefile", 1, 1),
+                deleted,
+                file("src/kept.c", 1, 1),
+            ]),
+            &FileFilter::new(&settings).expect("valid globs"),
+            &policy_with(&[], &["c", "h", "rs"]),
+            Window {
+                chunk_tokens: 10_000,
+                rounds: 1,
+                round_bytes: 0,
+            },
+        );
+
+        let reasons: Vec<(&str, &str)> = plan
+            .skipped
+            .iter()
+            .map(|file| (file.path.as_str(), file.reason.as_str()))
+            .collect();
+        assert!(
+            reasons
+                .iter()
+                .any(|(path, reason)| *path == "README.md" && reason.contains("allow_extensions")),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|(path, reason)| *path == "Makefile" && reason.contains("allow_extensions")),
+            "extensionless files are outside the whitelist: {reasons:?}"
+        );
+        assert!(
+            reasons.iter().any(|(path, reason)| *path == "docs/old.md"
+                && reason.contains("whole file was deleted")),
+            "a deletion is named as deleted, not as a missing extension: {reasons:?}"
+        );
         assert_eq!(plan.chunks.len(), 1);
         assert_eq!(plan.chunks[0].path, "src/kept.c");
     }
