@@ -377,7 +377,7 @@ impl Triage {
         let window = Window::new(
             model,
             &context.settings.config,
-            &context.adapters.tools,
+            context.tools,
             prompt_tokens,
         )?;
         let filter = FileFilter::new(&context.settings.config.triage)?;
@@ -484,6 +484,7 @@ mod tests {
 [review]
 max_files_per_listing = 200
 max_hits_per_search = 50
+max_files_per_fetch = 20
 max_file_bytes = 262144
 max_tool_output_bytes = 32768
 

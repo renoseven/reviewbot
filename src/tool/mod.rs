@@ -1,7 +1,7 @@
 //! What the model may call. One trait, one registry, one construction path.
 //! There is no "builtin versus external command" anywhere downstream: running
 //! an external command is one `Tool` implementation among the others, and the
-//! only difference is who writes the contract — Rust for the four content
+//! only difference is who writes the contract — Rust for the eight content
 //! tools and the three deliveries, a `[[tool]]` entry for a command.
 //!
 //! One tool is one set of facts: its name, its description, the arguments it
@@ -19,18 +19,24 @@ pub mod registry;
 pub mod signature;
 pub mod submit;
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::Settings;
+use crate::platform::{
+    Capabilities, LineRange, Listing, PlatformError, Repo, RepoSource, SearchHit, SearchKind,
+};
 use crate::record::ContextFile;
 use crate::security::{EnvPolicy, PathPolicy};
-use crate::worktree::{Abilities, Widest, WorktreeSource};
+use crate::worktree::{Worktree, WorktreeError};
 
-pub use availability::precondition;
 pub use command::{CommandContext, CommandTool};
-pub use content::{ListFiles, ReadFile, SearchCode, StatFile, ToolLimits, WorktreeContext};
+pub use content::{
+    FetchRepoFile, ListLocalFiles, ListRepoFiles, ReadLocalFile, SearchLocalRegex,
+    SearchRepoKeyword, SearchRepoRegex, SuggestLocalRead, ToolLimits,
+};
 pub use registry::Registry;
 pub use signature::{Arguments, Parameter, Shape, Signature};
 pub use submit::{FinishReview, SubmitComment, SubmitSummary, whole_score};
@@ -48,7 +54,8 @@ pub use submit::{FinishReview, SubmitComment, SubmitSummary, whole_score};
 pub fn build(
     settings: &Settings,
     paths: PathPolicy,
-    worktree: Arc<dyn WorktreeSource>,
+    worktree: Arc<Worktree>,
+    run_dir: &Path,
 ) -> Registry {
     let mut registry = Registry::new();
     // The three ways of handing something over: a finding, "I have none", and
@@ -61,11 +68,46 @@ pub fn build(
     registry.register(Box::new(SubmitSummary::new()));
 
     let limits = ToolLimits::from_config(&settings.config);
-    let context = WorktreeContext::new(Arc::clone(&worktree), paths.clone(), limits);
-    registry.register(Box::new(ListFiles::new(context.clone())));
-    registry.register(Box::new(StatFile::new(context.clone())));
-    registry.register(Box::new(ReadFile::new(context.clone())));
-    registry.register(Box::new(SearchCode::new(context)));
+    registry.register(Box::new(ListLocalFiles::new(
+        Arc::clone(&worktree),
+        paths.clone(),
+        limits,
+    )));
+    registry.register(Box::new(SuggestLocalRead::new(
+        Arc::clone(&worktree),
+        paths.clone(),
+        limits,
+    )));
+    registry.register(Box::new(ReadLocalFile::new(
+        Arc::clone(&worktree),
+        paths.clone(),
+        limits,
+    )));
+    registry.register(Box::new(SearchLocalRegex::new(
+        Arc::clone(&worktree),
+        paths.clone(),
+        limits,
+    )));
+    registry.register(Box::new(ListRepoFiles::new(
+        Arc::clone(&worktree),
+        paths.clone(),
+        limits,
+    )));
+    registry.register(Box::new(FetchRepoFile::new(
+        Arc::clone(&worktree),
+        paths.clone(),
+        limits,
+    )));
+    registry.register(Box::new(SearchRepoRegex::new(
+        Arc::clone(&worktree),
+        paths.clone(),
+        limits,
+    )));
+    registry.register(Box::new(SearchRepoKeyword::new(
+        Arc::clone(&worktree),
+        paths.clone(),
+        limits,
+    )));
 
     for entry in &settings.config.tools {
         registry.register(Box::new(CommandTool::new(
@@ -74,9 +116,10 @@ pub fn build(
                 EnvPolicy::default(),
                 paths.clone(),
                 Arc::clone(&worktree),
-                settings.config.review.max_tool_output_bytes,
+                run_dir.to_path_buf(),
                 settings.options.backoff(),
             ),
+            limits,
         )));
     }
     registry
@@ -96,19 +139,65 @@ pub struct ToolListing {
     pub preconditions: Vec<String>,
 }
 
+/// A `RepoSource` with no run behind it. `tool list` still has to go through
+/// `build`, and a `Repo` needs a source, so every method says there is
+/// nothing to read rather than inventing an answer.
+struct CatalogSource;
+
+impl CatalogSource {
+    fn no_run(operation: &'static str) -> PlatformError {
+        PlatformError::Request {
+            operation,
+            host: "catalog".to_string(),
+            reason: "there is no run behind this, so there is nothing to read".to_string(),
+        }
+    }
+}
+
+impl RepoSource for CatalogSource {
+    fn list_files(&self, _glob: &str) -> Result<Listing, PlatformError> {
+        Err(Self::no_run("listing repository files"))
+    }
+
+    fn read_file(&self, _path: &str, _lines: Option<LineRange>) -> Result<String, PlatformError> {
+        Err(Self::no_run("reading a repository file"))
+    }
+
+    fn size(&self, _path: &str) -> Result<u64, PlatformError> {
+        Err(Self::no_run("reading a file size"))
+    }
+
+    fn search(
+        &self,
+        _kind: SearchKind,
+        _query: &str,
+        _glob: Option<&str>,
+    ) -> Result<Vec<SearchHit>, PlatformError> {
+        Err(Self::no_run("searching the repository"))
+    }
+}
+
 /// The catalog, read off the real tools rather than described a second time.
 ///
 /// There is no run behind this command, so the tools are built over the widest
-/// worktree there is — a whole checkout with a platform that can match
-/// expressions — and the preconditions are what say when a run would get a
-/// refusal instead. Going through `build` is the point: a row here cannot
-/// disagree with what a review registers, because it is what a review
+/// worktree there is — a whole checkout holding a repository that can answer
+/// both search engines — and the preconditions are what say when a run would
+/// get a refusal instead. Going through `build` is the point: a row here
+/// cannot disagree with what a review registers, because it is what a review
 /// registers.
 pub fn inventory(settings: &Settings) -> Result<Vec<ToolListing>, crate::config::ConfigError> {
+    let worktree = Worktree::Local {
+        root: PathBuf::from("/catalog"),
+        repo: Some(Repo::new(
+            Arc::new(CatalogSource) as Arc<dyn RepoSource>,
+            Capabilities::all(),
+        )),
+    };
     let registry = build(
         settings,
         PathPolicy::for_settings(settings)?,
-        Arc::new(Widest),
+        Arc::new(worktree),
+        Path::new("/catalog"),
     );
     Ok(registry
         .all()
@@ -120,9 +209,9 @@ pub fn inventory(settings: &Settings) -> Result<Vec<ToolListing>, crate::config:
             parameters: tool.signature().schema(),
             rounds: tool.rounds().to_vec(),
             preconditions: tool
-                .needs()
-                .iter()
-                .map(|ability| precondition(ability).to_string())
+                .precondition()
+                .into_iter()
+                .map(str::to_string)
                 .collect(),
         })
         .collect())
@@ -148,6 +237,36 @@ impl ToolError {
     /// missing, so neither is retried.
     pub fn is_retryable(&self) -> bool {
         matches!(self, ToolError::Timeout { .. } | ToolError::Killed { .. })
+    }
+
+    /// A worktree call that is not a read of a named file: listings, searches.
+    pub(crate) fn failed(tool: &str, error: WorktreeError) -> Self {
+        ToolError::Unavailable {
+            tool: tool.to_string(),
+            reason: error.to_string(),
+        }
+    }
+
+    /// A worktree call about one path. `TooBig` carries no path of its own —
+    /// the tool puts it back into the wording the model reads.
+    pub(crate) fn failed_read(tool: &str, path: &str, error: WorktreeError) -> Self {
+        match error {
+            WorktreeError::TooBig { bytes } => ToolError::Rejected {
+                tool: tool.to_string(),
+                reason: format!(
+                    "{path} is {bytes} bytes, past max_file_bytes; \
+                     no part of it can be read, because reading any part means reading all of it. \
+                     Use a search to find what you need instead"
+                ),
+            },
+            other => ToolError::Unavailable {
+                tool: tool.to_string(),
+                reason: format!(
+                    "{other} (If the path was wrong, list the files first to see what \
+                     the worktree actually has, rather than guessing again.)"
+                ),
+            },
+        }
     }
 }
 
@@ -296,8 +415,9 @@ pub trait Tool: Send + Sync {
     /// is exactly what it can call in that round.
     fn rounds(&self) -> &'static [Round];
 
-    /// What this tool needs of the run's worktree. The declaration: the
-    /// catalog prints it, and `unavailable` is matched against it.
+    /// Why this run's worktree cannot answer this tool, when it cannot. The
+    /// same words the description was written from, so what the model is told
+    /// before a call and what it is told after one cannot disagree.
     ///
     /// It never decides whether the tool is registered — the model is offered
     /// every tool on every run. Leaving a tool out instead used to look safer
@@ -305,14 +425,13 @@ pub trait Tool: Send + Sync {
     /// names changes with the run, so the prompt describes tools that are not
     /// there and the model has to infer its own abilities from a list it
     /// cannot check.
-    fn needs(&self) -> Abilities {
-        Abilities::empty()
+    fn unavailable(&self) -> Option<&str> {
+        None
     }
 
-    /// Why this run's worktree cannot answer this tool, when it cannot.
-    /// Derived from `needs`, never written a second time, so the catalog's
-    /// preconditions and the refusal cannot disagree.
-    fn unavailable(&self) -> Option<&str> {
+    /// What `tool list` prints as the condition a run's worktree has to meet.
+    /// Empty when nothing does. Never a reason for the tool to be missing.
+    fn precondition(&self) -> Option<&'static str> {
         None
     }
 
@@ -328,6 +447,16 @@ pub trait Tool: Send + Sync {
             description: self.description().to_string(),
             parameters: self.signature().schema(),
             purpose: self.purpose(),
+        }
+    }
+}
+
+impl From<ToolSchema> for crate::protocol::ToolSchema {
+    fn from(schema: ToolSchema) -> Self {
+        Self {
+            name: schema.name,
+            description: schema.description,
+            parameters: schema.parameters,
         }
     }
 }

@@ -71,6 +71,10 @@ impl Client {
         self.inner.post(url)
     }
 
+    pub fn head(&self, url: reqwest::Url) -> reqwest::blocking::RequestBuilder {
+        self.inner.head(url)
+    }
+
     pub fn execute(
         &self,
         operation: &'static str,

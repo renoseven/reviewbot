@@ -96,6 +96,7 @@ mod tests {
 [review]
 max_files_per_listing = 200
 max_hits_per_search = 50
+max_files_per_fetch = 20
 max_file_bytes = 262144
 max_tool_output_bytes = 32768
 
@@ -200,7 +201,7 @@ api_token = "GITLAB_TOKEN"
         };
 
         let mut review = config();
-        review.review.max_hits_per_search = 20;
+        review.review.max_files_per_fetch = 5;
         unchanged(&fingerprint(&review, None, false));
 
         let mut security = config();

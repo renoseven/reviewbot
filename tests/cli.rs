@@ -264,7 +264,10 @@ fn a_piped_review_appends_progress_then_the_text_summary() {
 }
 
 /// Invalidating part of a run is worth a warning, and the warning goes
-/// where every other line of tracing goes: the run's own log.
+/// where every other line of tracing goes: the run's own log. Not stdout,
+/// which carries the progress and the summary, and not stderr, which
+/// carries the one sentence that ended the process — and this did not end
+/// it, since a changed config re-enters the run rather than refusing it.
 #[test]
 fn a_config_change_leaves_a_line_in_the_run_log_saying_what_it_cost() {
     let directory = tempfile::tempdir().expect("temp dir");
@@ -487,8 +490,8 @@ fn config_info_prints_tool_contracts_the_way_tool_list_did() {
     assert!(stdout.contains("NAME"), "{stdout}");
     assert!(stdout.contains("PURPOSE"), "{stdout}");
     assert!(stdout.contains("ROUNDS"), "{stdout}");
-    assert!(stdout.contains("search_code"), "{stdout}");
-    assert!(stdout.contains("read_file"), "{stdout}");
+    assert!(stdout.contains("search_local_regex"), "{stdout}");
+    assert!(stdout.contains("read_local_file"), "{stdout}");
     assert!(stdout.contains("cppcheck"), "{stdout}");
     assert!(stdout.contains("typecheck"), "{stdout}");
     assert!(stdout.contains("investigation"), "{stdout}");

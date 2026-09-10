@@ -713,8 +713,15 @@ mod tests {
             "gitlab.com"
         }
 
-        fn capabilities(&self) -> crate::platform::Capabilities {
-            crate::platform::Capabilities::default()
+        fn repo(&self) -> crate::platform::Repo {
+            crate::platform::Repo::new(
+                std::sync::Arc::new(NullRepo),
+                crate::platform::Capabilities::default(),
+            )
+        }
+
+        fn cached_body(&self, _path: &str) -> Option<String> {
+            None
         }
 
         fn head_sha(&self, _change: &ChangeRef) -> Result<String, crate::platform::PlatformError> {
@@ -768,10 +775,6 @@ mod tests {
         }
 
         fn bind_repo(&self, _change: &ChangeRef, _head_sha: &str) {}
-
-        fn repo_source(&self) -> std::sync::Arc<dyn crate::platform::RepoSource> {
-            std::sync::Arc::new(NullRepo)
-        }
     }
 
     /// A platform every call to which is a test failure. The only assertion
@@ -787,8 +790,15 @@ mod tests {
             "gitlab.com"
         }
 
-        fn capabilities(&self) -> crate::platform::Capabilities {
-            crate::platform::Capabilities::default()
+        fn repo(&self) -> crate::platform::Repo {
+            crate::platform::Repo::new(
+                std::sync::Arc::new(NullRepo),
+                crate::platform::Capabilities::default(),
+            )
+        }
+
+        fn cached_body(&self, _path: &str) -> Option<String> {
+            None
         }
 
         fn head_sha(&self, _change: &ChangeRef) -> Result<String, crate::platform::PlatformError> {
@@ -819,10 +829,6 @@ mod tests {
         }
 
         fn bind_repo(&self, _change: &ChangeRef, _head_sha: &str) {}
-
-        fn repo_source(&self) -> std::sync::Arc<dyn crate::platform::RepoSource> {
-            std::sync::Arc::new(NullRepo)
-        }
     }
 
     struct NullRepo;
@@ -833,7 +839,7 @@ mod tests {
             _glob: &str,
         ) -> Result<crate::platform::Listing, crate::platform::PlatformError> {
             Ok(crate::platform::Listing {
-                paths: Vec::new(),
+                files: Vec::new(),
                 complete: true,
             })
         }
@@ -846,8 +852,13 @@ mod tests {
             Ok(String::new())
         }
 
+        fn size(&self, _path: &str) -> Result<u64, crate::platform::PlatformError> {
+            Ok(0)
+        }
+
         fn search(
             &self,
+            _kind: crate::platform::SearchKind,
             _query: &str,
             _glob: Option<&str>,
         ) -> Result<Vec<crate::platform::SearchHit>, crate::platform::PlatformError> {

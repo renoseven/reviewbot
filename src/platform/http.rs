@@ -67,6 +67,10 @@ impl HttpClient {
         self.http.post(url)
     }
 
+    pub fn head(&self, url: reqwest::Url) -> reqwest::blocking::RequestBuilder {
+        self.http.head(url)
+    }
+
     pub fn send(
         &self,
         operation: &'static str,

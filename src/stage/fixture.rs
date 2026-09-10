@@ -15,7 +15,7 @@ use crate::protocol::{OutputItem, Protocol, ProtocolError, Request, Response};
 use crate::record::{LocalStorage, Meta, Recorder, RunIdentity, Storage, layout};
 use crate::security::{PathPolicy, Redactor};
 use crate::tool::{Registry, SubmitComment};
-use crate::worktree::WorktreeSource;
+use crate::worktree::Worktree;
 
 use super::{Adapters, StageContext};
 
@@ -23,6 +23,7 @@ const CONFIG: &str = r#"
 [review]
 max_files_per_listing = 200
 max_hits_per_search = 50
+max_files_per_fetch = 20
 max_file_bytes = 262144
 max_tool_output_bytes = 32768
 
@@ -176,6 +177,11 @@ pub struct StageFixture {
     _root: tempfile::TempDir,
     settings: Settings,
     adapters: Adapters,
+    /// The other half of a real run's adapters, held apart the same way: a
+    /// stage test that wants content puts its own worktree and its own tools
+    /// in these two slots.
+    worktree: Arc<Worktree>,
+    tools: Registry,
     recorder: Recorder,
     budget: Budget,
     paths: PathPolicy,
@@ -240,14 +246,6 @@ impl StageFixture {
         tools.register(Box::new(SubmitComment::new()));
         tools.register(Box::new(crate::tool::FinishReview::new()));
         tools.register(Box::new(crate::tool::SubmitSummary::new()));
-        // Every run has a worktree and opens it in the run directory before a
-        // stage runs, so the fixture does the same. This one has nothing
-        // behind it: a stage test that wants content registers its own tools.
-        let worktree =
-            crate::worktree::FetchedWorktree::new(None, crate::platform::Capabilities::default());
-        worktree
-            .open_in(&settings.options.runs_dir.join("test-run"))
-            .expect("worktree directory");
         let adapters = Adapters {
             platform: None,
             protocol: Box::new(ScriptedProtocol {
@@ -255,8 +253,6 @@ impl StageFixture {
                 sent: Arc::clone(&sent),
                 billed: Arc::clone(&billed),
             }),
-            tools,
-            worktree: Arc::new(worktree),
             redactor: Redactor::new(),
         };
 
@@ -300,6 +296,10 @@ impl StageFixture {
             _root: root,
             settings,
             adapters,
+            // Nothing to read: a stage test that wants content says so with
+            // `with_cache`.
+            worktree: Arc::new(Worktree::Empty),
+            tools,
             recorder,
             budget,
             paths,
@@ -314,6 +314,8 @@ impl StageFixture {
         StageContext {
             settings: &self.settings,
             adapters: &self.adapters,
+            worktree: self.worktree.as_ref(),
+            tools: &self.tools,
             recorder: &mut self.recorder,
             budget: &mut self.budget,
             redactor: &self.adapters.redactor,
@@ -339,8 +341,27 @@ impl StageFixture {
     }
 
     pub fn with_tools(mut self, tools: Registry) -> Self {
-        self.adapters.tools = tools;
+        self.tools = tools;
         self
+    }
+
+    /// A cache of this fixture's own, in its run directory, with `repo`
+    /// behind it. Used where what is being tested is the worktree's part of
+    /// the loop rather than the loop itself.
+    pub fn with_cache(mut self, repo: crate::platform::Repo) -> Self {
+        self.worktree = Arc::new(
+            Worktree::open(
+                None,
+                Some(repo),
+                &self.settings.options.runs_dir.join("test-run"),
+            )
+            .expect("a cache"),
+        );
+        self
+    }
+
+    pub fn worktree(&self) -> &Worktree {
+        &self.worktree
     }
 
     /// Make every scripted turn report this usage, so a test about running
@@ -361,16 +382,6 @@ impl StageFixture {
             price,
             self.budget.spent(),
         );
-        self
-    }
-
-    /// A worktree of the test's own, already opened. Used where what is being
-    /// tested is the worktree's part of the loop rather than the loop itself.
-    pub fn with_worktree(mut self, worktree: Arc<dyn WorktreeSource>) -> Self {
-        worktree
-            .open_in(&self.settings.options.runs_dir.join("test-run"))
-            .expect("worktree directory");
-        self.adapters.worktree = worktree;
         self
     }
 

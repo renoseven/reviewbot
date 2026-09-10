@@ -68,6 +68,15 @@ impl Registry {
             .collect()
     }
 
+    /// The same list, in the shape a `Request` carries. Purpose stays here;
+    /// the wire type has no slot for it.
+    pub fn request_schemas(&self, round: Round) -> Vec<crate::protocol::ToolSchema> {
+        self.schemas_for(round)
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
     pub fn offered_on(&self, round: Round) -> Vec<&dyn Tool> {
         self.tools
             .iter()

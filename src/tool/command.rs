@@ -18,12 +18,16 @@ use serde_json::{Map, Value};
 
 use crate::common::{Backoff, truncate};
 use crate::config::ToolEntry;
+use crate::record::layout;
 use crate::security::{EnvPolicy, Limits, PathPolicy};
-use crate::worktree::{Abilities, WorktreeSource};
+use crate::worktree::Worktree;
 
-use super::availability::unavailable_description;
+use super::availability::{
+    NO_FILES_PRECONDITION, NO_FILES_SHORT, NO_WHOLE_TREE_PRECONDITION, NO_WHOLE_TREE_SHORT,
+    no_files, no_whole_tree, unavailable_description,
+};
 use super::signature::Signature;
-use super::{Purpose, Round, Tool, ToolError, ToolOutput};
+use super::{Purpose, Round, Tool, ToolError, ToolLimits, ToolOutput};
 
 /// How often a running child is asked whether it is done.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -42,14 +46,14 @@ const WITHHELD_LINE: &str = "[one line withheld by deny_paths]";
 /// it may take. Baked in when the tool is registered, so `Tool::execute`
 /// still takes nothing but the arguments the model wrote.
 ///
-/// The worktree is held as the source rather than as a path: a run that opens
-/// its own worktree only knows where it is once the run directory exists, and
-/// that is later than the tools are registered.
+/// The worktree is held as the enum rather than as a path: Empty has no
+/// directory, and the checker refuses through its condition before anyone
+/// asks for a root.
 pub struct CommandContext {
     environment: EnvPolicy,
     paths: PathPolicy,
-    worktree: Arc<dyn WorktreeSource>,
-    max_output_bytes: u64,
+    worktree: Arc<Worktree>,
+    run_dir: PathBuf,
     backoff: Backoff,
 }
 
@@ -57,31 +61,29 @@ impl CommandContext {
     pub fn new(
         environment: EnvPolicy,
         paths: PathPolicy,
-        worktree: Arc<dyn WorktreeSource>,
-        max_output_bytes: u64,
+        worktree: Arc<Worktree>,
+        run_dir: PathBuf,
         backoff: Backoff,
     ) -> Self {
         Self {
             environment,
             paths,
             worktree,
-            max_output_bytes,
+            run_dir,
             backoff,
         }
     }
 
-    fn root(&self) -> &Path {
-        self.worktree.root()
+    fn checks_dir(&self) -> PathBuf {
+        self.run_dir.join(layout::CHECKS)
     }
 
     /// Why this run's worktree cannot answer a checker that needs these, when
     /// it cannot. The same answer the description was written from.
-    fn refusal(&self, needs: Abilities) -> Option<&'static str> {
-        let reach = self.worktree.reach();
-        let missing = reach.unmet(needs);
-        match missing.is_empty() {
-            true => None,
-            false => Some(super::availability::refusal(missing)),
+    fn refusal(&self, requires_checkout: bool) -> Option<&'static str> {
+        match requires_checkout {
+            true => no_whole_tree(&self.worktree),
+            false => no_files(&self.worktree),
         }
     }
 }
@@ -90,6 +92,7 @@ pub struct CommandTool {
     entry: ToolEntry,
     context: CommandContext,
     limits: Limits,
+    max_file_bytes: u64,
     /// The `params` table, read as a declaration: the schema the model sees
     /// and the check its call is put through both come from here.
     signature: Signature,
@@ -98,33 +101,35 @@ pub struct CommandTool {
     /// run cannot answer has to say so where the model reads, and the only
     /// thing it reads is this.
     description: String,
-    /// What the checker needs of the worktree, from the entry. Read both to
-    /// write the description and to refuse the call, so the two agree.
-    needs: Abilities,
+    /// Whether the entry asked for a whole checkout. Read both to write the
+    /// description and to refuse the call, so the two agree.
+    requires_checkout: bool,
 }
 
 impl CommandTool {
-    pub fn new(entry: ToolEntry, context: CommandContext) -> Self {
-        let limits = Limits::new(entry.timeout_ms, context.max_output_bytes);
+    pub fn new(entry: ToolEntry, context: CommandContext, tool_limits: ToolLimits) -> Self {
+        let limits = Limits::new(entry.timeout_ms, tool_limits.max_output_bytes);
         let signature = Signature::from_entry(&entry);
-        // Every checker opens a file, so every one of them needs content. A
-        // compiler, a history walk or a cross-file analysis needs the whole
-        // project on top of that, and says so in its entry.
-        let mut needs = Abilities::CONTENT;
-        needs.set(Abilities::CHECKOUT, entry.requires_checkout);
-        let reach = context.worktree.reach();
-        let missing = reach.unmet(needs);
-        let description = match missing.is_empty() {
-            true => entry.description.clone(),
-            false => unavailable_description(&entry.description, missing),
+        // Every checker opens a file, so every one of them needs something to
+        // read. A compiler, a history walk or a cross-file analysis needs the
+        // whole project on top of that, and says so in its entry.
+        let requires_checkout = entry.requires_checkout;
+        let short = match requires_checkout {
+            true => NO_WHOLE_TREE_SHORT,
+            false => NO_FILES_SHORT,
+        };
+        let description = match context.refusal(requires_checkout) {
+            None => entry.description.clone(),
+            Some(_) => unavailable_description(&entry.description, short),
         };
         Self {
             entry,
             context,
             limits,
+            max_file_bytes: tool_limits.max_file_bytes,
             signature,
             description,
-            needs,
+            requires_checkout,
         }
     }
 
@@ -172,9 +177,10 @@ impl CommandTool {
     }
 
     /// The arguments the model wrote, checked against the declaration and then
-    /// put through the path check: a `path` reaches argv as what the check
-    /// approved rather than as what the model typed.
-    fn checked(&self, arguments: &Value) -> Result<Map<String, Value>, ToolError> {
+    /// put through the path check: a `path` is fetched into the worktree and
+    /// reaches argv as the absolute path under the root, because the child
+    /// no longer starts there.
+    fn checked(&self, arguments: &Value, root: &Path) -> Result<Map<String, Value>, ToolError> {
         let checked = self.signature.validate(&self.entry.name, arguments)?;
         let mut values = checked.values().clone();
         for parameter in self.signature.parameters() {
@@ -184,23 +190,31 @@ impl CommandTool {
             let Some(given) = values.get(&parameter.name).and_then(Value::as_str) else {
                 continue;
             };
-            let path = self
+            let relative = self
                 .context
                 .paths
-                .check_worktree_path(given, self.context.root())
+                .check_worktree_path(given, root)
                 .map_err(|rejection| ToolError::Rejected {
                     tool: self.entry.name.clone(),
                     reason: rejection.to_string(),
                 })?;
-            values.insert(parameter.name.clone(), Value::String(path));
+            self.context
+                .worktree
+                .fetch(&relative, self.max_file_bytes)
+                .map_err(|error| ToolError::failed_read(&self.entry.name, &relative, error))?;
+            let absolute = root.join(&relative);
+            values.insert(
+                parameter.name.clone(),
+                Value::String(absolute.to_string_lossy().into_owned()),
+            );
         }
         Ok(values)
     }
 
     /// The config already refused a `bin` inside the repository, but the
     /// worktree is only known now, so the same rule is applied again here.
-    fn refuse_bin_inside_worktree(&self) -> Result<(), ToolError> {
-        let root = resolved(self.context.root());
+    fn refuse_bin_inside_worktree(&self, root: &Path) -> Result<(), ToolError> {
+        let root = resolved(root);
         let bin = resolved(&self.entry.bin);
         if bin.starts_with(&root) {
             return Err(ToolError::Rejected {
@@ -216,11 +230,11 @@ impl CommandTool {
 
     /// Only a timeout or a kill earns another attempt. Everything else is
     /// either a result or a fault that will repeat.
-    fn run(&self, argv: &[String]) -> Result<ToolOutput, ToolError> {
+    fn run(&self, argv: &[String], root: &Path) -> Result<ToolOutput, ToolError> {
         let attempts = self.context.backoff.attempts();
         let mut last = None;
         for attempt in 0..attempts {
-            match self.run_once(argv) {
+            match self.run_once(argv, root) {
                 Ok(output) => return Ok(output),
                 Err(error) if error.is_retryable() && attempt + 1 < attempts => {
                     let delay = self.context.backoff.delay_ms(attempt);
@@ -243,10 +257,15 @@ impl CommandTool {
         }))
     }
 
-    fn run_once(&self, argv: &[String]) -> Result<ToolOutput, ToolError> {
+    fn run_once(&self, argv: &[String], root: &Path) -> Result<ToolOutput, ToolError> {
+        let checks = self.context.checks_dir();
+        std::fs::create_dir_all(&checks).map_err(|error| ToolError::Unavailable {
+            tool: self.entry.name.clone(),
+            reason: format!("cannot create {}: {error}", checks.display()),
+        })?;
         let mut child = Command::new(&self.entry.bin)
             .args(argv)
-            .current_dir(self.context.root())
+            .current_dir(&checks)
             .env_clear()
             .envs(self.context.environment.apply(std::env::vars()))
             .stdin(Stdio::null())
@@ -266,7 +285,7 @@ impl CommandTool {
         let printed = merge(join(out), join(err));
 
         match status {
-            Ok(Some(status)) => Ok(self.finish(&printed, status)),
+            Ok(Some(status)) => Ok(self.finish(&printed, status, root)),
             Ok(None) => Err(ToolError::Timeout {
                 tool: self.entry.name.clone(),
                 timeout_ms: self.entry.timeout_ms,
@@ -280,9 +299,10 @@ impl CommandTool {
 
     /// A non-zero exit is a result the model gets to read, not a failure of
     /// this stage; being killed by a signal is not, and comes back as one.
-    fn finish(&self, printed: &str, status: ExitStatus) -> ToolOutput {
-        let visible = self.withhold_denied_lines(printed);
-        let clipped = truncate(&visible, self.context.max_output_bytes as usize);
+    fn finish(&self, printed: &str, status: ExitStatus, root: &Path) -> ToolOutput {
+        let relative = strip_worktree_prefix(printed, root);
+        let visible = self.withhold_denied_lines(&relative, root);
+        let clipped = truncate(&visible, self.limits.max_output_bytes as usize);
         let mut text = clipped.text;
         if !status.success() {
             if !text.is_empty() && !text.ends_with('\n') {
@@ -295,11 +315,11 @@ impl CommandTool {
 
     /// `deny_paths` applies to what comes back as well as to what goes in:
     /// a checker that lists files will hand paths over along with content.
-    fn withhold_denied_lines(&self, text: &str) -> String {
-        let root = format!("{}/", self.context.root().display());
+    fn withhold_denied_lines(&self, text: &str, root: &Path) -> String {
+        let prefix = format!("{}/", root.display());
         let withheld: Vec<&str> = text
             .lines()
-            .map(|line| match self.names_a_denied_path(line, &root) {
+            .map(|line| match self.names_a_denied_path(line, &prefix) {
                 true => WITHHELD_LINE,
                 false => line,
             })
@@ -338,6 +358,19 @@ fn fragment_pattern() -> &'static Regex {
 
 fn resolved(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Paths in checker output go back to the model as repository-relative, so
+/// the machine's directory layout is never fed in and `deny_paths` still
+/// matches the same strings it matches on the way in.
+fn strip_worktree_prefix(text: &str, root: &Path) -> String {
+    let mut out = text.to_string();
+    for candidate in [root.to_path_buf(), resolved(root)] {
+        let displayed = candidate.to_string_lossy();
+        let prefix = format!("{}/", displayed.trim_end_matches('/'));
+        out = out.replace(&prefix, "");
+    }
+    out
 }
 
 fn drain(pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
@@ -426,19 +459,44 @@ impl Tool for CommandTool {
         &[Round::Investigation]
     }
 
-    fn needs(&self) -> Abilities {
-        self.needs
+    fn unavailable(&self) -> Option<&str> {
+        self.context.refusal(self.requires_checkout)
     }
 
-    fn unavailable(&self) -> Option<&str> {
-        self.context.refusal(self.needs)
+    fn precondition(&self) -> Option<&'static str> {
+        Some(match self.requires_checkout {
+            true => NO_WHOLE_TREE_PRECONDITION,
+            false => NO_FILES_PRECONDITION,
+        })
     }
 
     fn execute(&self, arguments: &Value) -> Result<ToolOutput, ToolError> {
-        let checked = self.checked(arguments)?;
-        self.refuse_bin_inside_worktree()?;
+        // The registry asks first, and so does this: Empty has no directory,
+        // and a root is only taken after the condition says there is one.
+        let root = match (self.unavailable(), self.context.worktree.root()) {
+            (None, Some(root)) => root,
+            (Some(reason), _) => {
+                return Err(ToolError::Unavailable {
+                    tool: self.entry.name.clone(),
+                    reason: reason.to_string(),
+                });
+            }
+            (None, None) => {
+                return Err(ToolError::Unavailable {
+                    tool: self.entry.name.clone(),
+                    reason: match no_files(&self.context.worktree)
+                        .or_else(|| no_whole_tree(&self.context.worktree))
+                    {
+                        Some(reason) => reason.to_string(),
+                        None => "this run's worktree has no directory".to_string(),
+                    },
+                });
+            }
+        };
+        let checked = self.checked(arguments, root)?;
+        self.refuse_bin_inside_worktree(root)?;
         let argv = self.argv(&checked)?;
-        self.run(&argv)
+        self.run(&argv, root)
     }
 }
 
@@ -449,12 +507,24 @@ mod tests {
     use super::*;
     use crate::config::{ParamKind, ParamSpec, SecuritySettings};
 
+    const LIMITS: ToolLimits = ToolLimits {
+        max_file_bytes: 262_144,
+        max_output_bytes: 65_536,
+        max_files_per_listing: 200,
+        max_hits_per_search: 50,
+        max_files_per_fetch: 20,
+    };
+
     /// A worktree with one readable file, which is all these tests point at.
     fn worktree() -> tempfile::TempDir {
         let root = tempfile::tempdir().expect("temp dir");
         std::fs::write(root.path().join("parse.c"), "int main(void){return 0;}\n")
             .expect("write source");
         root
+    }
+
+    fn run_dir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("run dir")
     }
 
     fn policy(root: &Path) -> PathPolicy {
@@ -488,90 +558,67 @@ mod tests {
         }
     }
 
-    /// A command tool only ever asks the worktree where it is and what it can
-    /// answer: the process it spawns opens the files itself.
-    struct RootOnly {
-        root: PathBuf,
-        reach: crate::worktree::Reach,
-    }
+    /// A repository that answers nothing. The checker tests only ask the
+    /// worktree where it is and whether it is a checkout.
+    struct SilentRepo;
 
-    impl RootOnly {
-        fn checkout(root: &Path) -> Self {
-            Self {
-                root: root.to_path_buf(),
-                reach: crate::worktree::Reach {
-                    content: crate::worktree::Content::Checkout,
-                    search: crate::worktree::Search::Regex,
-                },
-            }
-        }
-
-        fn fetched(root: &Path) -> Self {
-            Self {
-                root: root.to_path_buf(),
-                reach: crate::worktree::Reach {
-                    content: crate::worktree::Content::Fetched,
-                    search: crate::worktree::Search::Regex,
-                },
-            }
-        }
-    }
-
-    impl WorktreeSource for RootOnly {
-        fn root(&self) -> &Path {
-            &self.root
-        }
-
-        fn reach(&self) -> crate::worktree::Reach {
-            self.reach
-        }
-
-        fn open_in(&self, _run_dir: &Path) -> Result<(), crate::worktree::WorktreeError> {
-            Ok(())
-        }
-
-        fn head_sha(&self) -> Result<Option<String>, crate::worktree::WorktreeError> {
-            Ok(None)
-        }
-
-        fn supply(&self, _path: &str) -> Result<(), crate::worktree::WorktreeError> {
-            Ok(())
-        }
-
+    impl crate::platform::RepoSource for SilentRepo {
         fn list_files(
             &self,
             _glob: &str,
-        ) -> Result<crate::worktree::Listing, crate::worktree::WorktreeError> {
-            Ok(crate::worktree::Listing::default())
+        ) -> Result<crate::platform::Listing, crate::platform::PlatformError> {
+            Ok(crate::platform::Listing::default())
         }
 
         fn read_file(
             &self,
             _path: &str,
-            _lines: Option<crate::worktree::LineRange>,
-        ) -> Result<String, crate::worktree::WorktreeError> {
+            _lines: Option<crate::platform::LineRange>,
+        ) -> Result<String, crate::platform::PlatformError> {
             Ok(String::new())
+        }
+
+        fn size(&self, _path: &str) -> Result<u64, crate::platform::PlatformError> {
+            Ok(0)
         }
 
         fn search(
             &self,
+            _kind: crate::platform::SearchKind,
             _query: &str,
             _glob: Option<&str>,
-        ) -> Result<Vec<crate::worktree::SearchHit>, crate::worktree::WorktreeError> {
+        ) -> Result<Vec<crate::platform::SearchHit>, crate::platform::PlatformError> {
             Ok(Vec::new())
         }
     }
 
-    fn tool_in(root: &Path, entry: ToolEntry) -> CommandTool {
+    fn checkout(root: &Path) -> Arc<Worktree> {
+        // Built directly: two of the tests only need a path, not a directory.
+        Arc::new(Worktree::Local {
+            root: root.to_path_buf(),
+            repo: None,
+        })
+    }
+
+    fn fetched(root: &Path) -> Arc<Worktree> {
+        let repo = crate::platform::Repo::new(
+            Arc::new(SilentRepo) as Arc<dyn crate::platform::RepoSource>,
+            crate::platform::Capabilities::all(),
+        );
+        Arc::new(Worktree::open(None, Some(repo), root).expect("a cache"))
+    }
+
+    fn tool_in(root: &Path, run_dir: &Path, entry: ToolEntry) -> CommandTool {
         CommandTool::new(
             entry,
             CommandContext::new(
                 EnvPolicy::default(),
                 policy(root),
-                Arc::new(RootOnly::checkout(root)) as Arc<dyn WorktreeSource>,
-                65_536,
+                checkout(root),
+                run_dir.to_path_buf(),
                 Backoff::new(0),
             ),
+            LIMITS,
         )
     }
 
@@ -580,6 +627,7 @@ mod tests {
     fn tool() -> CommandTool {
         tool_in(
             Path::new("/nonexistent/worktree"),
+            Path::new("/nonexistent/run"),
             entry("/usr/bin/cppcheck", &["--quiet", "--", "{path}"]),
         )
     }
@@ -610,7 +658,8 @@ mod tests {
     #[test]
     fn a_real_command_runs_in_the_worktree_with_only_the_whitelisted_environment() {
         let root = worktree();
-        let tool = tool_in(root.path(), entry("/usr/bin/env", &[]));
+        let run = run_dir();
+        let tool = tool_in(root.path(), run.path(), entry("/usr/bin/env", &[]));
 
         let output = tool
             .execute(&serde_json::json!({"path": "parse.c"}))
@@ -642,8 +691,10 @@ mod tests {
     #[test]
     fn the_command_is_given_the_argv_array_rather_than_a_shell_line() {
         let root = worktree();
+        let run = run_dir();
         let tool = tool_in(
             root.path(),
+            run.path(),
             entry("/bin/echo", &["--", "{path}", "; rm -rf /"]),
         );
 
@@ -661,10 +712,12 @@ mod tests {
     #[test]
     fn a_traversing_path_is_refused_before_anything_is_spawned() {
         let root = worktree();
+        let run = run_dir();
         let marker = root.path().join("spawned");
         let script = format!("printf x > {}", marker.display());
         let tool = tool_in(
             root.path(),
+            run.path(),
             entry("/bin/sh", &["-c", script.as_str(), "{path}"]),
         );
 
@@ -680,7 +733,8 @@ mod tests {
     #[test]
     fn an_argument_the_schema_does_not_declare_is_answered_not_run() {
         let root = worktree();
-        let tool = tool_in(root.path(), entry("/bin/echo", &["{path}"]));
+        let run = run_dir();
+        let tool = tool_in(root.path(), run.path(), entry("/bin/echo", &["{path}"]));
         let error = tool
             .execute(&serde_json::json!({"path": "parse.c", "extra": "1"}))
             .expect_err("unknown argument");
@@ -693,12 +747,15 @@ mod tests {
     #[test]
     fn a_line_naming_a_denied_path_is_withheld_before_the_model_sees_it() {
         let root = worktree();
+        let run = run_dir();
+        let denied = format!(
+            "{}:1: warning: see leaked",
+            root.path().join("secrets/deploy.toml").display()
+        );
         let tool = tool_in(
             root.path(),
-            entry(
-                "/bin/echo",
-                &["parse.c:1: warning: see secrets/deploy.toml", "{path}"],
-            ),
+            run.path(),
+            entry("/bin/echo", &[denied.as_str(), "{path}"]),
         );
 
         let output = tool
@@ -716,7 +773,8 @@ mod tests {
     #[test]
     fn a_non_zero_exit_comes_back_as_a_result_with_its_status() {
         let root = worktree();
-        let tool = tool_in(root.path(), entry("/bin/sh", &["-c", "exit 2"]));
+        let run = run_dir();
+        let tool = tool_in(root.path(), run.path(), entry("/bin/sh", &["-c", "exit 2"]));
         let output = tool
             .execute(&serde_json::json!({"path": "parse.c"}))
             .expect("a failing command is still an answer");
@@ -728,15 +786,19 @@ mod tests {
         let root = worktree();
         let mut small = entry("/bin/echo", &["0123456789012345678901234567890123456789"]);
         small.timeout_ms = 5_000;
+        let run = run_dir();
+        let mut limits = LIMITS;
+        limits.max_output_bytes = 8;
         let tool = CommandTool::new(
             small,
             CommandContext::new(
                 EnvPolicy::default(),
                 policy(root.path()),
-                Arc::new(RootOnly::checkout(root.path())) as Arc<dyn WorktreeSource>,
-                8,
+                checkout(root.path()),
+                run.path().to_path_buf(),
                 Backoff::new(0),
             ),
+            limits,
         );
 
         let output = tool
@@ -757,7 +819,8 @@ mod tests {
         let root = worktree();
         let mut slow = entry("/bin/sleep", &["30"]);
         slow.timeout_ms = 80;
-        let tool = tool_in(root.path(), slow);
+        let run = run_dir();
+        let tool = tool_in(root.path(), run.path(), slow);
 
         let error = tool
             .execute(&serde_json::json!({"path": "parse.c"}))
@@ -776,20 +839,22 @@ mod tests {
         let root = worktree();
         let marker = root.path().join("spawned");
         let script = format!("printf x > {}", marker.display());
-        let checker = |worktree: Arc<dyn WorktreeSource>| {
+        let run = run_dir();
+        let checker = |worktree: Arc<Worktree>| {
             CommandTool::new(
                 entry("/bin/sh", &["-c", script.as_str(), "{path}"]),
                 CommandContext::new(
                     EnvPolicy::default(),
                     policy(root.path()),
                     worktree,
-                    65_536,
+                    run.path().to_path_buf(),
                     Backoff::new(0),
                 ),
+                LIMITS,
             )
         };
 
-        let fetched = checker(Arc::new(RootOnly::fetched(root.path())));
+        let fetched = checker(fetched(root.path()));
         let reason = fetched.unavailable().expect("not a checkout");
         assert!(reason.contains("whole checkout"), "{reason}");
         assert!(reason.contains("not about the code"), "{reason}");
@@ -804,7 +869,7 @@ mod tests {
             fetched.description()
         );
 
-        let whole = checker(Arc::new(RootOnly::checkout(root.path())));
+        let whole = checker(checkout(root.path()));
         assert!(whole.unavailable().is_none());
         assert_eq!(whole.description(), "static analysis for C and C++");
         assert!(!marker.exists(), "neither of them was run");
@@ -815,7 +880,12 @@ mod tests {
         let root = worktree();
         let bin = root.path().join("checker.sh");
         std::fs::write(&bin, "#!/bin/sh\necho hi\n").expect("write script");
-        let tool = tool_in(root.path(), entry(bin.display().to_string().as_str(), &[]));
+        let run = run_dir();
+        let tool = tool_in(
+            root.path(),
+            run.path(),
+            entry(bin.display().to_string().as_str(), &[]),
+        );
 
         let error = tool
             .execute(&serde_json::json!({"path": "parse.c"}))
@@ -823,5 +893,188 @@ mod tests {
 
         assert!(matches!(error, ToolError::Rejected { .. }), "{error}");
         assert!(error.to_string().contains("inside the worktree"), "{error}");
+    }
+
+    /// A repository that holds named files. The fetch-before-spawn test
+    /// points a checker at one the worktree has never seen.
+    struct HoldingRepo {
+        files: BTreeMap<String, String>,
+    }
+
+    impl crate::platform::RepoSource for HoldingRepo {
+        fn list_files(
+            &self,
+            _glob: &str,
+        ) -> Result<crate::platform::Listing, crate::platform::PlatformError> {
+            Ok(crate::platform::Listing::default())
+        }
+
+        fn read_file(
+            &self,
+            path: &str,
+            _lines: Option<crate::platform::LineRange>,
+        ) -> Result<String, crate::platform::PlatformError> {
+            self.files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| crate::platform::PlatformError::Request {
+                    operation: "reading a file",
+                    host: "holding".to_string(),
+                    reason: format!("{path} is not in this repository"),
+                })
+        }
+
+        fn size(&self, path: &str) -> Result<u64, crate::platform::PlatformError> {
+            self.files
+                .get(path)
+                .map(|body| body.len() as u64)
+                .ok_or_else(|| crate::platform::PlatformError::Request {
+                    operation: "reading a file size",
+                    host: "holding".to_string(),
+                    reason: format!("{path} is not in this repository"),
+                })
+        }
+
+        fn search(
+            &self,
+            _kind: crate::platform::SearchKind,
+            _query: &str,
+            _glob: Option<&str>,
+        ) -> Result<Vec<crate::platform::SearchHit>, crate::platform::PlatformError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn a_path_argument_is_fetched_before_the_checker_runs() {
+        let run = run_dir();
+        let mut files = BTreeMap::new();
+        files.insert("header.h".to_string(), "/* never read */\n".to_string());
+        let repo = crate::platform::Repo::new(
+            Arc::new(HoldingRepo { files }) as Arc<dyn crate::platform::RepoSource>,
+            crate::platform::Capabilities::all(),
+        );
+        let worktree = Arc::new(Worktree::open(None, Some(repo), run.path()).expect("a cache"));
+        assert!(
+            !worktree
+                .root()
+                .expect("cache has a root")
+                .join("header.h")
+                .is_file(),
+            "the file is not on disk yet"
+        );
+
+        let mut checker = entry("/bin/cat", &["{path}"]);
+        checker.requires_checkout = false;
+        let tool = CommandTool::new(
+            checker,
+            CommandContext::new(
+                EnvPolicy::default(),
+                policy(worktree.root().expect("cache has a root")),
+                Arc::clone(&worktree),
+                run.path().to_path_buf(),
+                Backoff::new(0),
+            ),
+            LIMITS,
+        );
+
+        let output = tool
+            .execute(&serde_json::json!({"path": "header.h"}))
+            .expect("the path argument is fetched");
+
+        assert!(output.text.contains("/* never read */"), "{}", output.text);
+        assert!(
+            worktree
+                .root()
+                .expect("cache has a root")
+                .join("header.h")
+                .is_file(),
+            "fetch left the file in the cache"
+        );
+    }
+
+    #[test]
+    fn a_checker_starts_in_the_run_checks_directory() {
+        let root = worktree();
+        let run = run_dir();
+        let tool = tool_in(
+            root.path(),
+            run.path(),
+            entry("/bin/sh", &["-c", "printf dropped > marker"]),
+        );
+
+        tool.execute(&serde_json::json!({"path": "parse.c"}))
+            .expect("the checker runs");
+
+        assert!(
+            run.path().join(layout::CHECKS).join("marker").is_file(),
+            "the file the checker wrote landed in checks/"
+        );
+        assert!(
+            !root.path().join("marker").exists(),
+            "the checkout was not written"
+        );
+        assert!(
+            !run.path().join(layout::CACHE).join("marker").exists(),
+            "the cache was not written"
+        );
+        assert!(
+            !run.path().join(layout::CACHE).exists(),
+            "a checkout run does not open a cache"
+        );
+    }
+
+    #[test]
+    fn checker_output_paths_are_repository_relative() {
+        let root = worktree();
+        let run = run_dir();
+        let tool = tool_in(root.path(), run.path(), entry("/bin/echo", &["{path}"]));
+
+        let output = tool
+            .execute(&serde_json::json!({"path": "parse.c"}))
+            .expect("echo runs");
+
+        assert_eq!(output.text.trim(), "parse.c");
+        assert!(
+            !output
+                .text
+                .contains(&root.path().to_string_lossy().into_owned()),
+            "the worktree root must not reach the model: {}",
+            output.text
+        );
+    }
+
+    #[test]
+    fn an_empty_worktree_is_refused_without_a_directory() {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let spawned = scratch.path().join("spawned");
+        let script = format!("printf x > {}", spawned.display());
+        let tool = CommandTool::new(
+            entry("/bin/sh", &["-c", script.as_str()]),
+            CommandContext::new(
+                EnvPolicy::default(),
+                policy(Path::new("/nonexistent/worktree")),
+                Arc::new(Worktree::Empty),
+                PathBuf::from("/nonexistent/run"),
+                Backoff::new(0),
+            ),
+            LIMITS,
+        );
+
+        assert!(tool.unavailable().is_some());
+        let error = tool
+            .execute(&serde_json::json!({"path": "parse.c"}))
+            .expect_err("Empty is refused before a root is taken");
+        assert!(matches!(error, ToolError::Unavailable { .. }), "{error}");
+        assert!(
+            error.to_string().contains("whole checkout")
+                || error.to_string().contains("only the diff"),
+            "{error}"
+        );
+        assert!(!spawned.exists(), "the command was never spawned");
+        assert!(
+            !Path::new("/nonexistent/run").join(layout::CHECKS).exists(),
+            "no checks directory is created for Empty"
+        );
     }
 }

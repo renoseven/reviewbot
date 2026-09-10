@@ -2,7 +2,7 @@
 //! user config can never name one: adapters are injected through `review_with`,
 //! which is crate visible.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,17 +15,17 @@ use crate::platform::{
 };
 use crate::progress::{Event, Outcome, Progress, Silent};
 use crate::protocol::{OutputItem, Protocol, ProtocolError, Request, Response};
-use crate::record::{LocalStorage, Storage, layout};
+use crate::record::{LocalStorage, Storage, layout, prune_runs};
 use crate::security::Redactor;
 use crate::stage::Adapters;
-use crate::tool::{FinishReview, Registry, SubmitComment, SubmitSummary};
-use crate::worktree::FetchedWorktree;
+use crate::tool::{SubmitComment, SubmitSummary};
 use crate::{Error, RunResult, Source};
 
 const CONFIG: &str = r#"
 [review]
 max_files_per_listing = 200
 max_hits_per_search = 50
+max_files_per_fetch = 20
 max_file_bytes = 262144
 max_tool_output_bytes = 32768
 
@@ -114,7 +114,7 @@ impl FakePlatform {
     fn new(calls: Arc<Calls>) -> Self {
         Self {
             calls,
-            repo: Arc::new(FakeRepo),
+            repo: Arc::new(FakeRepo::default()),
             mr: Arc::new(Mr::default()),
             change: PlatformChange {
                 head_sha: HEAD_SHA.to_string(),
@@ -148,8 +148,15 @@ impl Platform for FakePlatform {
         "gitlab.com"
     }
 
-    fn capabilities(&self) -> Capabilities {
-        Capabilities::default()
+    fn repo(&self) -> crate::platform::Repo {
+        crate::platform::Repo::new(
+            Arc::clone(&self.repo) as Arc<dyn RepoSource>,
+            Capabilities::default(),
+        )
+    }
+
+    fn cached_body(&self, _path: &str) -> Option<String> {
+        None
     }
 
     fn head_sha(&self, _change: &ChangeRef) -> Result<String, PlatformError> {
@@ -194,27 +201,49 @@ impl Platform for FakePlatform {
     }
 
     fn bind_repo(&self, _change: &ChangeRef, _head_sha: &str) {}
-
-    fn repo_source(&self) -> Arc<dyn RepoSource> {
-        Arc::clone(&self.repo) as Arc<dyn RepoSource>
-    }
 }
 
-struct FakeRepo;
+#[derive(Default)]
+struct FakeRepo {
+    /// Bodies `read_file` hands back. Empty unless a test plants them, so a
+    /// checkout run can see a repository answer that is not the file on disk
+    /// — the canary that a write into the checkout would leave behind.
+    files: BTreeMap<String, String>,
+}
+
+impl FakeRepo {
+    fn holding(files: &[(&str, &str)]) -> Self {
+        Self {
+            files: files
+                .iter()
+                .map(|(path, body)| ((*path).to_string(), (*body).to_string()))
+                .collect(),
+        }
+    }
+}
 
 impl RepoSource for FakeRepo {
     fn list_files(&self, _glob: &str) -> Result<Listing, PlatformError> {
         Ok(Listing {
-            paths: Vec::new(),
+            files: Vec::new(),
             complete: true,
         })
     }
 
-    fn read_file(&self, _path: &str, _lines: Option<LineRange>) -> Result<String, PlatformError> {
-        Ok(String::new())
+    fn read_file(&self, path: &str, _lines: Option<LineRange>) -> Result<String, PlatformError> {
+        Ok(self.files.get(path).cloned().unwrap_or_default())
     }
 
-    fn search(&self, _query: &str, _glob: Option<&str>) -> Result<Vec<SearchHit>, PlatformError> {
+    fn size(&self, path: &str) -> Result<u64, PlatformError> {
+        Ok(self.files.get(path).map(String::len).unwrap_or(0) as u64)
+    }
+
+    fn search(
+        &self,
+        _kind: crate::platform::SearchKind,
+        _query: &str,
+        _glob: Option<&str>,
+    ) -> Result<Vec<SearchHit>, PlatformError> {
         Ok(Vec::new())
     }
 }
@@ -269,8 +298,9 @@ impl Protocol for FakeProtocol {
 /// tests readable. Both submissions are function calls now, so a document
 /// becomes whichever call the request advertises: a comments document
 /// becomes one `submit_comment` per finding, a score document becomes one
-/// `submit_summary`. A document the request has no tool for stays a message,
-/// which is how the "it only talked" paths are exercised.
+/// `submit_summary`, and `{"tool": ...}` becomes that one call. A document
+/// the request has no tool for stays a message, which is how the "it only
+/// talked" paths are exercised.
 fn reply_as_calls(text: &str, request: &Request) -> Option<Vec<OutputItem>> {
     let advertised = |name: &str| request.tools.iter().any(|tool| tool.name == name);
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
@@ -280,6 +310,19 @@ fn reply_as_calls(text: &str, request: &Request) -> Option<Vec<OutputItem>> {
                 call_id: "submit-summary".to_string(),
                 name: SubmitSummary::NAME.to_string(),
                 arguments: text.to_string(),
+            }]
+        });
+    }
+    if let Some(name) = value.get("tool").and_then(|name| name.as_str()) {
+        return advertised(name).then(|| {
+            let arguments = match value.get("arguments") {
+                Some(args) => args.to_string(),
+                None => "{}".to_string(),
+            };
+            vec![OutputItem::FunctionCall {
+                call_id: format!("call-{name}"),
+                name: name.to_string(),
+                arguments,
             }]
         });
     }
@@ -300,20 +343,14 @@ fn reply_as_calls(text: &str, request: &Request) -> Option<Vec<OutputItem>> {
     )
 }
 
+/// The half of the adapters a run has before it has a directory. The
+/// worktree and the tools are the run's own to build, once it is locked: a
+/// URL run opens a cache in its run directory with this fake platform behind
+/// it, and a diff run has nothing to read at all.
 fn adapters(calls: Arc<Calls>) -> Adapters {
-    let mut tools = Registry::new();
-    tools.register(Box::new(SubmitComment::new()));
-    tools.register(Box::new(FinishReview::new()));
-    tools.register(Box::new(SubmitSummary::new()));
     Adapters {
         platform: Some(Box::new(FakePlatform::new(Arc::clone(&calls)))),
         protocol: Box::new(FakeProtocol::new(calls, Arc::new(Mutex::new(Vec::new())))),
-        tools,
-        // One worktree, and this one fills itself from the fake platform.
-        worktree: Arc::new(FetchedWorktree::new(
-            Some(Arc::new(FakeRepo) as Arc<dyn RepoSource>),
-            Capabilities::default(),
-        )),
         redactor: Redactor::new(),
     }
 }
@@ -322,10 +359,6 @@ fn adapters(calls: Arc<Calls>) -> Adapters {
 /// merge request the caller holds on to, so two entries into the same run see
 /// one MR rather than two.
 fn publishing_adapters(calls: Arc<Calls>, mr: Arc<Mr>, replies: Vec<&str>) -> Adapters {
-    let mut tools = Registry::new();
-    tools.register(Box::new(SubmitComment::new()));
-    tools.register(Box::new(FinishReview::new()));
-    tools.register(Box::new(SubmitSummary::new()));
     let mut platform = FakePlatform::new(Arc::clone(&calls));
     platform.change.diff = DIFF.to_string();
     platform.mr = mr;
@@ -336,13 +369,102 @@ fn publishing_adapters(calls: Arc<Calls>, mr: Arc<Mr>, replies: Vec<&str>) -> Ad
             Arc::new(Mutex::new(Vec::new())),
             replies,
         )),
-        tools,
-        worktree: Arc::new(FetchedWorktree::new(
-            Some(Arc::new(FakeRepo) as Arc<dyn RepoSource>),
-            Capabilities::default(),
+        redactor: Redactor::new(),
+    }
+}
+
+/// A URL run whose repository answers with a body that is not what the
+/// checkout holds, and whose model is scripted to call tools. The mismatch
+/// is the canary: a write into the checkout would leave the repository body
+/// behind.
+fn writing_adapters(calls: Arc<Calls>, replies: Vec<&str>) -> Adapters {
+    let mut platform = FakePlatform::new(Arc::clone(&calls));
+    platform.change.diff = DIFF.to_string();
+    platform.repo = Arc::new(FakeRepo::holding(&[("src/parse.c", REPO_PARSE)]));
+    Adapters {
+        platform: Some(Box::new(platform)),
+        protocol: Box::new(FakeProtocol::scripted(
+            calls,
+            Arc::new(Mutex::new(Vec::new())),
+            replies,
         )),
         redactor: Redactor::new(),
     }
+}
+
+/// A checker that writes a marker into cwd and prints the file it was
+/// pointed at. The write is the thing a checkout must not receive.
+const CHECKER: &str = r#"
+[[tool]]
+name = "mark"
+description = "drop a marker in cwd and print the file"
+bin = "/bin/sh"
+args = ["-c", "printf dropped > marker; /bin/cat \"$1\"", "mark", "{path}"]
+params.path = { type = "path", description = "file to print" }
+requires_checkout = false
+"#;
+
+const REPO_PARSE: &str = "I-AM-FROM-THE-REPO\n";
+const CHECKOUT_PARSE: &str = "I-AM-FROM-THE-CHECKOUT\n";
+const CHECKOUT_KEEP: &str = "do-not-touch\n";
+const FETCH_CALL: &str = r#"{"tool":"fetch_repo_file","arguments":{"paths":["src/parse.c"]}}"#;
+const MARK_CALL: &str = r#"{"tool":"mark","arguments":{"path":"src/parse.c"}}"#;
+
+fn with_checker(config: &str) -> String {
+    format!(
+        "{}\n{CHECKER}",
+        config.replace("[triage]", "[triage]\nskip_paths = [\"vendor/**\"]")
+    )
+}
+
+fn planted_checkout(root: &Path) -> PathBuf {
+    let checkout = root.join("checkout");
+    std::fs::create_dir_all(checkout.join("src")).expect("src");
+    std::fs::create_dir_all(checkout.join(".git")).expect("git");
+    std::fs::write(checkout.join("src/parse.c"), CHECKOUT_PARSE).expect("parse.c");
+    std::fs::write(checkout.join("src/keep.c"), CHECKOUT_KEEP).expect("keep.c");
+    std::fs::write(checkout.join(".git/HEAD"), format!("{HEAD_SHA}\n")).expect("HEAD");
+    checkout
+}
+
+/// Every path under `root`. A directory is `None`; a regular file is its
+/// bytes. A new empty directory still shows up, which a file-only walk
+/// would miss.
+fn snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    let mut tree = BTreeMap::new();
+    walk_snapshot(root, root, &mut tree);
+    tree
+}
+
+fn walk_snapshot(root: &Path, dir: &Path, tree: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
+    for entry in std::fs::read_dir(dir).expect("read dir") {
+        let entry = entry.expect("entry");
+        let path = entry.path();
+        let relative = path.strip_prefix(root).expect("under root").to_path_buf();
+        let file_type = entry.file_type().expect("type");
+        if file_type.is_dir() {
+            tree.insert(relative, None);
+            walk_snapshot(root, &path, tree);
+        } else if file_type.is_file() {
+            tree.insert(relative, Some(std::fs::read(&path).expect("read file")));
+        } else {
+            tree.insert(
+                relative,
+                Some(format!("not-a-regular-file:{file_type:?}").into_bytes()),
+            );
+        }
+    }
+}
+
+fn named_tools(watcher: &Watcher) -> Vec<String> {
+    watcher
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Tool { name } => Some(name),
+            _ => None,
+        })
+        .collect()
 }
 
 struct Workspace {
@@ -582,6 +704,103 @@ fn a_second_process_on_the_same_run_directory_fails_at_once() {
         .expect("the holder let go, so the next one gets in");
 }
 
+/// Writing needs the root-and-repo pair only `Worktree::Cache` holds. A
+/// command-line checkout never has that pair, so a run that actually tries
+/// to write — the model calls `fetch_repo_file`, and a checker is pointed
+/// at a file — must leave the checkout's listing and every file's bytes
+/// exactly as they were.
+#[test]
+fn a_run_over_a_checkout_leaves_every_file_byte_for_byte() {
+    let workspace = Workspace::with_config(&with_checker(CONFIG));
+    let checkout = planted_checkout(workspace.root.path());
+    let before = snapshot(&checkout);
+    let settings = workspace.settings_with(RunOptions {
+        runs_dir: workspace.runs_dir.clone(),
+        worktree: Some(checkout.clone()),
+        ..RunOptions::default()
+    });
+    let watcher = Watcher::default();
+
+    let result = crate::review_with(
+        &settings,
+        &Source::Url(URL.to_string()),
+        &writing_adapters(
+            Arc::new(Calls::default()),
+            vec![FETCH_CALL, MARK_CALL, FINDING, SCORE],
+        ),
+        &watcher,
+    )
+    .expect("the run completes");
+
+    let tools = named_tools(&watcher);
+    assert!(
+        tools.iter().any(|name| name == "fetch_repo_file"),
+        "the model has to have called fetch_repo_file: {tools:?}"
+    );
+    assert!(
+        tools.iter().any(|name| name == "mark"),
+        "the checker has to have been pointed at a file: {tools:?}"
+    );
+    assert_eq!(
+        snapshot(&checkout),
+        before,
+        "the checkout listing and every file's bytes are unchanged"
+    );
+    let run_dir = workspace.run_dir(&result.run_id);
+    assert!(
+        !run_dir.join(layout::CACHE).exists(),
+        "a checkout run does not open a cache, so there is nowhere a write could land"
+    );
+    assert!(
+        run_dir.join(layout::CHECKS).join("marker").is_file(),
+        "the checker's write went to the run directory, not the checkout"
+    );
+}
+
+/// `cache/` and `checks/` live inside the run directory, so `run prune`
+/// taking the directory takes the fetched files and the checker scratch
+/// with it. They cannot outlive the run.
+#[test]
+fn prune_takes_the_cache_and_the_checks_with_the_run() {
+    let workspace = Workspace::with_config(&with_checker(CONFIG));
+    let result = crate::review_with(
+        &workspace.settings(),
+        &Source::Url(URL.to_string()),
+        &writing_adapters(Arc::new(Calls::default()), vec![MARK_CALL, FINDING, SCORE]),
+        &Silent,
+    )
+    .expect("the run completes");
+
+    let run_dir = workspace.run_dir(&result.run_id);
+    let cache = run_dir.join(layout::CACHE);
+    let checks = run_dir.join(layout::CHECKS);
+    assert!(cache.is_dir(), "a URL run opens a cache");
+    assert!(
+        cache.join("src/parse.c").is_file(),
+        "the file under review was fetched into the cache"
+    );
+    assert!(
+        checks.join("marker").is_file(),
+        "the checker wrote into checks/"
+    );
+
+    let report = prune_runs(&workspace.runs_dir, 0, false).expect("pruned");
+    assert_eq!(report.deleted, vec![result.run_id.clone()]);
+    assert!(!run_dir.exists(), "the run directory itself is gone");
+    assert!(!cache.exists(), "the fetched files cannot outlive the run");
+    assert!(
+        !checks.exists(),
+        "the checker scratch cannot outlive the run"
+    );
+}
+
+/// Which stages this entry read back rather than ran, in stage order. What
+/// a config change costs is exactly this list, so it is what these tests
+/// assert on rather than file timestamps.
+fn from_checkpoint(watcher: &Watcher) -> Vec<bool> {
+    watcher.stages().iter().map(|(_, _, done)| *done).collect()
+}
+
 /// A diff run, which is the shape with real chunks behind it: the model is
 /// asked twice for a first entry and must be asked again for whatever a
 /// config change put back on the table.
@@ -598,10 +817,6 @@ fn enter_diff_run(
         progress,
     )
     .expect("the run completes")
-}
-
-fn from_checkpoint(watcher: &Watcher) -> Vec<bool> {
-    watcher.stages().iter().map(|(_, _, done)| *done).collect()
 }
 
 /// The settings are not in the run id, so a config change walks back into
@@ -666,7 +881,7 @@ fn a_changed_review_table_leaves_input_and_triage_alone() {
 
     std::fs::write(
         &workspace.config_path,
-        CONFIG.replace("max_hits_per_search = 50", "max_hits_per_search = 20"),
+        CONFIG.replace("max_files_per_fetch = 20", "max_files_per_fetch = 5"),
     )
     .expect("rewrite config");
 
@@ -693,7 +908,9 @@ fn a_changed_review_table_leaves_input_and_triage_alone() {
 
 /// Three things that look like changes and are not: asking for debug
 /// logging must not cost a run its checkpoints, and neither `--publish` nor
-/// `--retries` says anything about what the review will conclude.
+/// `--retries` says anything about what the review will conclude. The last
+/// two are why "run once to read the report, then run again with
+/// `--publish`" pays the model once.
 #[test]
 fn debug_logging_publishing_and_retries_invalidate_nothing() {
     let workspace = Workspace::new();
@@ -775,7 +992,11 @@ fn an_explicit_run_id_pointed_at_another_input_fails() {
     }
 }
 
-/// A `meta.json` nobody can read is a broken run, not a fatal one.
+/// A `meta.json` nobody can read is a broken run, not a fatal one. Nothing
+/// in it can be trusted — not the fingerprint that says which checkpoints
+/// still answer the question, and not `spent`, which an unreadable file
+/// cannot yield anyway — so `review` starts over in the same directory with
+/// the budget frozen again, and the two read-only commands still answer.
 #[test]
 fn an_unreadable_meta_starts_a_fresh_run_and_still_lists() {
     let workspace = Workspace::new();
@@ -820,7 +1041,8 @@ fn an_unreadable_meta_starts_a_fresh_run_and_still_lists() {
     assert_eq!(second.spent, 0.0);
 }
 
-/// What each command line option puts in which slice.
+/// What each command line option puts in which slice, over the wiring the
+/// unit tests in `config` cannot reach.
 #[test]
 fn run_parameters_do_not_change_identity_but_conclusions_do() {
     let workspace = Workspace::new();
@@ -856,18 +1078,7 @@ fn run_parameters_do_not_change_identity_but_conclusions_do() {
     assert_eq!(
         baseline.earliest_change(&with_worktree.fingerprint()),
         Some(Stage::Input),
-        "whether a checkout was named is first read by input"
-    );
-
-    std::fs::write(
-        &workspace.config_path,
-        CONFIG.replace("budget_per_run = 10.0", "budget_per_run = 11.0"),
-    )
-    .expect("rewrite config");
-    assert_eq!(
-        baseline.earliest_change(&workspace.settings().fingerprint()),
-        Some(Stage::Review),
-        "a provider budget is first read by review"
+        "the content source mode is settled by input"
     );
 }
 
@@ -912,8 +1123,6 @@ fn a_diff_run_completes_without_a_platform() {
                 Arc::new(Calls::default()),
                 Arc::new(Mutex::new(Vec::new())),
             )),
-            tools: Registry::new(),
-            worktree: Arc::new(FetchedWorktree::new(None, Capabilities::default())),
             redactor: Redactor::new(),
         },
         &Silent,
@@ -967,10 +1176,6 @@ fn scripted_diff_adapters(
     replies: Vec<&str>,
 ) -> (Adapters, Arc<Mutex<Vec<Request>>>) {
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut tools = Registry::new();
-    tools.register(Box::new(SubmitComment::new()));
-    tools.register(Box::new(FinishReview::new()));
-    tools.register(Box::new(SubmitSummary::new()));
     let adapters = Adapters {
         platform: None,
         protocol: Box::new(FakeProtocol::scripted(
@@ -978,8 +1183,6 @@ fn scripted_diff_adapters(
             Arc::clone(&requests),
             replies,
         )),
-        tools,
-        worktree: Arc::new(FetchedWorktree::new(None, Capabilities::default())),
         redactor: Redactor::new(),
     };
     (adapters, requests)
@@ -1122,10 +1325,6 @@ fn what_the_author_wrote_reaches_every_review_request_as_material() {
     let workspace = Workspace::new();
     let calls = Arc::new(Calls::default());
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let mut tools = Registry::new();
-    tools.register(Box::new(SubmitComment::new()));
-    tools.register(Box::new(FinishReview::new()));
-    tools.register(Box::new(SubmitSummary::new()));
     let adapters = Adapters {
         platform: Some(Box::new(FakePlatform::narrated(Arc::clone(&calls)))),
         protocol: Box::new(FakeProtocol::scripted(
@@ -1133,8 +1332,6 @@ fn what_the_author_wrote_reaches_every_review_request_as_material() {
             Arc::clone(&requests),
             Vec::new(),
         )),
-        tools,
-        worktree: Arc::new(FetchedWorktree::new(None, Capabilities::default())),
         redactor: Redactor::new(),
     };
 

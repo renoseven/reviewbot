@@ -41,14 +41,18 @@ pub const KNOWN_REASONING_EFFORTS: [&str; 7] =
 /// which makes this list a security boundary rather than documentation: a name
 /// missing from it is a builtin a config entry could shadow. A test asserts it
 /// equals what a fully equipped run registers, because it has drifted before.
-pub const RESERVED_TOOL_NAMES: [&str; 7] = [
+pub const RESERVED_TOOL_NAMES: [&str; 11] = [
     "submit_comment",
     "finish_review",
     "submit_summary",
-    "list_files",
-    "stat_file",
-    "read_file",
-    "search_code",
+    "list_local_files",
+    "suggest_local_read",
+    "read_local_file",
+    "search_local_regex",
+    "list_repo_files",
+    "fetch_repo_file",
+    "search_repo_regex",
+    "search_repo_keyword",
 ];
 
 /// What the startup check assumes the prompt body and the tool schemas
@@ -569,6 +573,10 @@ impl Config {
                 u64::from(self.review.max_hits_per_search),
             ),
             (
+                "[review].max_files_per_fetch",
+                u64::from(self.review.max_files_per_fetch),
+            ),
+            (
                 "[triage].max_chunk_tokens",
                 u64::from(self.triage.max_chunk_tokens),
             ),
@@ -745,6 +753,7 @@ mod tests {
 [review]
 max_files_per_listing = 200
 max_hits_per_search = 50
+max_files_per_fetch = 20
 max_file_bytes = 262144
 max_tool_output_bytes = 32768
 
@@ -979,6 +988,7 @@ api_token = "GITHUB_TOKEN"
                 "max_files_per_listing = 200",
             ),
             ("[review].max_hits_per_search", "max_hits_per_search = 50"),
+            ("[review].max_files_per_fetch", "max_files_per_fetch = 20"),
             ("[triage].max_chunk_tokens", "max_chunk_tokens = 24000"),
             (
                 "[triage].skip_files_over_bytes",
@@ -1115,7 +1125,7 @@ params.flag = { type = "string" }
         text.push_str(
             r#"
 [[tool]]
-name = "search_code"
+name = "search_local_regex"
 description = "shadows the builtin"
 bin = "/usr/bin/rg"
 args = ["{query}"]

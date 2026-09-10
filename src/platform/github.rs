@@ -12,10 +12,10 @@ use crate::config::{PlatformEntry, PlatformKind};
 use crate::domain::Narrative;
 
 use super::http::HttpClient;
-use super::source::{LineRange, Listing, RepoSource, SearchHit};
+use super::source::{File, LineRange, Listing, RepoSource, SearchHit, SearchKind};
 use super::{
     Capabilities, ChangeRef, DiffRefs, ExistingComment, OutgoingComment, Platform, PlatformChange,
-    PlatformError,
+    PlatformError, Repo,
 };
 
 const API_VERSION: &str = "2022-11-28";
@@ -247,14 +247,15 @@ impl Platform for GitHub {
         self.entry.host().unwrap_or("github.com")
     }
 
-    /// The code search endpoint is always there. It indexes the default branch
-    /// and takes keywords rather than expressions, so hits are candidate paths
-    /// that get re-read at `head_sha` and rematched locally.
-    fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            code_search: true,
-            regex_search: false,
-        }
+    fn repo(&self) -> Repo {
+        Repo::new(
+            Arc::clone(&self.repo) as Arc<dyn RepoSource>,
+            Capabilities::KEYWORD_SEARCH,
+        )
+    }
+
+    fn cached_body(&self, path: &str) -> Option<String> {
+        self.repo.cached_body(path)
     }
 
     fn head_sha(&self, change: &ChangeRef) -> Result<String, PlatformError> {
@@ -350,10 +351,6 @@ impl Platform for GitHub {
             self.repo.bind(owner, repo, head_sha);
         }
     }
-
-    fn repo_source(&self) -> Arc<dyn RepoSource> {
-        Arc::clone(&self.repo) as Arc<dyn RepoSource>
-    }
 }
 
 /// The repository and commit every read goes against. There is nothing to read
@@ -378,6 +375,7 @@ struct TreeEntry {
     path: String,
     sha: String,
     is_tree: bool,
+    size: Option<u64>,
 }
 
 /// Repository reads for one repository at one commit. Trees and file bodies
@@ -387,9 +385,9 @@ struct GitHubRepo {
     http: Arc<HttpClient>,
     token: Secret,
     commit: Mutex<Option<Commit>>,
-    /// Every blob path, set only when one recursive request carried the whole
+    /// Every blob, set only when one recursive request carried the whole
     /// tree. From then on no glob costs a request.
-    whole_tree: Mutex<Option<Vec<String>>>,
+    whole_tree: Mutex<Option<Vec<File>>>,
     /// Entries per tree sha, so the per-directory fallback does not walk the
     /// same directory twice across two listings.
     trees: Mutex<BTreeMap<String, Tree>>,
@@ -458,6 +456,7 @@ impl GitHubRepo {
                     path: entry.path,
                     sha: entry.sha,
                     is_tree: entry.kind == "tree",
+                    size: entry.size,
                 })
                 .collect(),
             truncated: payload.truncated,
@@ -476,7 +475,7 @@ impl GitHubRepo {
         matcher: &GlobMatcher,
     ) -> Result<Listing, PlatformError> {
         let mut pending = VecDeque::from([(root.to_string(), String::new())]);
-        let mut paths = Vec::new();
+        let mut files = Vec::new();
         let mut visited = 0usize;
         let mut complete = true;
         while let Some((sha, directory)) = pending.pop_front() {
@@ -495,13 +494,16 @@ impl GitHubRepo {
                         pending.push_back((entry.sha, path));
                     }
                 } else if matcher.is_match(&path) {
-                    paths.push(path);
+                    files.push(File {
+                        path,
+                        bytes: entry.size,
+                    });
                 }
             }
         }
-        paths.sort();
-        paths.dedup();
-        Ok(Listing { paths, complete })
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        files.dedup_by(|left, right| left.path == right.path);
+        Ok(Listing { files, complete })
     }
 
     fn body(&self, path: &str) -> Result<String, PlatformError> {
@@ -526,6 +528,41 @@ impl GitHubRepo {
             .expect("files")
             .insert(path.to_string(), response.body.clone());
         Ok(response.body)
+    }
+
+    fn cached_body(&self, path: &str) -> Option<String> {
+        self.files.lock().expect("files").get(path).cloned()
+    }
+
+    /// Size from the cached recursive tree when it carried the whole thing.
+    /// A missing tree, or a truncated one, is not guessed at: the contents
+    /// API answers that path alone.
+    fn size_from_tree(&self, path: &str) -> Option<u64> {
+        self.whole_tree
+            .lock()
+            .expect("whole tree")
+            .as_ref()?
+            .iter()
+            .find(|file| file.path == path)?
+            .bytes
+    }
+
+    fn size_from_contents(&self, path: &str) -> Result<u64, PlatformError> {
+        let commit = self.commit()?;
+        let mut segments = vec![
+            "repos",
+            commit.owner.as_str(),
+            commit.repo.as_str(),
+            "contents",
+        ];
+        segments.extend(path.split('/'));
+        let mut url = self.http.url(&segments)?;
+        url.query_pairs_mut().append_pair("ref", &commit.sha);
+        let response = self
+            .http
+            .send("reading a file size", || self.get(url.clone(), ACCEPT_JSON))?;
+        let payload: GithubContent = self.http.json("reading a file size", &response.body)?;
+        Ok(payload.size)
     }
 
     fn matcher(&self, glob: &str) -> Result<GlobMatcher, PlatformError> {
@@ -579,9 +616,9 @@ impl RepoSource for GitHubRepo {
         let matcher = self.matcher(glob)?;
         if let Some(cached) = self.whole_tree.lock().expect("whole tree").clone() {
             return Ok(Listing {
-                paths: cached
+                files: cached
                     .into_iter()
-                    .filter(|path| matcher.is_match(path))
+                    .filter(|file| matcher.is_match(&file.path))
                     .collect(),
                 complete: true,
             });
@@ -589,23 +626,33 @@ impl RepoSource for GitHubRepo {
         let commit = self.commit()?;
         let tree = self.tree(&commit.sha, true)?;
         if !tree.truncated {
-            let mut all: Vec<String> = tree
+            let mut all: Vec<File> = tree
                 .entries
                 .iter()
                 .filter(|entry| !entry.is_tree)
-                .map(|entry| entry.path.clone())
+                .map(|entry| File {
+                    path: entry.path.clone(),
+                    bytes: entry.size,
+                })
                 .collect();
-            all.sort();
+            all.sort_by(|left, right| left.path.cmp(&right.path));
             *self.whole_tree.lock().expect("whole tree") = Some(all.clone());
             return Ok(Listing {
-                paths: all
+                files: all
                     .into_iter()
-                    .filter(|path| matcher.is_match(path))
+                    .filter(|file| matcher.is_match(&file.path))
                     .collect(),
                 complete: true,
             });
         }
         self.walk(&commit.sha, &literal_prefix(glob), &matcher)
+    }
+
+    fn size(&self, path: &str) -> Result<u64, PlatformError> {
+        if let Some(bytes) = self.size_from_tree(path) {
+            return Ok(bytes);
+        }
+        self.size_from_contents(path)
     }
 
     fn read_file(&self, path: &str, lines: Option<LineRange>) -> Result<String, PlatformError> {
@@ -616,11 +663,26 @@ impl RepoSource for GitHubRepo {
         })
     }
 
+    fn cached_body(&self, path: &str) -> Option<String> {
+        GitHubRepo::cached_body(self, path)
+    }
+
     /// The index covers the default branch, and the change under review is on
     /// another one. So a hit is only a candidate path: the file is read again
     /// at `head_sha` and the match redone there, which is where the line
     /// numbers and the text in the answer come from.
-    fn search(&self, query: &str, glob: Option<&str>) -> Result<Vec<SearchHit>, PlatformError> {
+    fn search(
+        &self,
+        kind: SearchKind,
+        query: &str,
+        glob: Option<&str>,
+    ) -> Result<Vec<SearchHit>, PlatformError> {
+        if kind != SearchKind::Keyword {
+            return Err(PlatformError::Unsupported {
+                host: self.host.clone(),
+                capability: "regular expression search",
+            });
+        }
         let matcher = glob.map(|pattern| self.matcher(pattern)).transpose()?;
         let needle = query.to_lowercase();
         let mut hits = Vec::new();
@@ -722,6 +784,14 @@ struct GithubTreeEntry {
     sha: String,
     #[serde(default, rename = "type")]
     kind: String,
+    #[serde(default)]
+    size: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubContent {
+    #[serde(default)]
+    size: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1068,8 +1138,8 @@ diff --git a/src/parse.c b/src/parse.c
                     "truncated": false,
                     "tree": [
                         {"path": "src", "type": "tree", "sha": "srctree"},
-                        {"path": "src/parse.c", "type": "blob", "sha": "b1"},
-                        {"path": "docs/readme.md", "type": "blob", "sha": "b2"},
+                        {"path": "src/parse.c", "type": "blob", "sha": "b1", "size": 42},
+                        {"path": "docs/readme.md", "type": "blob", "sha": "b2", "size": 17},
                     ]
                 })),
             )
@@ -1077,25 +1147,29 @@ diff --git a/src/parse.c b/src/parse.c
             .mount(&server)
             .await;
 
-        let (sources, docs) = call({
+        let (sources, docs, bytes) = call({
             let uri = server.uri();
             move || {
-                let repo = bound(uri).repo_source();
+                let repo = bound(uri).repo().source();
                 (
                     repo.list_files("src/**/*.c").expect("listed"),
                     repo.list_files("**/*.md").expect("listed"),
+                    repo.size("src/parse.c").expect("sized"),
                 )
             }
         })
         .await;
 
-        assert_eq!(sources.paths, vec!["src/parse.c".to_string()]);
+        assert_eq!(sources.paths().collect::<Vec<_>>(), vec!["src/parse.c"]);
+        assert_eq!(sources.files[0].bytes, Some(42));
         assert!(sources.complete);
-        assert_eq!(docs.paths, vec!["docs/readme.md".to_string()]);
+        assert_eq!(docs.paths().collect::<Vec<_>>(), vec!["docs/readme.md"]);
+        assert_eq!(docs.files[0].bytes, Some(17));
+        assert_eq!(bytes, 42);
         assert_eq!(
             server.received_requests().await.expect("received").len(),
             1,
-            "one tree request answered both globs"
+            "one tree request answered both globs and the size"
         );
     }
 
@@ -1161,12 +1235,12 @@ diff --git a/src/parse.c b/src/parse.c
 
         let listing = call({
             let uri = server.uri();
-            move || bound(uri).repo_source().list_files("src/**/*.c")
+            move || bound(uri).repo().source().list_files("src/**/*.c")
         })
         .await
         .expect("listed");
 
-        assert_eq!(listing.paths, vec!["src/parse.c".to_string()]);
+        assert_eq!(listing.paths().collect::<Vec<_>>(), vec!["src/parse.c"]);
         assert!(
             listing.complete,
             "the walk finished, so the list really is the whole answer"
@@ -1223,7 +1297,7 @@ diff --git a/src/parse.c b/src/parse.c
 
         let listing = call({
             let uri = server.uri();
-            move || bound(uri).repo_source().list_files("**/*.c")
+            move || bound(uri).repo().source().list_files("**/*.c")
         })
         .await
         .expect("listed");
@@ -1286,7 +1360,12 @@ diff --git a/src/parse.c b/src/parse.c
 
         let hits = call({
             let uri = server.uri();
-            move || bound(uri).repo_source().search("parse_token", None)
+            move || {
+                bound(uri)
+                    .repo()
+                    .source()
+                    .search(SearchKind::Keyword, "parse_token", None)
+            }
         })
         .await
         .expect("searched");
@@ -1299,10 +1378,12 @@ diff --git a/src/parse.c b/src/parse.c
 
     #[test]
     fn code_search_is_available_but_is_not_a_regular_expression_search() {
-        let capabilities = github("https://api.github.com".to_string()).capabilities();
-        assert!(capabilities.code_search);
+        let capabilities = github("https://api.github.com".to_string())
+            .repo()
+            .capabilities();
+        assert!(capabilities.contains(Capabilities::KEYWORD_SEARCH));
         assert!(
-            !capabilities.regex_search,
+            !capabilities.contains(Capabilities::REGEX_SEARCH),
             "the index takes keywords, and search_repo's description has to say so"
         );
     }
@@ -1386,5 +1467,116 @@ diff --git a/src/parse.c b/src/parse.c
                 .map(|value| value.to_str().expect("ascii")),
             Some(crate::common::http::USER_AGENT)
         );
+    }
+
+    #[test]
+    fn cached_body_is_none_until_a_file_has_been_read() {
+        let github = github("https://api.github.com".to_string());
+        assert_eq!(github.cached_body("src/parse.c"), None);
+    }
+
+    /// The index is keywords. Asking for a regular expression must not fall
+    /// through into a keyword search, and must not cost a request.
+    #[tokio::test]
+    async fn regex_search_is_unsupported_rather_than_a_silent_keyword_search() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/search/code"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        call({
+            let uri = server.uri();
+            move || {
+                crate::platform::source::contract::regex_search_on_keyword_only_is_an_error(
+                    &*bound(uri).repo().source(),
+                );
+            }
+        })
+        .await;
+
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("received")
+                .is_empty()
+        );
+    }
+
+    /// No tree in hand, or a truncated one, goes to the contents API for
+    /// this path alone and does not cache the body.
+    #[tokio::test]
+    async fn size_without_a_cached_tree_falls_back_to_the_contents_api() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/acme/app/contents/src/parse.c",
+            ))
+            .and(wiremock::matchers::query_param("ref", HEAD))
+            .and(wiremock::matchers::header("Accept", ACCEPT_JSON))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"size": 99, "content": "aW50Cg=="})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (bytes, cached) = call({
+            let uri = server.uri();
+            move || {
+                let github = bound(uri);
+                let bytes = github.repo().source().size("src/parse.c").expect("sized");
+                (bytes, github.cached_body("src/parse.c"))
+            }
+        })
+        .await;
+
+        assert_eq!(bytes, 99);
+        assert_eq!(cached, None, "size must not leave a body in the cache");
+    }
+
+    #[tokio::test]
+    async fn a_search_leaves_the_reread_body_in_the_cache() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/search/code"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "total_count": 1,
+                    "items": [{"path": "src/parse.c"}]
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/repos/acme/app/contents/src/parse.c",
+            ))
+            .and(wiremock::matchers::header("Accept", ACCEPT_RAW))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_string("int parse_token;\n"),
+            )
+            .mount(&server)
+            .await;
+
+        let cached = call({
+            let uri = server.uri();
+            move || {
+                let github = bound(uri);
+                github
+                    .repo()
+                    .source()
+                    .search(SearchKind::Keyword, "parse_token", None)
+                    .expect("searched");
+                github.cached_body("src/parse.c")
+            }
+        })
+        .await;
+
+        assert_eq!(cached.as_deref(), Some("int parse_token;\n"));
     }
 }

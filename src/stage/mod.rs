@@ -24,13 +24,14 @@ use crate::budget::{Budget, BudgetError};
 use crate::common::{Secret, SecretSource};
 use crate::config::{ConfigError, Settings};
 use crate::domain::Stage;
+use crate::platform::Repo;
 use crate::platform::{ChangeRef, Platform, PlatformError};
 use crate::progress::{Event, Outcome, Progress};
 use crate::protocol::{Protocol, ProtocolError, Request, Response};
 use crate::record::{InputIdentity, InputRecord, RecordError, Recorder};
 use crate::security::{PathPolicy, Redactor};
 use crate::tool::{Registry, ToolError};
-use crate::worktree::{Abilities, Checkout, FetchedWorktree, Reach, WorktreeError, WorktreeSource};
+use crate::worktree::{Worktree, WorktreeError};
 
 use input::DiffError;
 use prompt::PromptError;
@@ -73,16 +74,18 @@ pub enum StageError {
     PublishIncomplete { posted: usize, failed: usize },
 }
 
-/// The adapters this run talks to. Built once at startup and handed to every
+/// What a run can reach before it has a directory of its own: the platform
+/// the change comes from, the protocol the model is called over, and the
+/// redactor holding this run's secrets. Built at startup and handed to every
 /// stage, so tests can put fakes in the same slots.
+///
+/// The worktree and the tools are deliberately not here. Neither can exist
+/// this early — the cache lives inside the run directory, and every tool's
+/// description is written from the worktree it will read — so they are built
+/// afterwards, as `Equipment`.
 pub struct Adapters {
     pub platform: Option<Box<dyn Platform>>,
     pub protocol: Box<dyn Protocol>,
-    pub tools: Registry,
-    /// This run's only source of code, and always there: the checkout the
-    /// command line named, or a directory of the run's own. Shared rather
-    /// than owned, because the content tools hold it for the whole run.
-    pub worktree: Arc<dyn WorktreeSource>,
     /// Process redactor with this run's secrets already hidden.
     pub redactor: Redactor,
 }
@@ -111,44 +114,18 @@ impl Adapters {
             None => None,
         };
 
-        // One worktree, whatever the input was. A checkout the command line
-        // named is the whole project on the reviewed commit; without one, the
-        // run opens a directory of its own and fills it from the platform.
-        // The platform is an attribute of that worktree, not a second mode.
-        let worktree: Arc<dyn WorktreeSource> = match &settings.options.worktree {
-            Some(path) => Arc::new(Checkout::open(path.clone())?),
-            None => Arc::new(FetchedWorktree::new(
-                platform.as_ref().map(|platform| platform.repo_source()),
-                platform
-                    .as_ref()
-                    .map(|platform| platform.capabilities())
-                    .unwrap_or_default(),
-            )),
-        };
-
-        warn_about_reach(worktree.reach());
-        let tools = crate::tool::build(
-            settings,
-            PathPolicy::for_settings(settings)?,
-            Arc::clone(&worktree),
-        );
-
         Ok(Self {
-            tools,
             platform,
             protocol,
-            worktree,
             redactor,
         })
     }
 
-    /// Give the run's own worktree its directory, now that the run directory
-    /// exists. A checkout was already open before the tools were registered;
-    /// this is the other shape catching up, and it is why the run id could be
-    /// computed first.
-    pub fn open_worktree(&self, run_dir: &Path) -> Result<(), StageError> {
-        self.worktree.open_in(run_dir)?;
-        Ok(())
+    /// The repository this run reads content from, when there is a platform
+    /// to read it through. A plain diff has none, which is the single source
+    /// of the `Option` the worktree carries.
+    pub fn repo(&self) -> Option<Repo> {
+        self.platform.as_ref().map(|platform| platform.repo())
     }
 
     /// Point the repository reads at the commit under review. The head sha is
@@ -178,6 +155,44 @@ impl Adapters {
     }
 }
 
+/// The other half of the adapters: this run's worktree and the tools built
+/// over it.
+///
+/// Apart from `Adapters` because of when it can be built. The cache a run
+/// fills for itself sits inside the run directory, so it must not be opened
+/// before that directory is locked; and every tool's description, refusal and
+/// availability is written from the worktree, so the tools cannot be built
+/// before it either. Both facts point at the same moment, which is after the
+/// lock and before the first stage.
+pub struct Equipment {
+    /// Shared rather than owned: the content tools and the checkers hold it
+    /// for the whole run.
+    pub worktree: Arc<Worktree>,
+    pub tools: Registry,
+}
+
+impl Equipment {
+    pub fn real(
+        settings: &Settings,
+        adapters: &Adapters,
+        run_dir: &Path,
+    ) -> Result<Self, StageError> {
+        let worktree = Arc::new(Worktree::open(
+            settings.options.worktree.clone(),
+            adapters.repo(),
+            run_dir,
+        )?);
+        warn_about(&worktree);
+        let tools = crate::tool::build(
+            settings,
+            PathPolicy::for_settings(settings)?,
+            Arc::clone(&worktree),
+            run_dir,
+        );
+        Ok(Self { worktree, tools })
+    }
+}
+
 /// The read boundary for this run: `[security]` plus the directories the run
 /// writes to, expressed relative to the worktree when there is one.
 pub fn path_policy(settings: &Settings) -> Result<PathPolicy, StageError> {
@@ -201,17 +216,18 @@ fn hide_platform_token(redactor: &mut Redactor, settings: &Settings, host: &str)
 }
 
 /// Say once, for whoever is watching the run, what this worktree cannot do.
-/// The model is told the same thing by every description it is given; this is
-/// for the person who is about to read a report built on very little.
-fn warn_about_reach(reach: Reach) {
-    let missing = reach.unmet(Abilities::all());
-    if missing.contains(Abilities::CONTENT) {
+/// The same sentences the report will carry, so the terminal and the report
+/// cannot disagree; the model is told the same thing by every description it
+/// is given.
+fn warn_about(worktree: &Worktree) {
+    for went_without in worktree.went_without() {
+        tracing::warn!("this run {went_without}");
+    }
+    if worktree.is_empty() {
         tracing::warn!(
-            "this run has no code to read beyond the diff: pass --worktree to point at a \
-             checkout. Every tool is still offered, and each one says it cannot answer"
+            "pass --worktree to point at a checkout, or review a merge request URL. Every tool \
+             is still offered, and each one says it cannot answer"
         );
-    } else if missing.contains(Abilities::SEARCH) {
-        tracing::warn!("nothing can answer a search this run: search_code will refuse");
     }
 }
 
@@ -220,6 +236,11 @@ fn warn_about_reach(reach: Reach) {
 pub struct StageContext<'a> {
     pub settings: &'a Settings,
     pub adapters: &'a Adapters,
+    /// Where this run reads code from. Beside `adapters` rather than inside
+    /// it, because it is built later: not until the run directory exists.
+    pub worktree: &'a Worktree,
+    /// What the model may call, built over that worktree.
+    pub tools: &'a Registry,
     pub recorder: &'a mut Recorder,
     pub budget: &'a mut Budget,
     pub redactor: &'a Redactor,
@@ -356,8 +377,13 @@ mod tests {
             Ok(String::new())
         }
 
+        fn size(&self, _path: &str) -> Result<u64, PlatformError> {
+            Ok(0)
+        }
+
         fn search(
             &self,
+            _kind: crate::platform::SearchKind,
             _query: &str,
             _glob: Option<&str>,
         ) -> Result<Vec<SearchHit>, PlatformError> {
@@ -369,6 +395,7 @@ mod tests {
 [review]
 max_files_per_listing = 200
 max_hits_per_search = 50
+max_files_per_fetch = 20
 max_file_bytes = 262144
 max_tool_output_bytes = 32768
 
@@ -434,27 +461,24 @@ type = "path"
 
     /// Every case below goes through the real construction path, because what
     /// is being asserted is that it decides nothing: the worktree does.
-    fn registry(settings: &Settings, worktree: Arc<dyn WorktreeSource>) -> Registry {
+    fn registry(settings: &Settings, worktree: Worktree) -> Registry {
         crate::tool::build(
             settings,
             path_policy(settings).expect("valid globs"),
-            worktree,
+            Arc::new(worktree),
+            settings.options.runs_dir.as_path(),
         )
     }
 
-    /// The worktree a run opens for itself, already sitting in a directory.
-    fn fetched(
-        run_dir: &Path,
-        repository: Option<Arc<dyn RepoSource>>,
-        capabilities: Capabilities,
-    ) -> Arc<dyn WorktreeSource> {
-        let worktree = FetchedWorktree::new(repository, capabilities);
-        worktree.open_in(run_dir).expect("opened");
-        Arc::new(worktree)
+    /// The cache a run opens for itself, already sitting in its directory,
+    /// with a repository behind it that answers whatever `capabilities` says.
+    fn cache(run_dir: &Path, capabilities: Capabilities) -> Worktree {
+        let repo = Repo::new(Arc::new(StubRepo) as Arc<dyn RepoSource>, capabilities);
+        Worktree::open(None, Some(repo), run_dir).expect("a cache")
     }
 
-    fn checkout(root: &Path) -> Arc<dyn WorktreeSource> {
-        Arc::new(Checkout::open(root.to_path_buf()).expect("a directory"))
+    fn checkout(root: &Path) -> Worktree {
+        Worktree::open(Some(root.to_path_buf()), None, root).expect("a directory")
     }
 
     /// The whole point of the change: what a run can check is a property of
@@ -475,25 +499,25 @@ type = "path"
             "submit_comment",
             "finish_review",
             "submit_summary",
-            "list_files",
-            "stat_file",
-            "read_file",
-            "search_code",
+            "list_local_files",
+            "suggest_local_read",
+            "read_local_file",
+            "search_local_regex",
+            "list_repo_files",
+            "fetch_repo_file",
+            "search_repo_regex",
+            "search_repo_keyword",
             "typecheck",
             "compile",
         ];
 
         assert_eq!(
-            names(fetched(root.path(), None, Capabilities::default())),
+            names(Worktree::Empty),
             expected,
             "an empty worktree withholds nothing"
         );
         assert_eq!(
-            names(fetched(
-                root.path(),
-                Some(Arc::new(StubRepo) as Arc<dyn RepoSource>),
-                Capabilities::default(),
-            )),
+            names(cache(root.path(), Capabilities::empty())),
             expected,
             "neither does a platform that cannot search"
         );
@@ -507,10 +531,7 @@ type = "path"
     fn an_empty_worktree_answers_every_tool_with_a_reason_about_the_run() {
         let root = tempfile::tempdir().expect("temp dir");
         let settings = settings(root.path(), None);
-        let registry = registry(
-            &settings,
-            fetched(root.path(), None, Capabilities::default()),
-        );
+        let registry = registry(&settings, Worktree::Empty);
 
         assert!(registry.usable_with_purpose(Purpose::Content).is_empty());
         assert!(registry.usable_with_purpose(Purpose::Check).is_empty());
@@ -522,7 +543,13 @@ type = "path"
                 continue;
             }
             let reason = tool.unavailable().expect(name);
-            assert!(reason.contains("not about the repository"), "{name}");
+            assert!(
+                reason.contains("not about the repository")
+                    || reason.contains("not evidence")
+                    || reason.contains("not about the code"),
+                "{name}: {reason}"
+            );
+            assert!(reason.contains("this run"), "{name}: {reason}");
             assert!(
                 tool.description().contains("NOT AVAILABLE THIS RUN"),
                 "{name}: the model has to be able to decide before calling"
@@ -531,7 +558,10 @@ type = "path"
                 .execute(name, &serde_json::json!({}))
                 .expect_err(name);
             assert!(
-                matches!(&refused, ToolError::Unavailable { reason, .. } if reason.contains("not about the repository")),
+                matches!(&refused, ToolError::Unavailable { reason, .. }
+                    if reason.contains("not about the repository")
+                        || reason.contains("not evidence")
+                        || reason.contains("not about the code")),
                 "{name}: {refused}"
             );
         }
@@ -540,30 +570,32 @@ type = "path"
         }
     }
 
-    /// A platform that cannot search still offers `search_code`, and the
-    /// refusal says what an empty result would have meant if it had run: a
-    /// miss here is the run's limit, not proof of absence.
+    /// A platform that cannot search still offers both repository search
+    /// tools, and the refusal says what an empty result would have meant if
+    /// it had run: a miss here is the run's limit, not proof of absence.
     #[test]
     fn a_worktree_that_cannot_search_refuses_the_search_and_answers_the_rest() {
         let root = tempfile::tempdir().expect("temp dir");
         let settings = settings(root.path(), None);
-        let registry = registry(
-            &settings,
-            fetched(
-                root.path(),
-                Some(Arc::new(StubRepo) as Arc<dyn RepoSource>),
-                Capabilities::default(),
-            ),
-        );
+        let registry = registry(&settings, cache(root.path(), Capabilities::empty()));
 
         assert_eq!(
             registry.usable_with_purpose(Purpose::Content),
-            vec!["list_files", "stat_file", "read_file"]
+            vec![
+                "list_local_files",
+                "suggest_local_read",
+                "read_local_file",
+                "search_local_regex",
+                "list_repo_files",
+                "fetch_repo_file",
+            ]
         );
-        let search = registry.get("search_code").expect("still offered");
-        let reason = search.unavailable().expect("nothing can answer one");
-        assert!(reason.contains("not evidence"), "{reason}");
-        assert!(search.description().contains("NOT AVAILABLE THIS RUN"));
+        for name in ["search_repo_regex", "search_repo_keyword"] {
+            let search = registry.get(name).expect("still offered");
+            let reason = search.unavailable().expect("nothing can answer one");
+            assert!(reason.contains("not evidence"), "{reason}");
+            assert!(search.description().contains("NOT AVAILABLE THIS RUN"));
+        }
     }
 
     /// "Needs a whole checkout" is a fact about the worktree, not about which
@@ -575,20 +607,13 @@ type = "path"
         let root = tempfile::tempdir().expect("temp dir");
 
         let without = settings(root.path(), None);
-        let fetched_only = registry(
-            &without,
-            fetched(
-                root.path(),
-                Some(Arc::new(StubRepo) as Arc<dyn RepoSource>),
-                Capabilities::default(),
-            ),
-        );
+        let cache_only = registry(&without, cache(root.path(), Capabilities::empty()));
         assert_eq!(
-            fetched_only.usable_with_purpose(Purpose::Check),
+            cache_only.usable_with_purpose(Purpose::Check),
             vec!["typecheck"],
             "the single-file checker answers; the compiling one cannot"
         );
-        let compile = fetched_only.get("compile").expect("offered all the same");
+        let compile = cache_only.get("compile").expect("offered all the same");
         assert!(
             compile
                 .unavailable()
@@ -610,6 +635,42 @@ type = "path"
                     && !tool.description().contains("NOT AVAILABLE")),
             "adding a checker is a [[tool]] entry and nothing else"
         );
+    }
+
+    /// `tool list` goes through `build` on the widest shape — a Local
+    /// worktree holding a repository that can answer both search engines —
+    /// so every content tool and a `requires_checkout` checker print as
+    /// available. That is how the catalog stays what a review really registers.
+    #[test]
+    fn the_catalog_prints_the_widest_shape_as_available() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let settings = settings(root.path(), Some(root.path().to_path_buf()));
+        let listing = crate::tool::inventory(&settings).expect("catalog");
+        for name in [
+            "list_local_files",
+            "suggest_local_read",
+            "read_local_file",
+            "search_local_regex",
+            "list_repo_files",
+            "fetch_repo_file",
+            "search_repo_regex",
+            "search_repo_keyword",
+            "compile",
+        ] {
+            let row = listing
+                .iter()
+                .find(|row| row.name == name)
+                .unwrap_or_else(|| panic!("{name} missing from the catalog"));
+            assert!(
+                !row.description.contains("NOT AVAILABLE THIS RUN"),
+                "{name}: {}",
+                row.description
+            );
+            assert!(
+                !row.preconditions.is_empty(),
+                "{name} still names the condition a narrower run would miss"
+            );
+        }
     }
 
     /// The reserved list is a security boundary: a `[[tool]]` entry carrying

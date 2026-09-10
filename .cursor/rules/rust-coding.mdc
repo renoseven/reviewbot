@@ -27,9 +27,9 @@ alwaysApply: false
 
 - `domain` 是共享词汇，不含逻辑。现在是 `ChangeSet` / `Comment` / `Confidence`；新类型先证明没有主人再放进去，不要为了「看起来像数据」往里堆
 - `Request` / `Response` → `protocol`；`Trace` → `record`；`RunResult` → `lib.rs`
-- 一次 run 只有一个 worktree：它一定存在，且是一个本地目录。命令行给的检出就是它；没给就在这次 run 目录下开一份。平台 API 是它的可选属性（缺文件时取回并落盘），不是第二种模式，也不再有 scratch
-- `tool` 认这一个来源，不按来源分成两套具名工具。同层仍然只许这一条依赖
-- 命令行给的检出只读，没有写方法可走；取文件落盘只发生在这次 run 自己的目录里
+- 一次 run 只有一个 `Worktree`，是 enum 不是 trait（worktree 不是扩展点）：`Empty` 是纯 diff 且没有平台，连目录都没有，因为没有人会去读；`Local` 是命令行给的检出，评审 commit 上的整棵树，只读，有平台时仍带着 `Repo`；`Cache` 是这次 run 自己的目录，在 `<run_dir>/cache`，一定有后备库。同层仍然只许 `worktree` 认 `platform` 这一条依赖
+- `tool` 认这一个 `Worktree`，但按动作拆成本地与仓库两半，每个动作只出现一次。两半不是同一问的两个名字：列仓库与列本地问的不是同一件事。仓库那半没有「读」（先 `fetch_repo_file` 再 `read_local_file`），本地那半没有「拉」
+- 写盘要 root 与 repo 这一对，只有 `Cache` 同时握着；模块里唯一的 `fs::write` 落在 match 到 `Cache { root, repo }` 的那一臂。`Local` 与 `Empty` 凑不出这一对，所以往命令行给的检出里写在实现里没有地方发生
 - 核心禁止 `match tool_name`；走 registry 取 trait 对象。厂商 JSON 停在 `protocol`，不外泄
 
 ## 实体对象化
@@ -78,7 +78,7 @@ impl Merge {
 - **全程串行**：阶段与分片都不并发（并发会让调用前预算检查失效）
 - prompt 用 `include_str!` 随二进制走，配置不得有改 prompt 的字段
 - 密钥只在内存；不写 checkpoint / trace / 指纹 / 日志；子进程环境剔除 `*_API_KEY` / `*_TOKEN`
-- 本地只写 run 目录和 `--out-dir`；命令行给的检出只读。外部命令 argv 是数组，直接 `execve`，一个占位符一个元素，不经 shell
+- 本地只写 run 目录（含它底下的 `cache/` 与 `checks/`）和 `--out-dir`；命令行给的检出只读。检查器的 cwd 是 `<run_dir>/checks`，不是 worktree 根。外部命令 argv 是数组，直接 `execve`，一个占位符一个元素，不经 shell
 - **安全靠实现保证，不靠类型强制**：`security` 只提供检查函数；每个内建 tool 在调用来源之前先过路径校验，拒绝理由回传模型
 - 瞬时故障才重试（超时 / 5xx / 429 / 空 body）；401/403/400/越界/预算不足首次即失败
 - checkpoint 原子写 JSON（tmp + rename）；损坏回退上一份完整快照，禁止 catch 之后整次重跑

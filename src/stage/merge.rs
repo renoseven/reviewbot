@@ -12,7 +12,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{ChangeSet, Comment, CommentTarget, Confidence, FileChange, Severity, Stage};
-use crate::protocol::{InputItem, Request, Role, ToolSchema};
+use crate::protocol::{InputItem, Request, Role};
 use crate::record::{ToolCall, Trace};
 use crate::tool::{Round, SubmitSummary, whole_score};
 
@@ -689,7 +689,7 @@ impl Merge {
             // From the registry, on the scoring round: this stage does not
             // write out a schema of its own, and the round is what keeps
             // `submit_comment` and the content tools off this turn.
-            tools: scoring_tools(context),
+            tools: context.tools.request_schemas(Round::Scoring),
             max_output_tokens: selection.model.max_output_tokens,
             reasoning_effort: selection.model.reasoning_effort.clone(),
         };
@@ -916,23 +916,6 @@ fn score_of(field: &str, value: Option<&serde_json::Value>) -> Result<u8, String
     };
     whole_score(Some(value))
         .ok_or_else(|| format!("{field} {value} is not an integer between 0 and 100"))
-}
-
-/// What the scoring round offers, straight from the registry: one tool, the
-/// one that takes a verdict. A round shows what it accepts and nothing else,
-/// so this list is also the whole of what this call will be answered with.
-fn scoring_tools(context: &StageContext<'_>) -> Vec<ToolSchema> {
-    context
-        .adapters
-        .tools
-        .schemas_for(Round::Scoring)
-        .into_iter()
-        .map(|schema| ToolSchema {
-            name: schema.name,
-            description: schema.description,
-            parameters: schema.parameters,
-        })
-        .collect()
 }
 
 /// Step 1. Not a model reply: `review` builds this document out of the

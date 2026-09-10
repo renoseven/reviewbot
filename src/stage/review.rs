@@ -23,11 +23,11 @@ use crate::budget::estimate_tokens;
 use crate::common::truncate;
 use crate::domain::{Narrative, Stage};
 use crate::progress::Event;
-use crate::protocol::{InputItem, Request, Role, ToolSchema};
+use crate::protocol::{InputItem, Request, Role};
 use crate::record::{ContextFile, ToolCall, Trace};
 use crate::security::Redactor;
 use crate::tool::{Purpose, Registry, Round, SubmitComment, ToolError};
-use crate::worktree::{Abilities, Content, Reach};
+use crate::worktree::Worktree;
 
 use super::orient::Orientation;
 use super::prompt::{CappedList, Fence, Keep, Overflow, Prompts, code_ref};
@@ -186,7 +186,12 @@ impl Review {
                 // Written down before the first chunk, because it is true of
                 // the whole run and has to survive as far as the report
                 // whatever the chunks turn out to do.
-                unavailable: went_without(context.adapters.worktree.reach()),
+                unavailable: context
+                    .worktree
+                    .went_without()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
                 ..ReviewOutput::default()
             },
         };
@@ -281,21 +286,18 @@ impl Review {
         let context_window_tokens = selection.model.context_window_tokens;
         let max_rounds = window.rounds();
         let round_bytes = window.round_bytes() as usize;
-        let schemas = tool_schemas(&context.adapters.tools);
-        let concluding_schemas = concluding_tool_schemas(&context.adapters.tools);
+        let schemas = context.tools.request_schemas(Round::Investigation);
+        let concluding_schemas = context.tools.request_schemas(Round::Conclusion);
 
         // A checker opens the file itself, so the file under review has to be
         // in the worktree before the first round — the prompt asks for
         // checkers first, and a checker that cannot find the file is read as
-        // "this file does not exist". Free on a checkout, one fetch on a
-        // worktree the run fills itself, and skipped when no checker of this
-        // run can answer anyway.
-        if !context
-            .adapters
-            .tools
-            .usable_with_purpose(Purpose::Check)
-            .is_empty()
-            && let Err(error) = context.adapters.worktree.supply(path)
+        // "this file does not exist". Free on a checkout, one fetch into a
+        // cache, and skipped when no checker of this run can answer anyway.
+        if !context.tools.usable_with_purpose(Purpose::Check).is_empty()
+            && let Err(error) = context
+                .worktree
+                .fetch(path, context.settings.config.review.max_file_bytes)
         {
             tracing::warn!(
                 path,
@@ -495,7 +497,7 @@ impl Review {
             }
         };
 
-        let unused = chat.note_unused_checkers(path, &context.adapters.tools);
+        let unused = chat.note_unused_checkers(path, context.tools);
         context.recorder.write_trace(&chat.trace)?;
         let handoff = match chunk.piece + 1 < chunk.pieces {
             true => Some(chat.handoff(path, carried)),
@@ -546,13 +548,7 @@ impl Review {
             // the registry and the redactor and nothing else. The moment is
             // the same one: the call is about to run.
             context.progress.emit(Event::Tool { name: name.clone() });
-            let call = execute_call(
-                &context.adapters.tools,
-                context.redactor,
-                name,
-                arguments,
-                path,
-            );
+            let call = execute_call(context.tools, context.redactor, name, arguments, path);
             context.progress.emit(Event::ToolDone {
                 name: name.clone(),
                 ms: call.duration_ms,
@@ -841,25 +837,6 @@ fn fit_into_round(text: String, room: &mut usize) -> String {
 
 /// What goes into `Request.tools`, from the same registry the capability
 /// paragraph is written from, so the two lists cannot drift apart.
-fn tool_schemas(tools: &Registry) -> Vec<ToolSchema> {
-    map_schemas(tools.schemas_for(Round::Investigation))
-}
-
-fn concluding_tool_schemas(tools: &Registry) -> Vec<ToolSchema> {
-    map_schemas(tools.schemas_for(Round::Conclusion))
-}
-
-fn map_schemas(schemas: Vec<crate::tool::ToolSchema>) -> Vec<ToolSchema> {
-    schemas
-        .into_iter()
-        .map(|schema| ToolSchema {
-            name: schema.name,
-            description: schema.description,
-            parameters: schema.parameters,
-        })
-        .collect()
-}
-
 fn comments_json(submissions: &[serde_json::Value]) -> String {
     serde_json::json!({ "comments": submissions }).to_string()
 }
@@ -1007,13 +984,13 @@ fn split_preface(
 /// rest.
 pub(crate) fn assemble_instructions(
     tools: &Registry,
-    reach: Reach,
+    worktree: &Worktree,
     redactor: &Redactor,
     orientation: &Orientation,
 ) -> Result<String, StageError> {
     let assembled = Prompts::REVIEW
         .fill()
-        .set("capabilities", capability_paragraph(tools, reach)?)
+        .set("capabilities", capability_paragraph(tools, worktree)?)
         // Either of these can be missing rather than empty, and the template
         // takes the whole section away with the value: a heading with nothing
         // under it would say this change touched one file, or that the
@@ -1034,7 +1011,8 @@ pub(crate) fn assemble_instructions(
 /// `instructions`: what this number is for is the per-chunk overhead, and
 /// which slot it travels in does not change what it costs.
 pub(crate) fn prompt_tokens(instructions: &str, narrative: Option<&str>, tools: &Registry) -> u32 {
-    let schemas = serde_json::to_string(&tool_schemas(tools)).unwrap_or_default();
+    let schemas =
+        serde_json::to_string(&tools.request_schemas(Round::Investigation)).unwrap_or_default();
     estimate_tokens(instructions)
         .saturating_add(estimate_tokens(&schemas))
         .saturating_add(narrative.map(estimate_tokens).unwrap_or(0))
@@ -1045,7 +1023,7 @@ pub(crate) fn prompt_tokens(instructions: &str, narrative: Option<&str>, tools: 
 /// the list no longer varies: every tool is offered on every run, and what
 /// varies is the worktree behind them, which says so itself in the paragraph
 /// under the list and again in each description.
-fn capability_paragraph(tools: &Registry, reach: Reach) -> Result<String, StageError> {
+fn capability_paragraph(tools: &Registry, worktree: &Worktree) -> Result<String, StageError> {
     let mut investigation = Vec::new();
     let mut delivery = Vec::new();
     for schema in tools.schemas_for(Round::Investigation) {
@@ -1059,29 +1037,8 @@ fn capability_paragraph(tools: &Registry, reach: Reach) -> Result<String, StageE
         .fill()
         .set("investigation", bullets(investigation))
         .set("delivery", bullets(delivery))
-        .set("worktree", worktree_paragraph(reach)?)
+        .set("worktree", Prompts::worktree(worktree)?)
         .render()?)
-}
-
-/// What this run's worktree could not do, in the report's words. Empty when it
-/// could do everything, which is the common case and prints nothing.
-fn went_without(reach: Reach) -> Vec<String> {
-    crate::tool::availability::worth_reporting(reach.unmet(Abilities::all()))
-        .into_iter()
-        .map(|ability| crate::tool::availability::went_without(ability).to_string())
-        .collect()
-}
-
-/// What this run's worktree is, in the words the model reads. One template per
-/// shape rather than one with a condition in it: a run that can read nothing
-/// needs a different paragraph, not an emptier one.
-fn worktree_paragraph(reach: Reach) -> Result<String, StageError> {
-    let template = match reach.content {
-        Content::Checkout => Prompts::WORKTREE_CHECKOUT,
-        Content::Fetched => Prompts::WORKTREE_FETCHED,
-        Content::Empty => Prompts::WORKTREE_EMPTY,
-    };
-    Ok(template.text()?)
 }
 
 fn bullets(lines: Vec<String>) -> String {
@@ -1146,7 +1103,6 @@ mod tests {
     use crate::stage::fixture::{Reply, StageFixture};
     use crate::stage::triage::Chunk;
     use crate::tool::{Purpose, Round, Signature, SubmitComment, Tool, ToolError, ToolOutput};
-    use crate::worktree::WorktreeSource;
 
     /// The two deliveries a review round always has: file a finding, or say
     /// there is none. A real run registers both, so a test about the loop has
@@ -1333,8 +1289,13 @@ mod tests {
             Ok("int main(void)\n{\n}\n".to_string())
         }
 
+        fn size(&self, _path: &str) -> Result<u64, crate::platform::PlatformError> {
+            Ok(0)
+        }
+
         fn search(
             &self,
+            _kind: crate::platform::SearchKind,
             _query: &str,
             _glob: Option<&str>,
         ) -> Result<Vec<crate::platform::SearchHit>, crate::platform::PlatformError> {
@@ -1343,31 +1304,40 @@ mod tests {
     }
 
     /// The widest worktree there is, which is what a test that is not about
-    /// the worktree should not have to name.
-    const CHECKOUT: Reach = Reach {
-        content: crate::worktree::Content::Checkout,
-        search: crate::worktree::Search::Regex,
-    };
+    /// the worktree should not have to name. Nothing here reads it: only the
+    /// paragraph written from its shape is under test.
+    fn checkout() -> Worktree {
+        Worktree::Local {
+            root: std::path::PathBuf::from("/"),
+            repo: None,
+        }
+    }
 
-    /// A plain diff with no platform behind it.
-    const NOTHING: Reach = Reach {
-        content: crate::worktree::Content::Empty,
-        search: crate::worktree::Search::Unavailable,
-    };
+    /// A cache worktree: the paragraph, not the files, is what the prompt
+    /// tests read.
+    fn cache() -> Worktree {
+        Worktree::Cache {
+            root: std::path::PathBuf::from("/"),
+            repo: crate::platform::Repo::new(
+                Arc::new(OneFile) as Arc<dyn crate::platform::RepoSource>,
+                crate::platform::Capabilities::empty(),
+            ),
+        }
+    }
 
     /// The review body as shipped, which is what the loop is handed when a
     /// test is not about assembly.
     fn assembled(tools: &Registry, redactor: &Redactor, orientation: &Orientation) -> String {
-        assembled_over(tools, CHECKOUT, redactor, orientation)
+        assembled_over(tools, &checkout(), redactor, orientation)
     }
 
     fn assembled_over(
         tools: &Registry,
-        reach: Reach,
+        worktree: &Worktree,
         redactor: &Redactor,
         orientation: &Orientation,
     ) -> String {
-        assemble_instructions(tools, reach, redactor, orientation).expect("the prompt fills")
+        assemble_instructions(tools, worktree, redactor, orientation).expect("the prompt fills")
     }
 
     fn instructions() -> String {
@@ -1814,10 +1784,6 @@ mod tests {
     /// first round, and the checker finds it there.
     #[test]
     fn the_file_under_review_is_in_the_worktree_before_a_checker_is_offered() {
-        let worktree = Arc::new(crate::worktree::FetchedWorktree::new(
-            Some(Arc::new(OneFile) as Arc<dyn crate::platform::RepoSource>),
-            crate::platform::Capabilities::default(),
-        ));
         let fixture = StageFixture::scripted(
             vec![
                 Reply::calls(&[("cppcheck", r#"{"path":"src/parse.c"}"#)]),
@@ -1825,10 +1791,17 @@ mod tests {
             ],
             Limit::Amount(10.0),
         )
-        .with_worktree(Arc::clone(&worktree) as Arc<dyn WorktreeSource>);
+        .with_cache(crate::platform::Repo::new(
+            Arc::new(OneFile) as Arc<dyn crate::platform::RepoSource>,
+            crate::platform::Capabilities::all(),
+        ));
         let mut tools = Registry::new();
         tools.register(Box::new(OnDisk {
-            root: worktree.root().to_path_buf(),
+            root: fixture
+                .worktree()
+                .root()
+                .expect("a cache has a root")
+                .to_path_buf(),
         }));
         let mut fixture = fixture.with_tools(with_submit(tools));
 
@@ -2455,10 +2428,24 @@ mod tests {
         let redactor = Redactor::new();
         let orientation = Orientation::none();
 
-        let checkout = assembled_over(&Registry::new(), CHECKOUT, &redactor, &orientation);
+        let checkout = assembled_over(&Registry::new(), &checkout(), &redactor, &orientation);
         assert!(checkout.contains("the checkout under review"), "{checkout}");
+        assert!(
+            checkout.contains("Look locally first")
+                && checkout.contains("fetch it from the repository")
+                && checkout.contains("several paths at once"),
+            "the working order has to be in the body, not inferred from names: {checkout}"
+        );
 
-        let nothing = assembled_over(&Registry::new(), NOTHING, &redactor, &orientation);
+        let cached = assembled_over(&Registry::new(), &cache(), &redactor, &orientation);
+        assert!(cached.contains("directory of this run's own"), "{cached}");
+        assert!(
+            cached.contains("A local search covers only what is on disk right now")
+                && cached.contains("a miss there is not evidence"),
+            "a cache miss is not absence: {cached}"
+        );
+
+        let nothing = assembled_over(&Registry::new(), &Worktree::Empty, &redactor, &orientation);
         assert!(
             nothing.contains("empty and has nothing behind it"),
             "{nothing}"
@@ -2518,6 +2505,12 @@ mod tests {
                 "the prompt body names {name}; abilities come from the registry"
             );
         }
+        for name in ["list_files", "stat_file", "read_file", "search_code"] {
+            assert!(
+                !Prompts::REVIEW.body_for_tests().contains(name),
+                "the prompt body still names the retired tool {name}"
+            );
+        }
 
         let mut tools = Registry::new();
         tools.register(Box::new(SubmitComment::new()));
@@ -2532,7 +2525,12 @@ mod tests {
         // And nothing that is not there. `listed_tool` stands in for the whole
         // content group here: with only it registered, no other name may
         // appear.
-        for absent in ["list_files", "read_file", "stat_file", "search_code"] {
+        for absent in [
+            "list_local_files",
+            "read_local_file",
+            "suggest_local_read",
+            "search_local_regex",
+        ] {
             assert!(
                 !assembled.contains(absent),
                 "{absent} is not registered this run: {assembled}"

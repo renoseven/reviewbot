@@ -24,7 +24,7 @@ alwaysApply: false
 
 - crate 同时产出 `lib` 与 `bin`。业务逻辑一律测 `lib`；只有输出流、退出码、落盘位置才起二进制
 - 测试必须离线。适配器换成假实现，`review()` 就能整套跑完
-- 契约档：假 `RepoSource` / `WorktreeSource` / `protocol` / `tool` 与真实现共用同一组用例
+- 契约档：假 `RepoSource` / `protocol` / `tool` 与真实现共用同一组用例。`Worktree` 不是扩展点，假的不落在它身上——契约用例盖一个真 `Worktree` 在临时目录上，仓库那一半才换假 `RepoSource`
 - 新增行为先归到某一档，再写代码——写不出单独可跑的测试就说明分层错了
 
 ```rust

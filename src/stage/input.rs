@@ -8,12 +8,14 @@
 //! by file name.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{ChangeSet, DEV_NULL, FileChange, Hunk, Locator, Narrative, Stage};
 use crate::platform::ChangeRef;
 use crate::record::{InputIdentity, InputKind, InputRecord};
+use crate::worktree::{Worktree, WorktreeError};
 
 use super::{Adapters, StageContext, StageError};
 
@@ -43,8 +45,14 @@ pub struct Input;
 
 impl Input {
     /// What this run is, resolved before the run directory exists because
-    /// `run_id` is built from it.
-    pub fn identify(adapters: &Adapters, source: &Source) -> Result<InputRecord, StageError> {
+    /// `run_id` is built from it — and so before there is a worktree. The
+    /// checkout is therefore read by path: `checkout` is `--worktree`, and
+    /// `Worktree::head_at` needs no instance.
+    pub fn identify(
+        adapters: &Adapters,
+        source: &Source,
+        checkout: Option<&Path>,
+    ) -> Result<InputRecord, StageError> {
         match source {
             Source::Url(url) => {
                 let change = ChangeRef::parse(url)?;
@@ -62,6 +70,18 @@ impl Input {
                     "resolved change from URL"
                 );
                 let head_sha = platform.head_sha(&change)?;
+                // A checkout parked on another commit would make every line
+                // number wrong, so it is refused here — before the run
+                // directory exists, let alone anything being read out of it.
+                if let Some(root) = checkout {
+                    let actual = Worktree::head_at(root)?;
+                    if actual != head_sha {
+                        return Err(StageError::Worktree(WorktreeError::HeadMismatch {
+                            actual,
+                            expected: head_sha,
+                        }));
+                    }
+                }
                 Ok(InputRecord {
                     kind: InputKind::Url,
                     source: url.clone(),
@@ -74,10 +94,13 @@ impl Input {
                 })
             }
             Source::Diff { origin, content } => {
-                // A worktree the run opened for itself stands on no commit of
-                // its own, and that is recorded as an empty sha rather than
+                // A cache the run fills for itself stands on no commit of its
+                // own, and that is recorded as an empty sha rather than
                 // invented: the run id is built out of this.
-                let head_sha = adapters.worktree.head_sha()?.unwrap_or_default();
+                let head_sha = match checkout {
+                    Some(root) => Worktree::head_at(root)?,
+                    None => String::new(),
+                };
                 Ok(InputRecord {
                     kind: InputKind::Diff,
                     source: origin.clone(),
@@ -88,6 +111,9 @@ impl Input {
         }
     }
 
+    /// The change set itself. Nothing here reads the worktree: a change is
+    /// whatever the platform's diff or the diff file says it is, and the
+    /// commit a checkout stands on was settled by `identify`.
     pub fn run(context: &mut StageContext<'_>, source: &Source) -> Result<ChangeSet, StageError> {
         let changeset = match source {
             Source::Url(url) => Self::from_platform(context, url)?,
@@ -113,21 +139,6 @@ impl Input {
                 })?;
         let fetched = platform.fetch_change(&change)?;
 
-        // A checkout standing on a different commit would make every line
-        // number wrong, so it is refused before anything is read. A worktree
-        // the run filled itself has no commit of its own to disagree with:
-        // every file in it was fetched at this very sha.
-        if let Some(actual) = context.adapters.worktree.head_sha()?
-            && actual != fetched.head_sha
-        {
-            return Err(StageError::Worktree(
-                crate::worktree::WorktreeError::HeadMismatch {
-                    actual,
-                    expected: fetched.head_sha.clone(),
-                },
-            ));
-        }
-
         // The platform's diff endpoint returns the same unified diff a local
         // file holds, so it goes through the same parser.
         Ok(ChangeSet {
@@ -145,7 +156,12 @@ impl Input {
     }
 
     fn from_diff(context: &mut StageContext<'_>, content: &str) -> Result<ChangeSet, StageError> {
-        let head_sha = context.adapters.worktree.head_sha()?;
+        // The commit the checkout stood on, as `identify` read it before this
+        // run had a directory. Read back rather than read again: the run is
+        // named after that sha, so a second reading could only disagree with
+        // the one already on disk. Empty means there was no checkout.
+        let head_sha = Some(context.recorder.meta().input.head_sha.clone())
+            .filter(|head_sha| !head_sha.is_empty());
         Ok(ChangeSet {
             locator: Locator {
                 head_sha,

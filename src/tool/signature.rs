@@ -291,6 +291,16 @@ impl Arguments {
         self.values.get(name).and_then(Value::as_u64)
     }
 
+    /// Every string in a list argument, in the order the model wrote them.
+    /// Empty when the argument was omitted.
+    pub fn texts(&self, name: &str) -> Vec<&str> {
+        self.values
+            .get(name)
+            .and_then(Value::as_array)
+            .map(|items| items.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default()
+    }
+
     pub fn get(&self, name: &str) -> Option<&Value> {
         self.values.get(name)
     }

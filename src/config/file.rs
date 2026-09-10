@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Logging controls diagnostics, not what the review concludes.
-    // `Config` is serialized only for the run fingerprint. Keep this
-    // operational setting out so changing it still re-enters the same run.
+    // Named in no fingerprint slice (`config::fingerprint`), so asking for
+    // debug logging re-enters the same run with every checkpoint intact.
+    // Skipped on the wire as well, so no serialized `Config` carries it.
     #[serde(default, skip_serializing)]
     pub log: LogSettings,
     #[serde(default)]
@@ -89,6 +90,10 @@ pub struct ReviewSettings {
     /// How many hits one search may show.
     #[serde(default)]
     pub max_hits_per_search: u32,
+    /// How many paths one `fetch_repo_file` call may pull. A longer list is
+    /// refused as a whole, before any request is issued.
+    #[serde(default)]
+    pub max_files_per_fetch: u32,
     /// The most of one file a read-a-file tool may fetch. It bounds the
     /// fetch rather than the answer: the platform API has no range request,
     /// so reading part of a file means downloading all of it, and a file
@@ -113,6 +118,7 @@ impl ReviewSettings {
         Self {
             max_files_per_listing: 200,
             max_hits_per_search: 50,
+            max_files_per_fetch: 20,
             max_file_bytes: 262_144,
             max_tool_output_bytes: 32_768,
         }

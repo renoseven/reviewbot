@@ -62,8 +62,9 @@ skip_generated = true                   # true | false. Default true.
 # How much a review-stage tool may return.
 # Listings, searches, file reads, and one tool answer.
 [review]
-max_files_per_listing = 200   # paths one list_files call may return
-max_hits_per_search = 50      # hits one search_code call may return
+max_files_per_listing = 200   # paths one listing call may return
+max_hits_per_search = 50      # hits one search call may return
+max_files_per_fetch = 20      # paths one fetch_repo_file call may pull
 max_file_bytes = 262144       # most of one file a read may fetch
                               # a read takes the whole file; a larger file is refused
 max_tool_output_bytes = 32768 # most one tool answer may hand back

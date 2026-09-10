@@ -222,16 +222,19 @@ fn digest(paths: Vec<String>, complete: bool, policy: &PathPolicy) -> String {
     lines.join("\n")
 }
 
-/// Straight through this run's worktree, which is the same listing the
-/// model's own first `list_files` would have paid for — a checkout scans the
-/// disk, a fetched worktree asks the platform about the reviewed commit. An
-/// empty worktree has no shape to describe.
+/// Straight through this run's worktree, and which half of it depends on the
+/// shape rather than on a preference for the repository: a checkout is the
+/// whole tree already and free to walk, while a cache holds the handful of
+/// files fetched so far and listing that would describe the project as "the
+/// four files I happen to have". An empty worktree has no shape to describe.
 fn tree(context: &StageContext<'_>) -> Result<Option<(Vec<String>, bool)>, StageError> {
-    if !context.adapters.worktree.reach().has_content() {
+    let Some(listing) = context.worktree.list_project()? else {
         return Ok(None);
-    }
-    let listing = context.adapters.worktree.list_files("**")?;
-    Ok(Some((listing.paths, listing.complete)))
+    };
+    Ok(Some((
+        listing.paths().map(str::to_string).collect(),
+        listing.complete,
+    )))
 }
 
 /// `src/net/http.c` at two levels is `src/` and `src/net/`. The file's own

@@ -12,10 +12,10 @@ use crate::config::{PlatformEntry, PlatformKind};
 use crate::domain::{DEV_NULL, Narrative};
 
 use super::http::HttpClient;
-use super::source::{LineRange, Listing, RepoSource, SearchHit};
+use super::source::{File, LineRange, Listing, RepoSource, SearchHit, SearchKind};
 use super::{
-    Capabilities, ChangeRef, DiffRefs, ExistingComment, OutgoingComment, Platform, PlatformChange,
-    PlatformError,
+    ChangeRef, DiffRefs, ExistingComment, OutgoingComment, Platform, PlatformChange, PlatformError,
+    Repo,
 };
 
 /// Keyset pages of the recursive tree. Big enough that an ordinary repository
@@ -271,14 +271,15 @@ impl Platform for GitLab {
         self.entry.host().unwrap_or("gitlab.com")
     }
 
-    /// Blob search exists only with Advanced Search or Exact Code Search, and
-    /// neither the host nor the `base_url` says which. Guessing would hand the
-    /// model a search that silently returns nothing, so it stays off.
-    fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            code_search: false,
-            regex_search: false,
-        }
+    fn repo(&self) -> Repo {
+        Repo::new(
+            Arc::clone(&self.repo) as Arc<dyn RepoSource>,
+            super::Capabilities::empty(),
+        )
+    }
+
+    fn cached_body(&self, _path: &str) -> Option<String> {
+        None
     }
 
     fn head_sha(&self, change: &ChangeRef) -> Result<String, PlatformError> {
@@ -364,10 +365,6 @@ impl Platform for GitLab {
 
     fn bind_repo(&self, change: &ChangeRef, head_sha: &str) {
         self.repo.bind(&change.project, head_sha);
-    }
-
-    fn repo_source(&self) -> Arc<dyn RepoSource> {
-        Arc::clone(&self.repo) as Arc<dyn RepoSource>
     }
 }
 
@@ -471,6 +468,37 @@ impl GitLabRepo {
             .insert(path.to_string(), response.body.clone());
         Ok(response.body)
     }
+
+    fn file_size(&self, path: &str) -> Result<u64, PlatformError> {
+        let commit = self.commit()?;
+        let mut url = self
+            .http
+            .url(&["projects", &commit.project, "repository", "files", path])?;
+        url.query_pairs_mut().append_pair("ref", &commit.sha);
+        let response = self.http.send("reading a file size", || {
+            self.http
+                .head(url.clone())
+                .header("PRIVATE-TOKEN", self.token.expose())
+        })?;
+        let raw = response
+            .headers
+            .get("x-gitlab-size")
+            .ok_or_else(|| PlatformError::Request {
+                operation: "reading a file size",
+                host: self.host.clone(),
+                reason: "the response did not carry X-Gitlab-Size".to_string(),
+            })?;
+        let text = raw.to_str().map_err(|error| PlatformError::Request {
+            operation: "reading a file size",
+            host: self.host.clone(),
+            reason: error.to_string(),
+        })?;
+        text.parse().map_err(|error| PlatformError::Request {
+            operation: "reading a file size",
+            host: self.host.clone(),
+            reason: format!("X-Gitlab-Size is not a number: {error}"),
+        })
+    }
 }
 
 impl RepoSource for GitLabRepo {
@@ -484,15 +512,20 @@ impl RepoSource for GitLabRepo {
                 reason: format!("invalid glob {glob:?}: {error}"),
             })?
             .compile_matcher();
-        let paths = self
+        let files = self
             .tree()?
             .into_iter()
             .filter(|path| matcher.is_match(path))
+            .map(File::new)
             .collect();
         Ok(Listing {
-            paths,
+            files,
             complete: true,
         })
+    }
+
+    fn size(&self, path: &str) -> Result<u64, PlatformError> {
+        self.file_size(path)
     }
 
     fn read_file(&self, path: &str, lines: Option<LineRange>) -> Result<String, PlatformError> {
@@ -505,9 +538,15 @@ impl RepoSource for GitLabRepo {
 
     /// Blob search exists only with Advanced Search or Exact Code Search, and
     /// nothing in the config says whether this instance has it. `capabilities`
-    /// therefore reports no code search, so `search_code` refuses before
-    /// reaching the worktree and this is never called.
-    fn search(&self, _query: &str, _glob: Option<&str>) -> Result<Vec<SearchHit>, PlatformError> {
+    /// therefore reports no code search, so `search_repo_regex` and
+    /// `search_repo_keyword` refuse before reaching the worktree and this is
+    /// never called.
+    fn search(
+        &self,
+        _kind: SearchKind,
+        _query: &str,
+        _glob: Option<&str>,
+    ) -> Result<Vec<SearchHit>, PlatformError> {
         Err(PlatformError::Unsupported {
             host: self.host.clone(),
             capability: "code search",
@@ -1151,7 +1190,7 @@ mod tests {
             move || {
                 let gitlab = gitlab(uri);
                 gitlab.bind_repo(&change, "head222222222222222222222222222222222222");
-                let repo = gitlab.repo_source();
+                let repo = gitlab.repo().source();
                 (
                     repo.list_files("src/**/*.c").expect("listed"),
                     repo.list_files("**/*.md").expect("listed"),
@@ -1160,12 +1199,16 @@ mod tests {
         })
         .await;
 
-        assert_eq!(sources.paths, vec!["src/parse.c".to_string()]);
+        assert_eq!(sources.paths().collect::<Vec<_>>(), vec!["src/parse.c"]);
+        assert!(
+            sources.files.iter().all(|file| file.bytes.is_none()),
+            "the tree endpoint does not hand sizes over"
+        );
         assert!(
             sources.complete,
             "keyset paging reaches the end of the tree"
         );
-        assert_eq!(docs.paths, vec!["docs/readme.md".to_string()]);
+        assert_eq!(docs.paths().collect::<Vec<_>>(), vec!["docs/readme.md"]);
         assert_eq!(
             server.received_requests().await.expect("received").len(),
             2,
@@ -1201,7 +1244,7 @@ mod tests {
             move || {
                 let gitlab = gitlab(uri);
                 gitlab.bind_repo(&change, "head222222222222222222222222222222222222");
-                let repo = gitlab.repo_source();
+                let repo = gitlab.repo().source();
                 (
                     repo.read_file("src/parse.c", None).expect("read"),
                     repo.read_file("src/parse.c", Some(LineRange { first: 2, last: 3 }))
@@ -1222,9 +1265,12 @@ mod tests {
     #[test]
     fn code_search_is_not_claimed_without_knowing_the_instance_has_it() {
         let gitlab = gitlab("https://gitlab.com/api/v4".to_string());
-        assert!(!gitlab.capabilities().code_search);
+        assert!(gitlab.repo().capabilities().is_empty());
         assert!(matches!(
-            gitlab.repo_source().search("token", None),
+            gitlab
+                .repo()
+                .source()
+                .search(SearchKind::Keyword, "token", None),
             Err(PlatformError::Unsupported { .. })
         ));
     }
@@ -1272,5 +1318,85 @@ mod tests {
             Some("gitlab.com"),
             "posts go to the entry's host, not gitlab.com"
         );
+    }
+
+    #[test]
+    fn cached_body_is_always_none() {
+        let gitlab = gitlab("https://gitlab.com/api/v4".to_string());
+        assert_eq!(gitlab.cached_body("src/parse.c"), None);
+    }
+
+    /// HEAD returns X-Gitlab-Size and no body. A GET of the raw file would be
+    /// fetching the bytes this method is defined not to fetch.
+    #[tokio::test]
+    async fn size_is_the_gitlab_size_header_and_does_not_read_the_body() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("HEAD"))
+            .and(wiremock::matchers::path(
+                "/projects/acme%2Fapp/repository/files/src%2Fparse.c",
+            ))
+            .and(wiremock::matchers::query_param(
+                "ref",
+                "head222222222222222222222222222222222222",
+            ))
+            .and(wiremock::matchers::header(
+                "PRIVATE-TOKEN",
+                "test-gitlab-token",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).insert_header("X-Gitlab-Size", "17"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/projects/acme%2Fapp/repository/files/src%2Fparse.c/raw",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("int parse;\n"))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let bytes = call({
+            let uri = server.uri();
+            let change = change();
+            move || {
+                let gitlab = gitlab(uri);
+                gitlab.bind_repo(&change, "head222222222222222222222222222222222222");
+                gitlab.repo().source().size("src/parse.c").expect("sized")
+            }
+        })
+        .await;
+
+        assert_eq!(bytes, 17);
+        assert_eq!(server.received_requests().await.expect("received").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_listing_from_gitlab_has_no_sizes() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/projects/acme%2Fapp/repository/tree",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"type": "blob", "name": "parse.c", "path": "src/parse.c"},
+                ])),
+            )
+            .mount(&server)
+            .await;
+
+        call({
+            let uri = server.uri();
+            let change = change();
+            move || {
+                let gitlab = gitlab(uri);
+                gitlab.bind_repo(&change, "head222222222222222222222222222222222222");
+                crate::platform::source::contract::listing_without_sizes_has_none(
+                    &*gitlab.repo().source(),
+                );
+            }
+        })
+        .await;
     }
 }

@@ -16,7 +16,7 @@ use crate::common::{Backoff, Secret, SecretSource};
 use crate::config::{Config, PlatformEntry, PlatformKind};
 use crate::domain::Narrative;
 
-pub use source::{LineRange, Listing, RepoSource, SearchHit};
+pub use source::{File, LineRange, Listing, RepoSource, SearchHit, SearchKind};
 pub use url::ChangeRef;
 
 #[derive(Debug, thiserror::Error)]
@@ -65,16 +65,43 @@ pub enum PlatformError {
     },
 }
 
-/// What this particular instance can actually do. Code search is the only
-/// optional one, and `tool` registers `search_repo` only when it is there.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Capabilities {
-    pub code_search: bool,
-    /// Whether that search takes a regular expression. A keyword-only index
-    /// treats metacharacters as literal text, and the model has no way to
-    /// notice the difference, so `search_repo`'s description is written from
-    /// this at registration time.
-    pub regex_search: bool,
+bitflags::bitflags! {
+    /// 这个平台的代码搜索答得了什么。空集就是答不了。
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct Capabilities: u8 {
+        const REGEX_SEARCH   = 1 << 0;
+        const KEYWORD_SEARCH = 1 << 1;
+    }
+}
+
+/// 后备库：一个能按 head_sha 回答的仓库，加上它答得了哪些搜索
+#[derive(Clone)]
+pub struct Repo {
+    source: Arc<dyn RepoSource>,
+    capabilities: Capabilities,
+}
+
+impl Repo {
+    pub fn new(source: Arc<dyn RepoSource>, capabilities: Capabilities) -> Self {
+        Self {
+            source,
+            capabilities,
+        }
+    }
+
+    pub fn source(&self) -> Arc<dyn RepoSource> {
+        Arc::clone(&self.source)
+    }
+
+    pub fn capabilities(&self) -> Capabilities {
+        self.capabilities
+    }
+
+    /// Body already in hand at the source. Never issues a request: a `None`
+    /// is "this optimisation does not apply", not a miss to go fetch.
+    pub fn cached_body(&self, path: &str) -> Option<String> {
+        self.source.cached_body(path)
+    }
 }
 
 /// The change as the platform describes it.
@@ -169,7 +196,18 @@ pub trait Platform: Send + Sync {
 
     fn host(&self) -> &str;
 
-    fn capabilities(&self) -> Capabilities;
+    /// The repository this platform answers about, together with the searches
+    /// it can run. `repo_source()` and `capabilities()` used to be separate;
+    /// they were always used together, and splitting them left a seam where
+    /// one platform's source could be paired with a `Capabilities` that is
+    /// not its own.
+    fn repo(&self) -> Repo;
+
+    /// Do you already hold this file's bytes? Hand them over, and never issue
+    /// a request for this. Later the search tools warm the local cache from
+    /// hits that already paid for a body; a `None` here must not turn into a
+    /// download the model never asked for.
+    fn cached_body(&self, path: &str) -> Option<String>;
 
     /// The head commit alone. `run_id` needs it before the run directory
     /// exists, which is earlier than the full diff is wanted.
@@ -193,10 +231,6 @@ pub trait Platform: Send + Sync {
     /// any stage runs, so the source is told once instead of a `ChangeRef`
     /// travelling through every read.
     fn bind_repo(&self, change: &ChangeRef, head_sha: &str);
-
-    /// Shared rather than borrowed: the builtin tools outlive the call that
-    /// registers them, and they hold this for the whole run.
-    fn repo_source(&self) -> Arc<dyn RepoSource>;
 }
 
 /// Pick the `[[platform]]` entry whose host matches, and build the

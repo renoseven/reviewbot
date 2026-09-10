@@ -129,6 +129,20 @@ impl Prompts {
 
     /// The one re-ask when a scoring call carried no verdict.
     pub const RESCORE: Template = Template::new("rescore", include_str!("../prompts/rescore.md"));
+
+    /// What this run's worktree is, in the words the model reads. One
+    /// template per shape rather than one with a condition in it: a run that
+    /// can read nothing needs a different paragraph, not an emptier one.
+    pub fn worktree(worktree: &crate::worktree::Worktree) -> Result<String, PromptError> {
+        let template = if worktree.is_checkout() {
+            Self::WORKTREE_CHECKOUT
+        } else if worktree.is_cache() {
+            Self::WORKTREE_FETCHED
+        } else {
+            Self::WORKTREE_EMPTY
+        };
+        template.text()
+    }
 }
 
 /// A prompt body with `{{slot}}` markers in it.

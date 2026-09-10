@@ -43,7 +43,7 @@ use stage::publish::{Publish, PublishInput, PublishedComment};
 use stage::report::{Report, ReportInput};
 use stage::review::{Review, ReviewOutput};
 use stage::triage::{SkippedFile, Triage, TriagePlan};
-use stage::{Adapters, StageContext, StageError};
+use stage::{Adapters, Equipment, StageContext, StageError};
 use worktree::WorktreeError;
 
 pub use config::{RunOptions, Settings as Configuration};
@@ -231,6 +231,11 @@ pub fn review(
 
 /// The injection seam: tests hand in fake adapters and get the same
 /// sequencing the public entry point runs.
+///
+/// Only the half of them that exists before the run directory can be handed
+/// in. The worktree and the tools over it are this run's own to build, after
+/// the lock, so a test fakes the platform and the protocol and gets the real
+/// ones standing on top of them.
 pub(crate) fn review_with(
     settings: &Settings,
     source: &Source,
@@ -243,7 +248,10 @@ pub(crate) fn review_with(
     // Everything from here to `RunStarted` is one wait with nothing to show for
     // it: a URL has its change fetched before anything can be named.
     progress.emit(Event::Opening);
-    let input = Input::identify(adapters, source)?;
+    // The checkout is read by path here, because there is no worktree yet:
+    // the run is named after this sha, and the worktree opens inside the
+    // directory the name picks out.
+    let input = Input::identify(adapters, source, settings.options.worktree.as_deref())?;
     // The head sha is settled now, and repository reads are always by it.
     adapters.bind_repo(&input);
     // The settings are not in the id: the same change at the same commit is
@@ -258,10 +266,6 @@ pub(crate) fn review_with(
     // Nothing below may run without the lock, which is why it is taken with
     // the directory rather than later on with the recorder.
     let run = LockedRun::create(run_dir.clone())?;
-    // The run's own worktree lives here, and is deleted with the run. A
-    // checkout named on the command line ignores this: it was open before the
-    // run id existed, which is why the id could be computed first.
-    adapters.open_worktree(&run_dir)?;
     let selection = settings.selection()?;
     let frozen = Budget::freeze(&selection)?;
     let identity = RunIdentity {
@@ -373,12 +377,18 @@ fn finish(
     progress: &dyn Progress,
 ) -> Result<RunResult, Error> {
     let paths = stage::path_policy(settings)?;
+    // The worktree and the tools over it, assembled here because here is the
+    // first moment they can be: the lock is held, the directory the cache
+    // goes in exists, and no stage has run.
+    let equipment = Equipment::real(settings, adapters, recorder.run_dir())?;
     let mut budget = restore_budget(recorder.meta())?;
 
     let result = {
         let mut context = StageContext {
             settings,
             adapters,
+            worktree: equipment.worktree.as_ref(),
+            tools: &equipment.tools,
             recorder: &mut recorder,
             budget: &mut budget,
             redactor: &adapters.redactor,
@@ -432,8 +442,8 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
             context.progress.emit(Event::Preparing);
             let orientation = Orientation::build(context, &changeset);
             let instructions = stage::review::assemble_instructions(
-                &context.adapters.tools,
-                context.adapters.worktree.reach(),
+                context.tools,
+                context.worktree,
                 context.redactor,
                 &orientation,
             )?;
@@ -442,11 +452,8 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
             // diff, because it is prose whoever wrote the change wrote.
             let narrative =
                 stage::review::narrative_preface(&changeset.narrative, context.redactor)?;
-            let tokens = stage::review::prompt_tokens(
-                &instructions,
-                narrative.as_deref(),
-                &context.adapters.tools,
-            );
+            let tokens =
+                stage::review::prompt_tokens(&instructions, narrative.as_deref(), context.tools);
             Some(Preamble {
                 instructions,
                 narrative,
