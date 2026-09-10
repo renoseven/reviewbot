@@ -578,7 +578,7 @@ fn warn_if_too_many_runs(runs_dir: &Path) {
     };
     tracing::warn!(
         count,
-        "{count} runs under {}; run `{command}` to delete them (pass `--keep N` to retain the newest N)",
+        "{count} runs under {}; run `{command}` to delete them (pass `--keep-latest N` to retain the newest N)",
         runs_dir.display(),
     );
 }

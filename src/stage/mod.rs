@@ -192,7 +192,7 @@ fn hide_platform_token(redactor: &mut Redactor, settings: &Settings, host: &str)
     let Some(entry) = settings.config.platform(host) else {
         return;
     };
-    let field = format!("platform.{}.api_token", entry.host);
+    let field = format!("platform.{}.api_token", entry.host().unwrap_or("unknown"));
     if let Ok(token) = SecretSource::parse(&field, &entry.api_token)
         .and_then(|source| source.read(&field, settings.options.worktree.as_deref()))
     {

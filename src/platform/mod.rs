@@ -2,7 +2,7 @@
 //! posting comments, and the platform side of repository reads.
 //!
 //! One of the three extension points. Adding a platform means implementing
-//! `Platform` and naming its `kind` in the config.
+//! `Platform` and adding its public host to the builtin table.
 
 pub mod github;
 pub mod gitlab;
@@ -199,8 +199,8 @@ pub trait Platform: Send + Sync {
     fn repo_source(&self) -> Arc<dyn RepoSource>;
 }
 
-/// Pick the `[[platform]]` entry whose host matches, resolve its `kind`, and
-/// build the implementation. Never falls back to `gitlab.com`.
+/// Pick the `[[platform]]` entry whose host matches, and build the
+/// implementation the builtin table names. Never falls back to `gitlab.com`.
 pub fn resolve(
     config: &Config,
     host: &str,
@@ -211,11 +211,9 @@ pub fn resolve(
         .ok_or_else(|| PlatformError::UnknownHost {
             host: host.to_string(),
         })?;
-    let kind = entry
-        .resolved_kind()
-        .ok_or_else(|| PlatformError::UnknownHost {
-            host: host.to_string(),
-        })?;
+    let kind = entry.kind().ok_or_else(|| PlatformError::UnknownHost {
+        host: host.to_string(),
+    })?;
     let token = read_token(entry)?;
     Ok(match kind {
         PlatformKind::Gitlab => Box::new(gitlab::GitLab::new(entry.clone(), token, backoff)),
@@ -224,12 +222,13 @@ pub fn resolve(
 }
 
 fn read_token(entry: &PlatformEntry) -> Result<Secret, PlatformError> {
-    let field = format!("platform.{}.api_token", entry.host);
+    let host = entry.host().unwrap_or("unknown");
+    let field = format!("platform.{host}.api_token");
     SecretSource::parse(&field, &entry.api_token)
         .and_then(|source| source.read(&field, None))
         .map_err(|error| PlatformError::Request {
             operation: "reading the API token",
-            host: entry.host.clone(),
+            host: host.to_string(),
             reason: error.to_string(),
         })
 }

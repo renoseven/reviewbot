@@ -66,7 +66,7 @@ impl PathPolicy {
     /// The read boundary of one run, assembled from the settings alone.
     ///
     /// Lives here rather than at either caller because there are two: the
-    /// stages, and `tool list`, which builds the real tools to print their
+    /// stages, and `config info`, which builds the real tools to print their
     /// contracts. Two assemblies of the same boundary is one of them being
     /// wrong.
     pub fn for_settings(settings: &Settings) -> Result<Self, ConfigError> {

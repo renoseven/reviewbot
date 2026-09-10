@@ -63,6 +63,18 @@ pub enum LogLevel {
     Trace,
 }
 
+impl LogLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogLevel::Error => "error",
+            LogLevel::Warn => "warn",
+            LogLevel::Info => "info",
+            LogLevel::Debug => "debug",
+            LogLevel::Trace => "trace",
+        }
+    }
+}
+
 /// The tool loop's shape. Every number here is required: what the right value
 /// is depends on the model's context window and on how big the repository is,
 /// and neither is something this code can see. A builtin default would be a
@@ -250,33 +262,52 @@ impl PlatformKind {
     }
 }
 
-/// A code hosting instance, keyed by `host`. No `name`: nothing cross
-/// references it, the input URL's host matches it on the spot.
+/// A code hosting instance. The input URL's host picks the row; that host
+/// is read off `base_url`. No `name`, no `kind`, no `host` field.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlatformEntry {
-    #[serde(default)]
-    pub kind: Option<PlatformKind>,
-    pub host: String,
     pub base_url: String,
     pub api_token: String,
 }
 
 impl PlatformEntry {
-    /// Explicit `kind` wins; otherwise only the two builtin hosts resolve.
-    /// Never inferred from the shape of `base_url`.
-    pub fn resolved_kind(&self) -> Option<PlatformKind> {
-        self.kind.or_else(|| builtin_kind(&self.host))
+    /// The browser host this row answers, if `base_url` is a known API.
+    pub fn host(&self) -> Option<&'static str> {
+        known_platform(&self.base_url).map(|row| row.web_host)
+    }
+
+    pub fn kind(&self) -> Option<PlatformKind> {
+        known_platform(&self.base_url).map(|row| row.kind)
     }
 }
 
-/// The whole builtin host table: two rows, written down in code.
-pub fn builtin_kind(host: &str) -> Option<PlatformKind> {
-    match host {
-        "gitlab.com" => Some(PlatformKind::Gitlab),
-        "github.com" => Some(PlatformKind::Github),
-        _ => None,
-    }
+/// One public API we will talk to. The API host and the browser host differ
+/// for GitHub (`api.github.com` vs `github.com`); they match for GitLab.
+struct KnownPlatform {
+    api_host: &'static str,
+    web_host: &'static str,
+    kind: PlatformKind,
+}
+
+const KNOWN_PLATFORMS: [KnownPlatform; 2] = [
+    KnownPlatform {
+        api_host: "gitlab.com",
+        web_host: "gitlab.com",
+        kind: PlatformKind::Gitlab,
+    },
+    KnownPlatform {
+        api_host: "api.github.com",
+        web_host: "github.com",
+        kind: PlatformKind::Github,
+    },
+];
+
+/// Only these two API hosts resolve. The path of `base_url` is not a clue.
+fn known_platform(base_url: &str) -> Option<&'static KnownPlatform> {
+    let url = reqwest::Url::parse(base_url).ok()?;
+    let host = url.host_str()?;
+    KNOWN_PLATFORMS.iter().find(|row| row.api_host == host)
 }
 
 /// An external command exposed to the model. Builtin tools never appear here.

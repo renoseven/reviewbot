@@ -11,13 +11,11 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[command(
     name = "reviewbot",
     version,
-    about = "Review a merge request, a pull request or a raw diff",
-    long_about = "Review a merge request, a pull request or a raw unified diff with a language \
-                  model, write a report, and optionally post the comments back.\n\n\
-                  Nothing is read from the current directory: the config comes from --config or \
-                  from ~/.reviewbot/config.toml. Runs, checkpoints, logs and traces live under \
-                  --runs-dir (default ~/.reviewbot/runs), and `run prune` is the only command \
-                  that deletes any of it."
+    about = "Review a merge request, pull request, or unified diff",
+    long_about = "Review a merge request, pull request, or unified diff with a language model, \
+                  write a report, and optionally post the comments back.\n\n\
+                  The config is --config. Runs live under --runs-dir. The current directory is \
+                  never consulted. Only `run remove` and `run prune` delete anything."
 )]
 pub struct Cli {
     #[command(flatten)]
@@ -30,27 +28,37 @@ pub struct Cli {
 /// Recognized by every subcommand.
 #[derive(Debug, Args)]
 pub struct GlobalArgs {
-    /// The config file. The only source for this path. Default: ~/.reviewbot/config.toml
-    #[arg(long, global = true, value_name = "PATH")]
-    pub config: Option<PathBuf>,
+    /// Config file
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        default_value = "~/.reviewbot/config.toml"
+    )]
+    pub config: PathBuf,
 
-    /// Where runs and checkpoints live. No config field for this. Default: ~/.reviewbot/runs
-    #[arg(long, global = true, value_name = "PATH")]
-    pub runs_dir: Option<PathBuf>,
+    /// Directory for runs and checkpoints
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        default_value = "~/.reviewbot/runs"
+    )]
+    pub runs_dir: PathBuf,
 
-    /// How stdout is rendered.
+    /// Output format
     #[arg(long, global = true, value_enum, default_value_t = Format::Text)]
     pub format: Format,
 
-    /// Write nothing at all to stdout. Errors still go to stderr.
+    /// Suppress stdout
     #[arg(short = 'q', long, global = true)]
     pub quiet: bool,
 
-    /// Never colour the progress output, whatever the terminal is.
+    /// Never colour progress output
     #[arg(long, global = true)]
     pub no_color: bool,
 
-    /// Retries for transient failures.
+    /// Retries for transient failures
     #[arg(long, global = true, default_value_t = 2, value_name = "N")]
     pub retries: u32,
 }
@@ -66,7 +74,11 @@ pub enum Format {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Run the six stages over a URL, a diff file, or `-` for stdin.
+    /// Manage the config file
+    #[command(subcommand)]
+    Config(ConfigCommand),
+
+    /// Review a merge request, pull request, or unified diff
     #[command(long_about = "Review a change and write a report.\n\n\
                       The target says what to review, and its shape decides how it is read:\n\n\
                       - `http(s)://...` is a merge request or pull request URL. Its host has to \
@@ -84,41 +96,21 @@ pub enum Command {
                       that changed since the run started is refused instead of half applied.")]
     Review(ReviewArgs),
 
-    /// Inspect and prune past runs.
+    /// Inspect and delete past runs
     #[command(subcommand)]
     Run(RunCommand),
-
-    /// Check the config without sending anything.
-    #[command(subcommand)]
-    Config(ConfigCommand),
-
-    /// The model catalog this config declares.
-    #[command(subcommand)]
-    Model(ModelCommand),
-
-    /// The tools this config could offer the model, and their contracts.
-    #[command(subcommand)]
-    Tool(ToolCommand),
-
-    /// The code hosts this config can review.
-    #[command(subcommand)]
-    Platform(PlatformCommand),
-
-    /// The vendors this config can call.
-    #[command(subcommand)]
-    Provider(ProviderCommand),
 }
 
 #[derive(Debug, Args)]
 pub struct ReviewArgs {
-    /// A merge request URL, a diff file, or `-` for stdin.
+    /// Merge request URL, diff file, or `-` for stdin
     pub target: String,
 
-    /// Which `[[model]]` entry to use. Changes the run id.
+    /// `[[model]]` name or alias
     #[arg(long, value_name = "NAME|ALIAS")]
     pub model: Option<String>,
 
-    /// Reuse an existing checkout, read only.
+    /// Existing checkout to reuse, read-only
     #[arg(
         long,
         value_name = "PATH",
@@ -132,44 +124,54 @@ pub struct ReviewArgs {
     )]
     pub worktree: Option<PathBuf>,
 
-    /// Also post the comments back to the merge request.
+    /// Post comments back to the merge request
     #[arg(long)]
     pub publish: bool,
 
-    /// Override the computed run id. Still fingerprint checked.
+    /// Override the computed run id
     #[arg(long, value_name = "ID")]
     pub run_id: Option<String>,
 
-    /// Export the report and the summary here, for CI artifacts.
+    /// Directory for the report and summary
     #[arg(long, value_name = "DIR")]
     pub output_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum RunCommand {
-    /// Runs in the runs directory, with that directory named up front.
+    /// List recorded runs
     List,
 
-    /// Everything recorded about one run: stages, counts, spend, artifacts.
+    /// Show one run
     Show {
-        /// The run to describe.
+        /// Run id
         run_id: String,
     },
 
-    /// Keep the newest N runs and delete the rest.
-    #[command(long_about = "Delete run directories, newest first kept.\n\n\
-                      This is the only command that deletes anything. `--keep N` counts from the \
-                      newest run by modification time and deletes everything older; the default \
-                      is 0, which deletes every run in the directory. A deleted run takes its \
-                      report, its summary, its log, its traces and its worktree with it, and \
-                      nothing else in reviewbot ever removes them.\n\n\
-                      `--dry-run` prints exactly what would go, and deletes nothing.")]
-    Prune {
-        /// How many of the newest runs to keep. 0 deletes every run.
-        #[arg(long, default_value_t = reviewbot::record::DEFAULT_KEEP, value_name = "N")]
-        keep: usize,
+    /// Delete one run
+    #[command(long_about = "Delete one run directory by id.\n\n\
+                      The run takes its report, its summary, its log, its traces and its \
+                      worktree with it. A missing id is an error, not a no-op. Success prints \
+                      nothing.")]
+    Remove {
+        /// Run id
+        run_id: String,
+    },
 
-        /// List what would be deleted and delete nothing.
+    /// Delete old runs, retaining the newest
+    #[command(long_about = "Delete run directories, newest first retained.\n\n\
+                      `--keep-latest N` counts from the newest run by modification time and \
+                      deletes everything older. 0 deletes every run in the directory. A \
+                      deleted run takes its report, its summary, its log, its traces and its \
+                      worktree with it.\n\n\
+                      Success prints one sentence. `--dry-run` reports what would happen and \
+                      deletes nothing.")]
+    Prune {
+        /// Newest runs to retain
+        #[arg(long = "keep-latest", default_value_t = reviewbot::record::DEFAULT_KEEP, value_name = "N")]
+        keep_latest: usize,
+
+        /// Report what would be deleted and delete nothing
         #[arg(long)]
         dry_run: bool,
     },
@@ -177,7 +179,16 @@ pub enum RunCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ConfigCommand {
-    /// Parse and validate, credential readability included.
+    /// Write the example config
+    #[command(long_about = "Write a complete, valid example config and stop.\n\n\
+                      The file is the one that ships in the binary as src/config/example.toml: \
+                      every required number is filled in, and `config check` will accept it \
+                      once the credential names it points at are readable. It will not \
+                      overwrite a file that is already there; pass `--config` to choose \
+                      another path.")]
+    Init,
+
+    /// Validate the config
     #[command(long_about = "Validate the config and stop.\n\n\
                       Everything it does is local: the file is parsed, every rule that spans two \
                       tables is checked, the selected model resolves to a provider, and the \
@@ -188,45 +199,18 @@ pub enum ConfigCommand {
                       fact about the runner, and a review that calls the tool is where it \
                       matters.")]
     Check,
-}
 
-#[derive(Debug, Subcommand)]
-pub enum ModelCommand {
-    /// Every `[[model]]` entry with its prices and window.
-    List,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum ToolCommand {
-    /// Every tool's contract: purpose, call, rounds, preconditions.
+    /// List platforms, providers, models, and tools
     #[command(
-        long_about = "Print the contract of every tool this config could offer the model, \
-                      grouped by what the tool is for.\n\n\
-                      Each row is the call as the model writes it, the description the model \
-                      reads, one line per declared argument, the rounds the tool is offered on, \
-                      and what a run's worktree has to be able to do before a call can be \
-                      answered.\n\n\
-                      Every tool here is offered to the model on every run; what varies is \
-                      whether that run's worktree can answer it, and a run that cannot says so \
-                      in the description and again in the refusal. Which worktree a review got \
-                      is a fact about that review, and this command reviews nothing. The content \
-                      descriptions here are written for the widest worktree there is, a whole \
-                      checkout with a platform that can match expressions; the preconditions are \
-                      what say when a run would get less."
+        long_about = "Print the platforms, providers, models, and tools in the loaded config \
+                      as tables.\n\n\
+                      Column titles are uppercase. A title of more than one word is joined \
+                      with `_`. The tool table is name, purpose, and rounds; the rest of \
+                      the contract is in `--format json`.\n\n\
+                      Credentials are named by source, never printed. This command does not \
+                      read them; `config check` is what does that."
     )]
-    List,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum PlatformCommand {
-    /// Every `[[platform]]` entry, its kind, and where its token comes from.
-    List,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum ProviderCommand {
-    /// Every `[[provider]]` entry, its protocol, budget and key source.
-    List,
+    Info,
 }
 
 #[cfg(test)]
@@ -268,20 +252,24 @@ mod tests {
         walk(&Cli::command(), "");
     }
 
-    /// Four of them need more than a line, because the short version cannot
-    /// carry what a reader has to know before running them.
+    /// These need more than a line, because the short version cannot carry
+    /// what a reader has to know before running them.
     #[test]
     fn the_commands_that_need_spelling_out_have_a_long_help() {
         let command = Cli::command();
         for path in [
             // What a target may be, and what each shape can and cannot do.
             vec!["review"],
-            // The only command that deletes anything, and how `--keep` counts.
+            // How `--keep-latest` counts, and what success prints.
             vec!["run", "prune"],
+            // Deletes one run and prints nothing.
+            vec!["run", "remove"],
             // Local from start to finish; it sends nothing.
             vec!["config", "check"],
-            // It prints contracts, not what this invocation would register.
-            vec!["tool", "list"],
+            // Where it writes, and that it will not overwrite.
+            vec!["config", "init"],
+            // The four catalogs; the tool table is the short columns.
+            vec!["config", "info"],
         ] {
             let mut found = &command;
             for name in &path {
@@ -324,18 +312,61 @@ mod tests {
             ],
             vec!["reviewbot", "run", "list"],
             vec!["reviewbot", "run", "show", "7f3a9c1e"],
+            vec!["reviewbot", "run", "remove", "7f3a9c1e"],
             vec!["reviewbot", "run", "prune"],
-            vec!["reviewbot", "run", "prune", "--keep", "5", "--dry-run"],
+            vec![
+                "reviewbot",
+                "run",
+                "prune",
+                "--keep-latest",
+                "5",
+                "--dry-run",
+            ],
             vec!["reviewbot", "config", "check"],
-            vec!["reviewbot", "model", "list"],
-            vec!["reviewbot", "tool", "list"],
-            vec!["reviewbot", "platform", "list"],
-            vec!["reviewbot", "provider", "list"],
+            vec!["reviewbot", "config", "init"],
+            vec!["reviewbot", "config", "info"],
             vec!["reviewbot", "-q", "--format", "json", "run", "list"],
         ] {
             Cli::try_parse_from(&arguments)
                 .unwrap_or_else(|error| panic!("{arguments:?} should parse: {error}"));
         }
+    }
+
+    #[test]
+    fn commands_are_listed_in_semantic_order() {
+        fn names_of(command: &clap::Command) -> Vec<String> {
+            command
+                .get_subcommands()
+                .map(|sub| sub.get_name().to_string())
+                .filter(|name| name != "help")
+                .collect()
+        }
+        let root = Cli::command();
+        assert_eq!(names_of(&root), ["config", "review", "run"]);
+        assert_eq!(
+            names_of(root.find_subcommand("config").expect("config")),
+            ["init", "check", "info"]
+        );
+        assert_eq!(
+            names_of(root.find_subcommand("run").expect("run")),
+            ["list", "show", "remove", "prune"]
+        );
+    }
+
+    #[test]
+    fn help_shows_defaults_the_way_clap_does() {
+        let help = Cli::command().render_help().to_string();
+        assert!(
+            help.contains("[default: ~/.reviewbot/config.toml]"),
+            "{help}"
+        );
+        assert!(help.contains("[default: ~/.reviewbot/runs]"), "{help}");
+        assert!(help.contains("[default: text]"), "{help}");
+        assert!(help.contains("[default: 2]"), "{help}");
+        assert!(
+            !help.contains("Default:"),
+            "defaults belong to clap, not the help prose: {help}"
+        );
     }
 
     #[test]
@@ -386,14 +417,36 @@ mod tests {
     }
 
     #[test]
-    fn prune_keep_defaults_to_zero() {
+    fn prune_keep_latest_defaults_to_zero() {
         let cli = Cli::try_parse_from(["reviewbot", "run", "prune"]).unwrap();
         match cli.command {
-            Command::Run(RunCommand::Prune { keep, dry_run }) => {
-                assert_eq!(keep, reviewbot::record::DEFAULT_KEEP);
+            Command::Run(RunCommand::Prune {
+                keep_latest,
+                dry_run,
+            }) => {
+                assert_eq!(keep_latest, reviewbot::record::DEFAULT_KEEP);
                 assert!(!dry_run);
             }
             other => panic!("expected prune, got {other:?}"),
+        }
+    }
+
+    /// These used to be top-level nouns with a `list` verb. The same
+    /// information now lives under `config info`, and the old spellings
+    /// are gone rather than kept as aliases.
+    #[test]
+    fn the_old_catalog_nouns_no_longer_parse() {
+        for arguments in [
+            vec!["reviewbot", "model", "list"],
+            vec!["reviewbot", "tool", "list"],
+            vec!["reviewbot", "platform", "list"],
+            vec!["reviewbot", "provider", "list"],
+            vec!["reviewbot", "run", "prune", "--keep", "5"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&arguments).is_err(),
+                "{arguments:?} should no longer parse"
+            );
         }
     }
 }

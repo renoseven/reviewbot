@@ -19,8 +19,12 @@ use crate::common::{Secret, SecretSource};
 pub use crate::common::Backoff;
 pub use file::{
     Config, LogLevel, LogSettings, Model, ParamKind, ParamSpec, PlatformEntry, PlatformKind,
-    Provider, ReviewSettings, SecuritySettings, ToolEntry, TriageSettings, builtin_kind,
+    Provider, ReviewSettings, SecuritySettings, ToolEntry, TriageSettings,
 };
+
+/// The shipped example, which is also what `config init` writes. Complete
+/// enough to parse and validate; credentials still have to be pointed at.
+pub const EXAMPLE_CONFIG: &str = include_str!("example.toml");
 
 /// Wire protocols this binary can speak. `protocol` resolves the same list;
 /// it is named here so `config` never has to look up at the adapter layer.
@@ -69,7 +73,7 @@ const BUILTIN_PLACEHOLDERS: [&str; 1] = ["worktree"];
 /// the file is absent, unreadable, or malformed.
 pub fn log_level(config_path: Option<&Path>) -> tracing::Level {
     let path = config_path
-        .map(Path::to_path_buf)
+        .map(paths::expand_user)
         .unwrap_or_else(paths::default_config_path);
     let level = std::fs::read_to_string(path)
         .ok()
@@ -89,8 +93,15 @@ pub fn log_level(config_path: Option<&Path>) -> tracing::Level {
 pub enum ConfigError {
     #[error("no config file at {path} (set --config to point somewhere else)")]
     Missing { path: PathBuf },
+    #[error("will not overwrite {path}; pass --config to choose another path")]
+    AlreadyExists { path: PathBuf },
     #[error("cannot read config at {path}: {source}")]
     Unreadable {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("cannot write config at {path}: {source}")]
+    Unwritable {
         path: PathBuf,
         source: std::io::Error,
     },
@@ -108,10 +119,8 @@ pub enum ConfigError {
     DuplicateName { table: &'static str, name: String },
     #[error("duplicate platform host {host:?}")]
     DuplicateHost { host: String },
-    #[error(
-        "platform host {host:?} is not a builtin host, so it needs an explicit kind (gitlab or github)"
-    )]
-    UnknownHost { host: String },
+    #[error("platform base_url {url:?} is not gitlab.com or api.github.com")]
+    UnknownPlatform { url: String },
     #[error("model {model:?} refers to provider {provider:?}, which is not configured")]
     UnknownProvider { model: String, provider: String },
     #[error("provider {provider:?} speaks protocol {protocol:?}; known protocols: {known}")]
@@ -248,6 +257,41 @@ impl RunOptions {
     }
 }
 
+/// Where `--config` points, or `~/.reviewbot/config.toml`. The current
+/// directory is never consulted.
+pub fn resolve_config_path(config_path: Option<&Path>) -> Result<PathBuf, ConfigError> {
+    match config_path {
+        Some(path) => {
+            let expanded = paths::expand_user(path);
+            std::path::absolute(&expanded).map_err(|source| ConfigError::Unreadable {
+                path: expanded,
+                source,
+            })
+        }
+        None => Ok(paths::default_config_path()),
+    }
+}
+
+/// Write the shipped example to `--config`, or to `~/.reviewbot/config.toml`.
+/// Refuses to overwrite: a file that is already there is left alone.
+pub fn init_config(config_path: Option<&Path>) -> Result<PathBuf, ConfigError> {
+    let path = resolve_config_path(config_path)?;
+    if path.exists() {
+        return Err(ConfigError::AlreadyExists { path });
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| ConfigError::Unwritable {
+            path: path.clone(),
+            source,
+        })?;
+    }
+    std::fs::write(&path, EXAMPLE_CONFIG).map_err(|source| ConfigError::Unwritable {
+        path: path.clone(),
+        source,
+    })?;
+    Ok(path)
+}
+
 /// A validated config plus the command line that goes with it.
 #[derive(Clone, Debug)]
 pub struct Settings {
@@ -260,13 +304,7 @@ impl Settings {
     /// Read and validate the file. `config_path` is the only path source;
     /// `None` means `~/.reviewbot/config.toml`, never the current directory.
     pub fn load(config_path: Option<&Path>, options: RunOptions) -> Result<Self, ConfigError> {
-        let path = match config_path {
-            Some(path) => std::path::absolute(path).map_err(|source| ConfigError::Unreadable {
-                path: path.to_path_buf(),
-                source,
-            })?,
-            None => paths::default_config_path(),
-        };
+        let path = resolve_config_path(config_path)?;
         if !path.exists() {
             return Err(ConfigError::Missing { path });
         }
@@ -395,14 +433,14 @@ impl Config {
     fn check_platforms(&self) -> Result<(), ConfigError> {
         let mut hosts = BTreeSet::new();
         for platform in &self.platforms {
-            if !hosts.insert(platform.host.as_str()) {
-                return Err(ConfigError::DuplicateHost {
-                    host: platform.host.clone(),
+            let Some(host) = platform.host() else {
+                return Err(ConfigError::UnknownPlatform {
+                    url: platform.base_url.clone(),
                 });
-            }
-            if platform.resolved_kind().is_none() {
-                return Err(ConfigError::UnknownHost {
-                    host: platform.host.clone(),
+            };
+            if !hosts.insert(host) {
+                return Err(ConfigError::DuplicateHost {
+                    host: host.to_string(),
                 });
             }
         }
@@ -604,7 +642,10 @@ impl Config {
         }
         for platform in &self.platforms {
             SecretSource::parse(
-                &format!("platform.{}.api_token", platform.host),
+                &format!(
+                    "platform.{}.api_token",
+                    platform.host().unwrap_or("unknown")
+                ),
                 &platform.api_token,
             )?;
         }
@@ -616,7 +657,7 @@ impl Config {
     }
 
     pub fn platform(&self, host: &str) -> Option<&PlatformEntry> {
-        self.platforms.iter().find(|p| p.host == host)
+        self.platforms.iter().find(|p| p.host() == Some(host))
     }
 
     /// `--model` beats `default = true` beats the sole entry. Nothing else,
@@ -809,25 +850,41 @@ max_output_tokens = 8192
     }
 
     #[test]
-    fn unknown_host_needs_an_explicit_kind_even_when_base_url_looks_like_gitlab() {
+    fn an_unknown_api_is_refused_even_when_base_url_looks_like_gitlab() {
         let mut text = MINIMAL.to_string();
         text.push_str(
             r#"
 [[platform]]
-host = "git.example.com"
 base_url = "https://git.example.com/api/v4"
 api_token = "GITLAB_TOKEN"
 "#,
         );
         let error = parse(&text).validate().expect_err("must fail");
         assert!(
-            matches!(&error, ConfigError::UnknownHost { host } if host == "git.example.com"),
+            matches!(&error, ConfigError::UnknownPlatform { url } if url == "https://git.example.com/api/v4"),
             "got {error}"
         );
     }
 
     #[test]
-    fn builtin_hosts_resolve_without_a_kind() {
+    fn a_kind_field_is_unknown() {
+        let mut text = MINIMAL.to_string();
+        text.push_str(
+            r#"
+[[platform]]
+kind = "gitlab"
+base_url = "https://gitlab.com/api/v4"
+api_token = "GITLAB_TOKEN"
+"#,
+        );
+        assert!(
+            toml::from_str::<Config>(&text).is_err(),
+            "kind is not a config field"
+        );
+    }
+
+    #[test]
+    fn a_host_field_is_unknown() {
         let mut text = MINIMAL.to_string();
         text.push_str(
             r#"
@@ -835,9 +892,24 @@ api_token = "GITLAB_TOKEN"
 host = "gitlab.com"
 base_url = "https://gitlab.com/api/v4"
 api_token = "GITLAB_TOKEN"
+"#,
+        );
+        assert!(
+            toml::from_str::<Config>(&text).is_err(),
+            "host is not a config field"
+        );
+    }
+
+    #[test]
+    fn known_apis_resolve() {
+        let mut text = MINIMAL.to_string();
+        text.push_str(
+            r#"
+[[platform]]
+base_url = "https://gitlab.com/api/v4"
+api_token = "GITLAB_TOKEN"
 
 [[platform]]
-host = "github.com"
 base_url = "https://api.github.com"
 api_token = "GITHUB_TOKEN"
 "#,
@@ -845,11 +917,11 @@ api_token = "GITHUB_TOKEN"
         let config = parse(&text);
         config.validate().expect("valid");
         assert_eq!(
-            config.platform("gitlab.com").unwrap().resolved_kind(),
+            config.platform("gitlab.com").unwrap().kind(),
             Some(PlatformKind::Gitlab)
         );
         assert_eq!(
-            config.platform("github.com").unwrap().resolved_kind(),
+            config.platform("github.com").unwrap().kind(),
             Some(PlatformKind::Github)
         );
     }
@@ -936,10 +1008,39 @@ api_token = "GITHUB_TOKEN"
     /// come and go. It has no builtin defaults to fall back on.
     #[test]
     fn the_example_config_sets_everything_that_is_required() {
-        let text = include_str!("../../examples/reviewbot.toml");
-        parse(text)
+        parse(EXAMPLE_CONFIG)
             .validate()
             .expect("the shipped example is a complete config");
+        assert!(
+            !EXAMPLE_CONFIG
+                .lines()
+                .any(|line| line.starts_with("[[tool]]")),
+            "external checkers stay commented; listed means enabled"
+        );
+    }
+
+    #[test]
+    fn init_writes_the_example_and_refuses_to_overwrite() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("nested").join("config.toml");
+        let written = init_config(Some(&path)).expect("first write");
+        assert_eq!(written, std::path::absolute(&path).expect("abs"));
+        assert_eq!(
+            std::fs::read_to_string(&written).expect("read"),
+            EXAMPLE_CONFIG
+        );
+        let refused = init_config(Some(&path)).expect_err("already there");
+        assert!(
+            matches!(refused, ConfigError::AlreadyExists { .. }),
+            "{refused}"
+        );
+        assert_eq!(
+            refused.to_string(),
+            format!(
+                "will not overwrite {}; pass --config to choose another path",
+                std::path::absolute(&path).expect("abs").display()
+            )
+        );
     }
 
     #[test]

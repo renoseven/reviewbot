@@ -31,14 +31,15 @@ pub struct GitLab {
 
 impl GitLab {
     pub fn new(entry: PlatformEntry, token: Secret, backoff: Backoff) -> Self {
+        let host = entry.host().unwrap_or("gitlab.com").to_string();
         let http = Arc::new(HttpClient::new(
             entry.base_url.clone(),
-            entry.host.clone(),
+            host.clone(),
             token.expose(),
             backoff,
         ));
         let repo = Arc::new(GitLabRepo {
-            host: entry.host.clone(),
+            host,
             http: Arc::clone(&http),
             token: token.clone(),
             commit: Mutex::new(None),
@@ -267,7 +268,7 @@ impl Platform for GitLab {
     }
 
     fn host(&self) -> &str {
-        &self.entry.host
+        self.entry.host().unwrap_or("gitlab.com")
     }
 
     /// Blob search exists only with Advanced Search or Exact Code Search, and
@@ -646,7 +647,6 @@ impl GitlabDiffFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::PlatformKind;
     use crate::stage::input::UnifiedDiff;
 
     fn change() -> ChangeRef {
@@ -657,11 +657,9 @@ mod tests {
         }
     }
 
-    fn gitlab(base_url: String, host: &str) -> GitLab {
+    fn gitlab(base_url: String) -> GitLab {
         GitLab::new(
             PlatformEntry {
-                kind: Some(PlatformKind::Gitlab),
-                host: host.to_string(),
                 base_url,
                 api_token: "GITLAB_TOKEN".to_string(),
             },
@@ -750,7 +748,7 @@ mod tests {
     #[test]
     fn a_gitlab_html_url_is_fetched_from_the_api_base() {
         let parsed = ChangeRef::parse("https://gitlab.com/acme/app/-/merge_requests/128").unwrap();
-        let api = gitlab("https://gitlab.com/api/v4".to_string(), "gitlab.com")
+        let api = gitlab("https://gitlab.com/api/v4".to_string())
             .mr_url(&parsed, &[])
             .unwrap();
         assert_eq!(
@@ -820,7 +818,7 @@ mod tests {
         let fetched = call({
             let uri = server.uri();
             let change = change();
-            move || gitlab(uri, "gitlab.com").fetch_change(&change)
+            move || gitlab(uri).fetch_change(&change)
         })
         .await
         .expect("fetched");
@@ -866,7 +864,7 @@ mod tests {
         let fetched = call({
             let uri = server.uri();
             let change = change();
-            move || gitlab(uri, "gitlab.com").fetch_change(&change)
+            move || gitlab(uri).fetch_change(&change)
         })
         .await
         .expect("fetched");
@@ -914,7 +912,7 @@ mod tests {
             let change = change();
             let refs = refs();
             let comment = inline(marker);
-            move || gitlab(uri, "gitlab.com").post_comments(&change, &refs, &[comment])
+            move || gitlab(uri).post_comments(&change, &refs, &[comment])
         })
         .await
         .expect("posted");
@@ -977,7 +975,7 @@ mod tests {
             let uri = server.uri();
             let change = change();
             let refs = refs();
-            move || gitlab(uri, "gitlab.com").post_comments(&change, &refs, &[comment])
+            move || gitlab(uri).post_comments(&change, &refs, &[comment])
         })
         .await
         .expect("posted");
@@ -1024,7 +1022,7 @@ mod tests {
             let change = change();
             let refs = refs();
             let comment = inline("<!-- reviewbot:run1:trace-1 -->");
-            move || gitlab(uri, "gitlab.com").post_comments(&change, &refs, &[comment])
+            move || gitlab(uri).post_comments(&change, &refs, &[comment])
         })
         .await
         .expect("degraded");
@@ -1059,7 +1057,7 @@ mod tests {
         let existing = call({
             let uri = server.uri();
             let change = change();
-            move || gitlab(uri, "gitlab.com").existing_comments(&change)
+            move || gitlab(uri).existing_comments(&change)
         })
         .await
         .expect("listed");
@@ -1083,7 +1081,7 @@ mod tests {
         let error = call({
             let uri = server.uri();
             let change = change();
-            move || gitlab(uri, "gitlab.com").fetch_change(&change)
+            move || gitlab(uri).fetch_change(&change)
         })
         .await
         .expect_err("401");
@@ -1151,7 +1149,7 @@ mod tests {
             let uri = server.uri();
             let change = change();
             move || {
-                let gitlab = gitlab(uri, "gitlab.com");
+                let gitlab = gitlab(uri);
                 gitlab.bind_repo(&change, "head222222222222222222222222222222222222");
                 let repo = gitlab.repo_source();
                 (
@@ -1201,7 +1199,7 @@ mod tests {
             let uri = server.uri();
             let change = change();
             move || {
-                let gitlab = gitlab(uri, "gitlab.com");
+                let gitlab = gitlab(uri);
                 gitlab.bind_repo(&change, "head222222222222222222222222222222222222");
                 let repo = gitlab.repo_source();
                 (
@@ -1223,7 +1221,7 @@ mod tests {
     /// is what keeps `search_repo` out of the list the model is shown.
     #[test]
     fn code_search_is_not_claimed_without_knowing_the_instance_has_it() {
-        let gitlab = gitlab("https://gitlab.com/api/v4".to_string(), "gitlab.com");
+        let gitlab = gitlab("https://gitlab.com/api/v4".to_string());
         assert!(!gitlab.capabilities().code_search);
         assert!(matches!(
             gitlab.repo_source().search("token", None),
@@ -1262,7 +1260,7 @@ mod tests {
                 number: 128,
             };
             let refs = refs();
-            move || gitlab(uri, "git.example.com").post_comments(&change, &refs, &[comment])
+            move || gitlab(uri).post_comments(&change, &refs, &[comment])
         })
         .await
         .expect("posted");
@@ -1272,7 +1270,7 @@ mod tests {
         assert_ne!(
             received[0].url.host_str(),
             Some("gitlab.com"),
-            "kind is not inferred from a public host"
+            "posts go to the entry's host, not gitlab.com"
         );
     }
 }

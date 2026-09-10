@@ -16,10 +16,7 @@ use reviewbot::config::{RunOptions, Settings, paths};
 use reviewbot::progress::{Event, Progress, Silent};
 use reviewbot::{Error, Source};
 
-use args::{
-    Cli, Command, ConfigCommand, GlobalArgs, ModelCommand, PlatformCommand, ProviderCommand,
-    ReviewArgs, RunCommand, ToolCommand,
-};
+use args::{Cli, Command, ConfigCommand, GlobalArgs, ReviewArgs, RunCommand};
 use logging::LogSink;
 use status::Status;
 
@@ -56,7 +53,7 @@ fn execute() -> Result<Finished, Failure> {
         }
         Err(complaint) => return Err(Failure::Usage(complaint)),
     };
-    let log = init_tracing(cli.global.config.as_deref());
+    let log = init_tracing(Some(&cli.global.config));
     let finished = dispatch(&cli, &log).map_err(|error| Failure::Command {
         error: Box::new(error),
         // The environment is read here rather than in `render`, which only
@@ -174,37 +171,37 @@ fn dispatch(cli: &Cli, log: &LogSink) -> Result<Finished, Error> {
             settings.selected_api_key()?;
             render::config_check(&settings, cli.global.format).map(Finished::ok)
         }
+        Command::Config(ConfigCommand::Init) => {
+            let path = reviewbot::config::init_config(Some(&cli.global.config))?;
+            Ok(Finished::ok(render::config_init(&path, cli.global.format)))
+        }
+        Command::Config(ConfigCommand::Info) => {
+            let settings = load(&cli.global, base_options(&cli.global))?;
+            render::config_info(&settings, cli.global.format).map(Finished::ok)
+        }
         Command::Run(RunCommand::List) => {
             render::run_list(&runs_dir(&cli.global), cli.global.format).map(Finished::ok)
         }
         Command::Run(RunCommand::Show { run_id }) => {
             render::run_show(&runs_dir(&cli.global), run_id, cli.global.format).map(Finished::ok)
         }
-        Command::Run(RunCommand::Prune { keep, dry_run }) => {
-            let report = reviewbot::record::prune_runs(&runs_dir(&cli.global), *keep, *dry_run)?;
+        Command::Run(RunCommand::Remove { run_id }) => {
+            reviewbot::record::remove_run(&runs_dir(&cli.global), run_id)?;
+            Ok(Finished::ok(String::new()))
+        }
+        Command::Run(RunCommand::Prune {
+            keep_latest,
+            dry_run,
+        }) => {
+            let report =
+                reviewbot::record::prune_runs(&runs_dir(&cli.global), *keep_latest, *dry_run)?;
             Ok(Finished::ok(render::run_prune(&report, cli.global.format)))
-        }
-        Command::Model(ModelCommand::List) => {
-            let settings = load(&cli.global, base_options(&cli.global))?;
-            render::model_list(&settings, cli.global.format).map(Finished::ok)
-        }
-        Command::Tool(ToolCommand::List) => {
-            let settings = load(&cli.global, base_options(&cli.global))?;
-            render::tool_list(&settings, cli.global.format).map(Finished::ok)
-        }
-        Command::Platform(PlatformCommand::List) => {
-            let settings = load(&cli.global, base_options(&cli.global))?;
-            render::platform_list(&settings, cli.global.format).map(Finished::ok)
-        }
-        Command::Provider(ProviderCommand::List) => {
-            let settings = load(&cli.global, base_options(&cli.global))?;
-            render::provider_list(&settings, cli.global.format).map(Finished::ok)
         }
     }
 }
 
 fn load(global: &GlobalArgs, options: RunOptions) -> Result<Settings, Error> {
-    Ok(Settings::load(global.config.as_deref(), options)?)
+    Ok(Settings::load(Some(&global.config), options)?)
 }
 
 fn base_options(global: &GlobalArgs) -> RunOptions {
@@ -227,10 +224,7 @@ fn review_options(global: &GlobalArgs, review: &ReviewArgs) -> RunOptions {
 }
 
 fn runs_dir(global: &GlobalArgs) -> PathBuf {
-    global
-        .runs_dir
-        .clone()
-        .unwrap_or_else(paths::default_runs_dir)
+    paths::expand_user(&global.runs_dir)
 }
 
 /// The positional argument decides its own shape: a URL, standard input, or

@@ -4,10 +4,12 @@
 use std::ffi::OsString;
 use std::path::Path;
 
+use comfy_table::presets::ASCII_FULL_CONDENSED;
+use comfy_table::{ContentArrangement, Table};
+
 use reviewbot::config::Settings;
 use reviewbot::domain::{Confidence, Severity};
 use reviewbot::security::Redactor;
-use reviewbot::tool::Purpose;
 use reviewbot::{Error, RunResult};
 
 use super::Failure;
@@ -214,26 +216,74 @@ pub fn config_check(settings: &Settings, format: Format) -> Result<String, Error
         .to_string(),
         Format::Text => {
             let mut out = String::new();
-            out.push_str(&format!("config     {}\n", settings.config_path.display()));
-            out.push_str(&format!(
-                "model      {}  (selected by {})\n",
-                selection.model.name,
-                selection.reason.as_str()
+            out.push_str(&check_field("Path", settings.config_path.display()));
+            out.push_str(&check_field("Provider", &selection.provider.name));
+            out.push_str(&check_field("Credential", "readable"));
+            out.push_str(&check_field(
+                "Budget",
+                budget(
+                    selection.provider.budget_per_run,
+                    &selection.provider.currency,
+                ),
             ));
-            out.push_str(&format!(
-                "provider   {}  ({}, {} budget {})\n",
-                selection.provider.name,
-                selection.provider.protocol,
-                selection.provider.currency,
-                selection.provider.budget_per_run
-            ));
-            out.push_str(&format!("platforms  {}\n", settings.config.platforms.len()));
-            out.push_str(&format!("tools      {}\n", settings.config.tools.len()));
-            out.push_str("credential readable, no requests sent\n");
+            out.push_str(&check_field("Platforms", settings.config.platforms.len()));
+            out.push_str(&check_field("Models", settings.config.models.len()));
+            out.push_str(&check_field("Tools", settings.config.tools.len()));
+            out.push_str("ok\n");
             out
         }
     };
     Ok(Redactor::new().redact(&text))
+}
+
+/// Widest `config check` label, including the colon: `Credential:`.
+const CHECK_LABEL_WIDTH: usize = 11;
+
+fn check_field(label: &str, value: impl std::fmt::Display) -> String {
+    format!(
+        "{label:<CHECK_LABEL_WIDTH$} {value}\n",
+        label = format!("{label}:")
+    )
+}
+
+/// stdout for `config init`.
+pub fn config_init(path: &Path, format: Format) -> String {
+    let text = match format {
+        Format::Json => serde_json::json!({ "config": path.display().to_string() }).to_string(),
+        Format::Text => format!("wrote {}\n", path.display()),
+    };
+    Redactor::new().redact(&text)
+}
+
+/// stdout for `config info`: the four catalogs as tables.
+pub fn config_info(settings: &Settings, format: Format) -> Result<String, Error> {
+    let tools = reviewbot::tool::inventory(settings)?;
+    let text = match format {
+        Format::Json => serde_json::json!({
+            "config": settings.config_path.display().to_string(),
+            "log": settings.config.log,
+            "platforms": platform_values(settings),
+            "providers": provider_values(settings),
+            "models": model_values(settings),
+            "triage": settings.config.triage,
+            "review": settings.config.review,
+            "security": settings.config.security,
+            "tools": tools,
+        })
+        .to_string(),
+        Format::Text => text_info(settings, &tools),
+    };
+    Ok(Redactor::new().redact(&text))
+}
+
+fn text_info(settings: &Settings, tools: &[reviewbot::tool::ToolListing]) -> String {
+    format!(
+        "{}\n{}\n{}\n{}",
+        platform_table(settings),
+        provider_table(settings),
+        model_table(settings),
+        tool_table(tools),
+    )
 }
 
 pub fn run_list(runs_dir: &Path, format: Format) -> Result<String, Error> {
@@ -314,74 +364,76 @@ pub fn run_show(runs_dir: &Path, run_id: &str, format: Format) -> Result<String,
 }
 
 pub fn run_prune(report: &reviewbot::record::PruneReport, format: Format) -> String {
+    let pruned = report.deleted.len();
     let text = match format {
-        Format::Json => serde_json::to_string_pretty(report)
-            .unwrap_or_else(|error| format!("{{\"error\":\"{error}\"}}")),
-        Format::Text => {
-            let mut out = format!("runs_dir  {}\n", report.runs_dir.display());
-            out.push_str(&format!("keep      {}\n", report.keep));
+        Format::Json => {
+            let mut value = serde_json::json!({
+                "pruned": pruned,
+                "keep_latest": report.keep,
+                "deleted": report.deleted,
+            });
             if report.dry_run {
-                out.push_str("dry_run   true (nothing deleted)\n");
+                value["dry_run"] = serde_json::json!(true);
             }
-            out.push_str(&format!("kept      {}\n", report.kept.join(", ")));
-            if report.deleted.is_empty() {
-                out.push_str("deleted   (none)\n");
-            } else {
-                out.push_str(&format!("deleted   {}\n", report.deleted.join(", ")));
-            }
-            out
+            value.to_string()
         }
+        Format::Text => format!(
+            "{}\n",
+            prune_sentence(pruned, report.kept.len(), report.dry_run)
+        ),
     };
     Redactor::new().redact(&text)
 }
 
-/// Which hosts this config can review, and where each one's token comes
-/// from. The token column is the *source*, never the credential: an inline
-/// secret is refused at parse time, so there is nothing here to leak.
-pub fn platform_list(settings: &Settings, format: Format) -> Result<String, Error> {
-    let platforms: Vec<serde_json::Value> = settings
+fn prune_sentence(pruned: usize, kept: usize, dry_run: bool) -> String {
+    let prune = if dry_run { "would prune" } else { "pruned" };
+    let deleted = match pruned {
+        0 => "no runs".to_string(),
+        1 => "1 run".to_string(),
+        n => format!("{n} runs"),
+    };
+    let recent = match kept {
+        0 => "none".to_string(),
+        1 => "the most recent run".to_string(),
+        n => format!("the {n} most recent"),
+    };
+    format!("{prune} {deleted}, retaining {recent}.")
+}
+
+/// Which API endpoints this config can review, and where each one's token
+/// comes from. The token column is the *source*, never the credential: an
+/// inline secret is refused at parse time, so there is nothing here to leak.
+fn platform_values(settings: &Settings) -> Vec<serde_json::Value> {
+    settings
         .config
         .platforms
         .iter()
         .map(|platform| {
             serde_json::json!({
-                "host": platform.host,
-                "kind": platform.resolved_kind().map(|kind| kind.as_str()),
+                "host": platform.host(),
+                "kind": platform.kind().map(|kind| kind.as_str()),
                 "base_url": platform.base_url,
                 "api_token": platform.api_token,
             })
         })
+        .collect()
+}
+
+fn platform_table(settings: &Settings) -> String {
+    let rows: Vec<Vec<String>> = settings
+        .config
+        .platforms
+        .iter()
+        .map(|platform| vec![platform.base_url.clone(), platform.api_token.clone()])
         .collect();
-    let text = match format {
-        Format::Json => serde_json::json!({ "platforms": platforms }).to_string(),
-        Format::Text => {
-            let rows: Vec<Vec<String>> = settings
-                .config
-                .platforms
-                .iter()
-                .map(|platform| {
-                    vec![
-                        platform.host.clone(),
-                        platform
-                            .resolved_kind()
-                            .map(|kind| kind.as_str().to_string())
-                            .unwrap_or_else(|| "-".to_string()),
-                        platform.base_url.clone(),
-                        platform.api_token.clone(),
-                    ]
-                })
-                .collect();
-            pad_table(&["HOST", "KIND", "BASE URL", "TOKEN FROM"], &rows)
-        }
-    };
-    Ok(Redactor::new().redact(&text))
+    catalog_table("PLATFORMS", &["BASE_URL", "TOKEN_FROM"], &rows)
 }
 
 /// Which vendors this config can call, and what each one is allowed to
 /// spend. The budget is per run, not per month: `-1` is no ceiling and `0`
 /// spends nothing, and both are worth being able to read off a table.
-pub fn provider_list(settings: &Settings, format: Format) -> Result<String, Error> {
-    let providers: Vec<serde_json::Value> = settings
+fn provider_values(settings: &Settings) -> Vec<serde_json::Value> {
+    settings
         .config
         .providers
         .iter()
@@ -395,31 +447,29 @@ pub fn provider_list(settings: &Settings, format: Format) -> Result<String, Erro
                 "api_key": provider.api_key,
             })
         })
+        .collect()
+}
+
+fn provider_table(settings: &Settings) -> String {
+    let rows: Vec<Vec<String>> = settings
+        .config
+        .providers
+        .iter()
+        .map(|provider| {
+            vec![
+                provider.name.clone(),
+                provider.protocol.clone(),
+                provider.base_url.clone(),
+                budget(provider.budget_per_run, &provider.currency),
+                provider.api_key.clone(),
+            ]
+        })
         .collect();
-    let text = match format {
-        Format::Json => serde_json::json!({ "providers": providers }).to_string(),
-        Format::Text => {
-            let rows: Vec<Vec<String>> = settings
-                .config
-                .providers
-                .iter()
-                .map(|provider| {
-                    vec![
-                        provider.name.clone(),
-                        provider.protocol.clone(),
-                        provider.base_url.clone(),
-                        budget(provider.budget_per_run, &provider.currency),
-                        provider.api_key.clone(),
-                    ]
-                })
-                .collect();
-            pad_table(
-                &["NAME", "PROTOCOL", "BASE URL", "BUDGET/RUN", "KEY FROM"],
-                &rows,
-            )
-        }
-    };
-    Ok(Redactor::new().redact(&text))
+    catalog_table(
+        "PROVIDERS",
+        &["NAME", "PROTOCOL", "BASE_URL", "BUDGET_PER_RUN", "KEY_FROM"],
+        &rows,
+    )
 }
 
 /// `-1` and `0` are both real settings and neither reads as an amount, so
@@ -434,14 +484,9 @@ fn budget(value: f64, currency: &str) -> String {
     money(value, currency, 2)
 }
 
-pub fn model_list(settings: &Settings, format: Format) -> Result<String, Error> {
-    let default_name = settings
-        .config
-        .models
-        .iter()
-        .find(|model| model.default)
-        .map(|model| model.name.as_str());
-    let models: Vec<serde_json::Value> = settings
+fn model_values(settings: &Settings) -> Vec<serde_json::Value> {
+    let default_name = default_model_name(settings);
+    settings
         .config
         .models
         .iter()
@@ -460,208 +505,74 @@ pub fn model_list(settings: &Settings, format: Format) -> Result<String, Error> 
                 "default": default_name == Some(model.name.as_str()),
             })
         })
-        .collect();
-    let text = match format {
-        Format::Json => serde_json::json!({ "models": models }).to_string(),
-        Format::Text => {
-            let rows: Vec<Vec<String>> = settings
-                .config
-                .models
-                .iter()
-                .map(|model| {
-                    let currency = currency_of(settings, &model.provider);
-                    let cached = model
-                        .cached_input_per_1m_tokens
-                        .map(|value| money(value, currency, 2))
-                        .unwrap_or_else(|| "-".to_string());
-                    let is_default = default_name == Some(model.name.as_str());
-                    vec![
-                        model.name.clone(),
-                        model.alias.clone().unwrap_or_else(|| "-".to_string()),
-                        model.provider.clone(),
-                        money(model.input_per_1m_tokens, currency, 2),
-                        cached,
-                        money(model.output_per_1m_tokens, currency, 2),
-                        model.context_window_tokens.to_string(),
-                        model.max_output_tokens.to_string(),
-                        if is_default { "yes" } else { "no" }.to_string(),
-                    ]
-                })
-                .collect();
-            pad_table(
-                &[
-                    "NAME",
-                    "ALIAS",
-                    "PROVIDER",
-                    "IN/1M",
-                    "CACHED/1M",
-                    "OUT/1M",
-                    "CONTEXT",
-                    "MAX OUT",
-                    "DEFAULT",
-                ],
-                &rows,
-            )
-        }
-    };
-    Ok(Redactor::new().redact(&text))
+        .collect()
 }
 
-/// The contract of every tool this config offers: what it is for, how it is
-/// called, what each argument is, which rounds it appears on, and what a run's
-/// worktree has to be able to do before a call can be answered.
-///
-/// Every tool is offered to the model on every run, so there is nothing here
-/// about a tool being present or absent. What varies is whether a given run
-/// can answer it, and that is a fact about one invocation of `review` — which
-/// worktree it got, which platform — while this command reviews nothing. So it
-/// prints the preconditions instead of a verdict.
-pub fn tool_list(settings: &Settings, format: Format) -> Result<String, Error> {
-    let rows = reviewbot::tool::inventory(settings)?;
-    let text = match format {
-        Format::Json => serde_json::json!({ "tools": rows }).to_string(),
-        Format::Text => {
-            let mut out = String::new();
-            for purpose in [Purpose::Content, Purpose::Check, Purpose::Delivery] {
-                out.push_str(&format!("{}\n\n", purpose.as_str()));
-                let group: Vec<_> = rows.iter().filter(|row| row.purpose == purpose).collect();
-                if group.is_empty() {
-                    out.push_str("(none)\n\n");
-                }
-                for row in group {
-                    out.push_str(&format_tool_row(row));
-                }
-            }
-            out
-        }
-    };
-    Ok(Redactor::new().redact(&text))
-}
-
-fn format_tool_row(row: &reviewbot::tool::ToolListing) -> String {
-    let mut out = format!("{}({})\n", row.name, call_arguments(&row.parameters));
-    out.push_str(&format!("  {}\n", row.description));
-    let rounds: Vec<&str> = row.rounds.iter().map(|round| round.as_str()).collect();
-    out.push_str(&format!("  rounds    {}\n", rounds.join(", ")));
-    if !row.preconditions.is_empty() {
-        out.push_str(&format!("  needs     {}\n", row.preconditions.join("; ")));
-    }
-    let declared = parameters_of(&row.parameters);
-    // Padded to the widest name in this tool, so a long one still gets a gap
-    // rather than running into its own type.
-    let width = declared
+fn model_table(settings: &Settings) -> String {
+    let default_name = default_model_name(settings);
+    let rows: Vec<Vec<String>> = settings
+        .config
+        .models
         .iter()
-        .map(|parameter| parameter.name.chars().count())
-        .max()
-        .unwrap_or(0);
-    for parameter in &declared {
-        out.push_str(&format!(
-            "  {:<width$}  {}{}\n",
-            parameter.name,
-            parameter.kind,
-            match parameter.description.is_empty() {
-                true => String::new(),
-                false => format!("  {}", parameter.description),
-            }
-        ));
-    }
-    out.push('\n');
-    out
-}
-
-/// The call as the model writes it: required names, then optionals in brackets.
-fn call_arguments(parameters: &serde_json::Value) -> String {
-    let declared = parameters_of(parameters);
-    let required: Vec<&str> = declared
-        .iter()
-        .filter(|parameter| parameter.required)
-        .map(|parameter| parameter.name.as_str())
+        .map(|model| {
+            let currency = currency_of(settings, &model.provider);
+            let cached = model
+                .cached_input_per_1m_tokens
+                .map(|value| money(value, currency, 2))
+                .unwrap_or_else(|| "-".to_string());
+            let is_default = default_name == Some(model.name.as_str());
+            vec![
+                model.name.clone(),
+                model.alias.clone().unwrap_or_else(|| "-".to_string()),
+                model.provider.clone(),
+                money(model.input_per_1m_tokens, currency, 2),
+                cached,
+                money(model.output_per_1m_tokens, currency, 2),
+                model.context_window_tokens.to_string(),
+                model.max_output_tokens.to_string(),
+                if is_default { "yes" } else { "no" }.to_string(),
+            ]
+        })
         .collect();
-    let optional: Vec<&str> = declared
-        .iter()
-        .filter(|parameter| !parameter.required)
-        .map(|parameter| parameter.name.as_str())
-        .collect();
-    match (required.is_empty(), optional.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => required.join(", "),
-        (true, false) => format!("[{}]", optional.join(", ")),
-        (false, false) => format!("{}, [{}]", required.join(", "), optional.join(", ")),
-    }
-}
-
-/// One row per declared argument, read back out of the schema the tool
-/// published rather than out of a second list kept here.
-struct DeclaredParameter {
-    name: String,
-    kind: String,
-    required: bool,
-    description: String,
-}
-
-fn parameters_of(parameters: &serde_json::Value) -> Vec<DeclaredParameter> {
-    let Some(properties) = parameters
-        .get("properties")
-        .and_then(|value| value.as_object())
-    else {
-        return Vec::new();
-    };
-    let required: Vec<&str> = parameters
-        .get("required")
-        .and_then(|value| value.as_array())
-        .map(|items| items.iter().filter_map(|item| item.as_str()).collect())
-        .unwrap_or_default();
-    let declare = |name: &String| DeclaredParameter {
-        name: name.clone(),
-        kind: properties
-            .get(name)
-            .map(describe_kind)
-            .unwrap_or_else(|| "value".to_string()),
-        required: required.iter().any(|need| need == name),
-        description: properties
-            .get(name)
-            .and_then(|property| property.get("description"))
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .to_string(),
-    };
-    // Required ones first, in the order the tool declared them, so the rows
-    // read in the same order as the call signature above them.
-    let mut rows: Vec<DeclaredParameter> = required
-        .iter()
-        .filter(|name| properties.contains_key(**name))
-        .map(|name| declare(&name.to_string()))
-        .collect();
-    rows.extend(
-        properties
-            .keys()
-            .filter(|name| !required.iter().any(|need| need == *name))
-            .map(declare),
-    );
-    rows
-}
-
-fn describe_kind(property: &serde_json::Value) -> String {
-    let kind = property
-        .get("type")
-        .and_then(|value| value.as_str())
-        .unwrap_or("value");
-    let inner = match kind {
-        "array" => property
-            .get("items")
-            .map(|items| format!(" of {}", describe_kind(items))),
-        _ => None,
-    };
-    let bounds = match (property.get("minimum"), property.get("maximum")) {
-        (Some(low), Some(high)) => Some(format!(" {low}-{high}")),
-        (Some(low), None) => Some(format!(" {low} or more")),
-        _ => None,
-    };
-    format!(
-        "{kind}{}{}",
-        inner.unwrap_or_default(),
-        bounds.unwrap_or_default()
+    catalog_table(
+        "MODELS",
+        &[
+            "NAME",
+            "ALIAS",
+            "PROVIDER",
+            "IN_1M",
+            "CACHED_1M",
+            "OUT_1M",
+            "CONTEXT",
+            "MAX_OUT",
+            "DEFAULT",
+        ],
+        &rows,
     )
+}
+
+fn default_model_name(settings: &Settings) -> Option<&str> {
+    settings
+        .config
+        .models
+        .iter()
+        .find(|model| model.default)
+        .map(|model| model.name.as_str())
+}
+
+fn tool_table(tools: &[reviewbot::tool::ToolListing]) -> String {
+    let rows: Vec<Vec<String>> = tools
+        .iter()
+        .map(|row| {
+            let rounds: Vec<&str> = row.rounds.iter().map(|round| round.as_str()).collect();
+            vec![
+                row.name.clone(),
+                row.purpose.as_str().to_string(),
+                rounds.join(", "),
+            ]
+        })
+        .collect();
+    catalog_table("TOOLS", &["NAME", "PURPOSE", "ROUNDS"], &rows)
 }
 
 fn currency_of<'a>(settings: &'a Settings, provider: &str) -> &'a str {
@@ -711,7 +622,7 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
     (year, month, day)
 }
 
-fn pad_table(headers: &[&str], rows: &[Vec<String>]) -> String {
+fn column_widths(headers: &[&str], rows: &[Vec<String>]) -> Vec<usize> {
     let mut widths: Vec<usize> = headers
         .iter()
         .map(|header| header.chars().count())
@@ -723,6 +634,22 @@ fn pad_table(headers: &[&str], rows: &[Vec<String>]) -> String {
             }
         }
     }
+    widths
+}
+
+/// One catalog: the name, then a boxed grid of the column header and body.
+fn catalog_table(title: &str, headers: &[&str], rows: &[Vec<String>]) -> String {
+    let mut table = Table::new();
+    table
+        .load_style(ASCII_FULL_CONDENSED)
+        .set_content_arrangement(ContentArrangement::Disabled)
+        .set_header(headers)
+        .add_rows(rows.iter().cloned());
+    format!("{title}\n{table}\n")
+}
+
+fn pad_table(headers: &[&str], rows: &[Vec<String>]) -> String {
+    let widths = column_widths(headers, rows);
     let mut out = String::new();
     push_padded_row(&mut out, headers.iter().copied(), &widths);
     for row in rows {
@@ -762,45 +689,51 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reviewbot::tool::{Round, ToolListing};
-    use serde_json::json;
 
-    /// The row is the tool's contract: how it is called, what each argument
-    /// is, which rounds offer it, and what a run's worktree needs to be able
-    /// to do before a call can be answered. Never a verdict — whether this
-    /// run can answer it is a fact about one review, and this command reviews
-    /// nothing.
     #[test]
-    fn a_tool_row_prints_the_contract_rather_than_a_registration_verdict() {
-        let row = ToolListing {
-            name: "search_code".to_string(),
-            purpose: Purpose::Content,
-            description: "Search the code of this run's worktree.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "What to search for"},
-                    "glob": {"type": "string"},
-                },
-                "required": ["query"],
-            }),
-            rounds: vec![Round::Investigation],
-            preconditions: vec!["the worktree can answer a search".to_string()],
-        };
-        let text = format_tool_row(&row);
-        assert!(text.starts_with("search_code(query, [glob])"), "{text}");
-        assert!(
-            text.contains("Search the code of this run's worktree."),
-            "{text}"
+    fn a_catalog_is_a_boxed_table() {
+        let text = catalog_table(
+            "T",
+            &["A", "BB"],
+            &[vec!["ccc".to_string(), "d".to_string()]],
         );
-        assert!(text.contains("rounds    investigation"), "{text}");
-        assert!(
-            text.contains("needs     the worktree can answer a search"),
-            "{text}"
+        assert_eq!(
+            text,
+            "T\n\
+             +-----+----+\n\
+             | A   | BB |\n\
+             +==========+\n\
+             | ccc | d  |\n\
+             +-----+----+\n"
         );
-        assert!(text.contains("query"), "{text}");
-        assert!(text.contains("What to search for"), "{text}");
-        assert!(!text.contains("registered"), "{text}");
+    }
+
+    #[test]
+    fn prune_is_one_sentence_and_zero_is_nothing() {
+        assert_eq!(
+            prune_sentence(0, 0, false),
+            "pruned no runs, retaining none."
+        );
+        assert_eq!(
+            prune_sentence(1, 2, false),
+            "pruned 1 run, retaining the 2 most recent."
+        );
+        assert_eq!(
+            prune_sentence(3, 0, false),
+            "pruned 3 runs, retaining none."
+        );
+        assert_eq!(
+            prune_sentence(0, 2, false),
+            "pruned no runs, retaining the 2 most recent."
+        );
+        assert_eq!(
+            prune_sentence(1, 2, true),
+            "would prune 1 run, retaining the 2 most recent."
+        );
+        assert_eq!(
+            prune_sentence(0, 0, true),
+            "would prune no runs, retaining none."
+        );
     }
 
     /// The line is printed to be pasted, so a word the shell would read as
@@ -899,5 +832,18 @@ mod tests {
     fn money_puts_the_currency_after_the_amount() {
         assert_eq!(money(3.0, "CNY", 2), "3.00 CNY");
         assert_eq!(money(0.0316, "", 4), "0.0316");
+    }
+
+    #[test]
+    fn check_fields_align_to_the_credential_label() {
+        assert_eq!(
+            check_field("Path", "/tmp/c.toml"),
+            "Path:       /tmp/c.toml\n"
+        );
+        assert_eq!(
+            check_field("Credential", "readable"),
+            "Credential: readable\n"
+        );
+        assert_eq!(check_field("Tools", 2), "Tools:      2\n");
     }
 }

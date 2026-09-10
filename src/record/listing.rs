@@ -19,7 +19,7 @@ pub struct CommentCount {
     pub count: usize,
 }
 
-/// How many newest runs `run prune` keeps when `--keep` is omitted.
+/// How many newest runs `run prune` keeps when `--keep-latest` is omitted.
 /// Written into the command line, not the config: changing it must not
 /// invalidate fingerprints. Zero means delete every run.
 pub const DEFAULT_KEEP: usize = 0;
@@ -121,6 +121,37 @@ pub fn list_runs(runs_dir: &Path) -> Result<Vec<RunRow>, RecordError> {
         rows.push(row_from_dir(&directory)?);
     }
     Ok(rows)
+}
+
+/// Delete one run directory. A missing id is an error, not a no-op.
+pub fn remove_run(runs_dir: &Path, run_id: &str) -> Result<(), RecordError> {
+    if !is_run_id(run_id) {
+        return Err(RecordError::RunNotFound {
+            run_id: run_id.to_string(),
+            runs_dir: runs_dir.to_path_buf(),
+        });
+    }
+    let directory = runs_dir.join(run_id);
+    if !directory.is_dir() {
+        return Err(RecordError::RunNotFound {
+            run_id: run_id.to_string(),
+            runs_dir: runs_dir.to_path_buf(),
+        });
+    }
+    fs::remove_dir_all(&directory).map_err(|source| RecordError::Io {
+        path: directory,
+        source,
+    })?;
+    Ok(())
+}
+
+/// A run id is one directory name. A slash would walk out of `runs_dir`.
+fn is_run_id(run_id: &str) -> bool {
+    !run_id.is_empty()
+        && run_id != "."
+        && run_id != ".."
+        && !run_id.contains('/')
+        && !run_id.contains('\\')
 }
 
 pub fn show_run(runs_dir: &Path, run_id: &str) -> Result<RunShow, RecordError> {
@@ -315,6 +346,27 @@ mod tests {
         assert_eq!(done.deleted.len(), 2);
         assert!(!runs.join("old").exists());
         assert!(!runs.join("new").exists());
+    }
+
+    #[test]
+    fn remove_deletes_one_run_and_refuses_a_missing_id() {
+        let root = tempfile::tempdir().expect("temp");
+        let runs = root.path().join("runs");
+        fs::create_dir_all(runs.join("keep")).expect("keep");
+        fs::create_dir_all(runs.join("gone")).expect("gone");
+        fs::write(runs.join("gone").join(layout::REPORT), b"gone").expect("report");
+
+        remove_run(&runs, "gone").expect("removed");
+        assert!(!runs.join("gone").exists());
+        assert!(runs.join("keep").is_dir());
+        assert!(matches!(
+            remove_run(&runs, "gone"),
+            Err(RecordError::RunNotFound { .. })
+        ));
+        assert!(matches!(
+            remove_run(&runs, "../keep"),
+            Err(RecordError::RunNotFound { .. })
+        ));
     }
 
     #[test]

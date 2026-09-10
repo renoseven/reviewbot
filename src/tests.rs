@@ -63,7 +63,6 @@ context_window_tokens = 131072
 max_output_tokens = 8192
 
 [[platform]]
-host = "gitlab.com"
 base_url = "https://gitlab.com/api/v4"
 api_token = "GITLAB_TOKEN"
 "#;

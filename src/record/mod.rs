@@ -22,7 +22,7 @@ use crate::domain::Stage;
 
 pub use listing::{
     DEFAULT_KEEP, PruneReport, RunRow, RunShow, WARN_AFTER_RUNS, count_runs, list_run_dirs,
-    list_runs, prune_runs, show_run,
+    list_runs, prune_runs, remove_run, show_run,
 };
 pub use lock::DirLock;
 pub use meta::{InputKind, InputRecord, Meta, RunIdentity};

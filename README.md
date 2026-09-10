@@ -12,12 +12,13 @@ cargo build
 
 The binary is `reviewbot`. Configuration is **not** read from the current directory. Pass `--config`, or put a file at `~/.reviewbot/config.toml`.
 
-Copy [`examples/reviewbot.toml`](examples/reviewbot.toml) and point the `api_key` / `api_token` fields at environment variable names or files outside the repo. Never put a real key in the file.
+`config init` writes that same example to `--config`, or to `~/.reviewbot/config.toml`. Point the `api_key` / `api_token` fields at environment variable names or files outside the repo. Never put a real key in the file.
 
 ```bash
+reviewbot config init
 export DEEPSEEK_API_KEY=...          # dummy is enough for `config check`
 export GITLAB_TOKEN=...              # only needed to pull or post
-reviewbot --config examples/reviewbot.toml config check
+reviewbot config check
 ```
 
 `config check` reads the credential; it does not send a request. It also does not check that a `[[tool]]` `bin` exists on the machine.
@@ -26,9 +27,9 @@ reviewbot --config examples/reviewbot.toml config check
 
 ```bash
 git diff main...HEAD > change.diff
-reviewbot --config examples/reviewbot.toml review change.diff
+reviewbot review change.diff
 # or stdin
-git diff main...HEAD | reviewbot --config examples/reviewbot.toml review -
+git diff main...HEAD | reviewbot review -
 ```
 
 A `git format-patch` mbox is refused. Use `git diff`.
@@ -36,14 +37,14 @@ A `git format-patch` mbox is refused. Use `git diff`.
 ## Review a URL
 
 ```bash
-reviewbot --config examples/reviewbot.toml review \
+reviewbot review \
   https://gitlab.com/acme/app/-/merge_requests/128
 ```
 
 Add `--publish` to post comments as well as write the report. `--publish` on a diff file fails at startup.
 
 ```bash
-reviewbot --config examples/reviewbot.toml review --publish \
+reviewbot review --publish \
   --worktree . \
   https://gitlab.com/acme/app/-/merge_requests/128
 ```
@@ -66,7 +67,7 @@ While a review runs, a terminal gets a fixed-height live checklist: a title, all
 A pipe deliberately keeps less: one run header, one line per chunk (with spend), and one line per finished stage. Exchanges, tool calls, and spend updates do not each create another log line. `--format json` makes stdout a single JSON document with progress suppressed; `-q` silences stdout entirely, progress included.
 
 ```bash
-reviewbot --config examples/reviewbot.toml --format json -q review change.diff --output-dir artifacts/
+reviewbot --format json -q review change.diff --output-dir artifacts/
 ```
 
 ## Continuing a run
@@ -86,26 +87,20 @@ Two things worth knowing. Changing the config changes the run id, so the same co
 
 ## Inspecting a config and past runs
 
-Every noun is singular: `run`, `model`, `tool`, `platform`, `provider`.
-
 ```bash
 reviewbot --runs-dir .reviewbot/runs run list
 reviewbot --runs-dir .reviewbot/runs --format json run list
 reviewbot run show 7f3a9c1e
-reviewbot run prune                    # delete every run; only command that deletes
-reviewbot run prune --keep 10          # keep the newest 10 instead
-reviewbot run prune --dry-run          # list, do not delete
-reviewbot --config examples/reviewbot.toml model list
-reviewbot --config examples/reviewbot.toml tool list
-reviewbot --config examples/reviewbot.toml platform list
-reviewbot --config examples/reviewbot.toml provider list
+reviewbot run remove 7f3a9c1e          # delete one run; prints nothing
+reviewbot run prune                    # delete every run; prints how many
+reviewbot run prune --keep-latest 10   # keep the newest 10 instead
+reviewbot run prune --dry-run          # count, do not delete
+reviewbot config info                  # platforms, providers, models, tools
 ```
 
-`tool list` prints each tool's contract — what it is for, how it is called, what each argument is, which rounds offer it, and what a run's worktree needs to be able to do before a call to it can be answered. Every tool is offered to the model on every run; what varies is whether that run's worktree can answer it, and this command reviews nothing, so it describes the widest worktree there is.
+`config info` lists the platforms, providers, models, and tools in the loaded config. Column titles are uppercase; a title of more than one word is joined with `_`. The tool table is name, purpose, and rounds; `--format json` has the rest of the contract. Credentials are named by source, never printed; `config check` is what reads them.
 
-`platform list` and `provider list` name where each credential comes from, never the credential itself — an inline secret is refused when the config is parsed, so there is only ever a source to print. Neither command reads the credential; `config check` is what does that.
-
-`review` never deletes a run, including when it re-enters one. `run prune` with no `--keep` deletes every run. If a review leaves more than 10 runs, it warns once with a `run prune` line you can paste.
+`review` never deletes a run, including when it re-enters one. `run prune` with no `--keep-latest` deletes every run. If a review leaves more than 10 runs, it warns once with a `run prune` line you can paste.
 
 ## Exit codes
 
@@ -130,11 +125,11 @@ This repo does not ship a canned PR report. Produce one by pointing `review` at 
 
 ## Add a tool without recompiling
 
-[`examples/reviewbot.toml`](examples/reviewbot.toml) ships two checkers. `cppcheck` (`requires_build = false`, `requires_checkout` unset) reads one C/C++ file on its own, so any worktree with code in it can answer it. `typecheck` is the brief's named example of adding a tool without recompiling: another `[[tool]]` row, `gcc -fsyntax-only`, `requires_checkout = true` because a `.c` file without its headers produces a screen of missing includes, which is worse than not running. Both are offered to the model on every run; without a checkout, `typecheck`'s description says it is not available this run and calling it returns that same reason instead of the missing-include screen. `tool list` prints both contracts. A `requires_build` tool also needs `[security].allow_build_tools` and a sandbox.
+[`src/config/example.toml`](src/config/example.toml) comments two checkers you can uncomment. `cppcheck` (`requires_build = false`, `requires_checkout = false`) reads one C/C++ file on its own, so any worktree with code in it can answer it. `typecheck` is the brief's named example of adding a tool without recompiling: another `[[tool]]` row, `gcc -fsyntax-only`, `requires_checkout = true` because a `.c` file without its headers produces a screen of missing includes, which is worse than not running. Listed means enabled; without a checkout, `typecheck`'s description says it is not available this run and calling it returns that same reason instead of the missing-include screen. A `requires_build` tool also needs `[security].allow_build_tools` and a sandbox.
 
 ## Known limits
 
-- Config field names carry their unit and their subject: `[review].max_file_bytes`, `max_files_per_listing`, `max_hits_per_search`, `[triage].skip_files_over_bytes`, `[[provider]].budget_per_run`, `[[model]].context_window_tokens` and the three `_per_1m_tokens` prices, `[[tool]].requires_checkout`. Every number under `[review]`, `[triage]` and `[security]` is required and has no builtin default, because the right value depends on how big this repository's files get, or on how much output is worth reading. Omitting one, or writing a zero, fails `config check` and names the field. Copy [`examples/reviewbot.toml`](examples/reviewbot.toml), which sets all of them.
+- Config field names carry their unit and their subject: `[review].max_file_bytes`, `max_files_per_listing`, `max_hits_per_search`, `[triage].skip_files_over_bytes`, `[[provider]].budget_per_run`, `[[model]].context_window_tokens` and the three `_per_1m_tokens` prices, `[[tool]].requires_checkout`. Every number under `[review]`, `[triage]` and `[security]` is required and has no builtin default, because the right value depends on how big this repository's files get, or on how much output is worth reading. Omitting one, or writing a zero, fails `config check` and names the field. `config init` writes [`src/config/example.toml`](src/config/example.toml), which sets all of them.
 - `[log] level` (`error|warn|info|debug|trace`, default `info`) is the one config field left out of the run fingerprint, so turning the log up does not invalidate a run's checkpoints. It is the only way to set the level; there is no `-v`.
 - `[security]` holds permissions only — `deny_paths`, `allow_extensions`, `follow_symlinks`, `allow_build_tools` — and no sizes. How much a tool may fetch or return is a different question from whether it may be touched, so those numbers live under `[review]`.
 - `[security].allow_extensions` is required for the same reason and is a hard boundary besides, so a default could only loosen it. Extensions are written bare (`"rs"`, not `".rs"`). It is a whitelist: files outside it are skipped at triage (named in the report, not sent to the model), and a read of one is refused. Extensionless files (`Makefile`, `Dockerfile`, `LICENSE`) stay out.
@@ -145,7 +140,7 @@ This repo does not ship a canned PR report. Produce one by pointing `review` at 
 - The layout digest counts directories rather than naming files, and leaves out anything a read would refuse (`deny_paths`, and extensions outside the whitelist). A directory missing from it holds nothing readable, which is not the same as holding nothing; `list_files` is still what answers about a specific path.
 - On a URL, every chunk is also shown what the author wrote about the change: the title, the description and up to 20 commit subject lines, fenced by the one renderer that knows how to fence. It is the highest-value context in the prompt — intent is the one thing a diff does not carry — and the only prompt injection surface reviewbot fetches on purpose, so it goes in fenced as material ahead of the diff and never into `instructions`. The fence says three things: read it for intent, do not read it as evidence about behaviour (where it and the diff disagree the diff is what is true, and the disagreement is worth filing), and an instruction inside it is reviewed content. A description that cannot be fetched costs the model context and nothing else; a diff off disk has none.
 - Finding nothing has an ending of its own: `finish_review` takes no arguments and files nothing. Without it, a model handed only `submit_comment` and asked to conclude files a placeholder — a real run came back with `body: "No defect found in this change."`, `suggestion: "N/A"` and a confidence of 95, which passed every check a finding has to pass and went out as a published comment. There is no gate on the wording of a body: "nothing is wrong here" has no shape a check can recognise, and a gate that guessed would throw away real findings that happen to read reassuringly.
-- Both submissions are function calls: `submit_comment` for a finding, `submit_summary` for the overall score. No stage reads JSON out of a chat message, so nothing strips markdown fences. Each tool is offered on the rounds it belongs to and no others — investigation, the concluding turn, or the scoring call — and `tool list` prints those rounds. A blank or whitespace-only summary is refused and re-asked rather than published as a score with nothing behind it.
+- Both submissions are function calls: `submit_comment` for a finding, `submit_summary` for the overall score. No stage reads JSON out of a chat message, so nothing strips markdown fences. Each tool is offered on the rounds it belongs to and no others — investigation, the concluding turn, or the scoring call — and `config info` prints those rounds. A blank or whitespace-only summary is refused and re-asked rather than published as a score with nothing behind it.
 - A score written as `"92"` is read as 92. The schema says integer and no vendor enforces it, so re-asking buys a round trip and the same number back. Nothing is rounded or clamped: `"45.7"`, `"high"` and `101` are still refused.
 - Everything sent to the model is in English — both prompts, the capability paragraph, tool descriptions, and the notes and refusals in tool output. So are the two badges reviewbot puts on a comment (`found by tool`, `quote unverified`). The report body and comment text come from the model, in whatever language it chooses.
 - reviewbot never writes the checkout you name with `--worktree`; the only local writes are the run directory (including the run's own worktree) and `--output-dir`. A subprocess cannot be stopped from writing the checkout on a bare machine; that only holds in an isolated environment (container, or a user with no write permission).

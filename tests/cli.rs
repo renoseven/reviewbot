@@ -14,7 +14,7 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 fn example_config() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/reviewbot.toml")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/config/example.toml")
 }
 
 fn reviewbot() -> Command {
@@ -38,7 +38,21 @@ fn config_check_validates_locally_and_writes_nothing_to_stderr() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("deepseek-v4-flash"), "{stdout}");
+    let path = fixture("valid.toml");
+    assert_eq!(
+        stdout,
+        format!(
+            "Path:       {}\n\
+             Provider:   deepseek\n\
+             Credential: readable\n\
+             Budget:     10.00 CNY\n\
+             Platforms:  1\n\
+             Models:     2\n\
+             Tools:      2\n\
+             ok\n",
+            path.display()
+        )
+    );
 }
 
 #[test]
@@ -289,10 +303,10 @@ fn run_list_json_is_an_object_with_runs_dir() {
 }
 
 #[test]
-fn model_list_json_is_parseable() {
+fn config_info_json_is_parseable() {
     let output = reviewbot()
         .args(["--config", fixture("valid.toml").to_str().unwrap()])
-        .args(["--format", "json", "model", "list"])
+        .args(["--format", "json", "config", "info"])
         .output()
         .expect("run");
 
@@ -302,27 +316,54 @@ fn model_list_json_is_parseable() {
     assert!(parsed["models"].is_array(), "{parsed}");
     assert_eq!(parsed["models"][0]["name"], "deepseek-v4-flash");
     assert_eq!(parsed["models"][0]["currency"], "CNY");
+    assert!(parsed["platforms"].is_array(), "{parsed}");
+    assert!(parsed["providers"].is_array(), "{parsed}");
+    assert!(parsed["tools"].is_array(), "{parsed}");
 }
 
 #[test]
-fn model_list_text_has_capital_headers_and_currency() {
+fn config_info_text_has_every_section_and_the_file_field_names() {
     let output = reviewbot()
         .args(["--config", fixture("valid.toml").to_str().unwrap()])
-        .args(["model", "list"])
+        .args(["config", "info"])
         .output()
         .expect("run");
 
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let header = stdout.lines().next().expect("header");
-    assert!(header.contains("NAME"), "{header}");
-    assert!(header.contains("IN/1M"), "{header}");
-    assert!(header.contains("CACHED/1M"), "{header}");
-    assert!(header.contains("OUT/1M"), "{header}");
-    assert!(header.contains("MAX OUT"), "{header}");
+    for heading in [
+        "PLATFORMS\n+",
+        "PROVIDERS\n+",
+        "MODELS\n+",
+        "TOOLS\n+",
+        "+-",
+        "BASE_URL",
+        "TOKEN_FROM",
+        "BUDGET_PER_RUN",
+        "KEY_FROM",
+        "IN_1M",
+        "CACHED_1M",
+        "OUT_1M",
+        "MAX_OUT",
+        "PURPOSE",
+        "ROUNDS",
+    ] {
+        assert!(
+            stdout.contains(heading),
+            "missing column {heading}: {stdout}"
+        );
+    }
     assert!(stdout.contains("3.00 CNY"), "{stdout}");
     assert!(stdout.contains("0.10 CNY"), "{stdout}");
     assert!(stdout.contains("9.00 CNY"), "{stdout}");
+    assert!(
+        !stdout.contains("BASE URL"),
+        "a multi-word title is joined with _: {stdout}"
+    );
+    assert!(
+        !stdout.contains("HOST") && !stdout.contains("KIND"),
+        "host and kind are derived, not columns: {stdout}"
+    );
 }
 
 #[test]
@@ -378,34 +419,31 @@ fn run_list_text_aligns_spent_with_currency_and_utc() {
 }
 
 #[test]
-fn tool_list_exits_zero_on_a_valid_config() {
+fn config_info_prints_tool_contracts_the_way_tool_list_did() {
     let output = reviewbot()
         .args(["--config", fixture("valid.toml").to_str().unwrap()])
-        .args(["tool", "list"])
+        .args(["config", "info"])
         .output()
         .expect("run");
 
     assert!(output.status.success(), "{output:?}");
     assert!(output.stderr.is_empty(), "success writes no stderr");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // Grouped by what a tool is for, and each row is a contract: the call, the
-    // description, the rounds that offer it, what a run needs first.
-    for heading in ["content", "check", "delivery"] {
-        assert!(stdout.contains(heading), "{stdout}");
-    }
-    assert!(stdout.contains("search_code(query, [glob])"), "{stdout}");
+    assert!(stdout.contains("NAME"), "{stdout}");
+    assert!(stdout.contains("PURPOSE"), "{stdout}");
+    assert!(stdout.contains("ROUNDS"), "{stdout}");
+    assert!(stdout.contains("search_code"), "{stdout}");
+    assert!(stdout.contains("read_file"), "{stdout}");
+    assert!(stdout.contains("cppcheck"), "{stdout}");
+    assert!(stdout.contains("typecheck"), "{stdout}");
+    assert!(stdout.contains("investigation"), "{stdout}");
+    assert!(stdout.contains("scoring"), "{stdout}");
+    assert!(!stdout.contains("NEEDS"), "needs stay in json: {stdout}");
+    assert!(!stdout.contains("ABOUT"), "about stays in json: {stdout}");
     assert!(
-        stdout.contains("read_file(path, [first_line, last_line])"),
-        "{stdout}"
+        !stdout.contains("Submit one finding"),
+        "descriptions stay in json: {stdout}"
     );
-    assert!(stdout.contains("cppcheck(path)"), "{stdout}");
-    assert!(stdout.contains("typecheck(path)"), "{stdout}");
-    assert!(stdout.contains("Submit one finding"), "{stdout}");
-    assert!(stdout.contains("rounds    investigation"), "{stdout}");
-    assert!(stdout.contains("rounds    scoring"), "{stdout}");
-    assert!(stdout.contains("needs     the worktree"), "{stdout}");
-    // Whether a tool registered is a fact about one review, and this command
-    // reviews nothing.
     assert!(!stdout.contains("registered"), "{stdout}");
 }
 
@@ -437,15 +475,28 @@ fn run_prune_dry_run_lists_and_does_not_delete() {
 
     let output = reviewbot()
         .args(["--runs-dir", runs.to_str().unwrap()])
-        .args(["run", "prune", "--keep", "2", "--dry-run"])
+        .args(["run", "prune", "--keep-latest", "2", "--dry-run"])
         .output()
         .expect("run");
 
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("old"), "{stdout}");
-    assert!(stdout.contains("dry_run"), "{stdout}");
+    assert_eq!(stdout, "would prune 1 run, retaining the 2 most recent.\n");
     assert!(runs.join("old").join("report.md").is_file());
+    assert!(runs.join("mid").is_dir());
+    assert!(runs.join("new").is_dir());
+
+    let done = reviewbot()
+        .args(["--runs-dir", runs.to_str().unwrap()])
+        .args(["run", "prune", "--keep-latest", "2"])
+        .output()
+        .expect("run");
+    assert!(done.status.success(), "{done:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&done.stdout),
+        "pruned 1 run, retaining the 2 most recent.\n"
+    );
+    assert!(!runs.join("old").exists());
     assert!(runs.join("mid").is_dir());
     assert!(runs.join("new").is_dir());
 }
@@ -454,7 +505,7 @@ fn run_prune_dry_run_lists_and_does_not_delete() {
 fn quiet_json_still_prints_json() {
     let output = reviewbot()
         .args(["--config", fixture("valid.toml").to_str().unwrap()])
-        .args(["-q", "--format", "json", "model", "list"])
+        .args(["-q", "--format", "json", "config", "info"])
         .output()
         .expect("run");
 
@@ -548,45 +599,93 @@ fn a_parse_error_is_set_off_like_every_other_error_and_help_is_not() {
 /// credential: an inline secret is refused at parse time, so a config that
 /// got this far has only a source to show.
 #[test]
-fn platform_list_names_the_host_and_the_token_source() {
+fn config_info_names_platform_hosts_and_provider_budgets() {
     let output = reviewbot()
         .args(["--config", fixture("valid.toml").to_str().unwrap()])
-        .args(["platform", "list"])
+        .args(["config", "info"])
         .output()
         .expect("run");
 
     assert!(output.status.success(), "{output:?}");
     assert!(output.stderr.is_empty(), "success writes no stderr");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.starts_with("HOST"), "{stdout}");
-    assert!(stdout.contains("TOKEN FROM"), "{stdout}");
+    assert!(stdout.contains("TOKEN_FROM"), "{stdout}");
     assert!(stdout.contains("gitlab.com"), "{stdout}");
     assert!(stdout.contains("gitlab"), "the resolved kind: {stdout}");
     assert!(stdout.contains("GITLAB_TOKEN"), "{stdout}");
+    assert!(stdout.contains("BUDGET_PER_RUN"), "{stdout}");
+    assert!(stdout.contains("10.00 CNY"), "{stdout}");
+
+    let json = reviewbot()
+        .args(["--config", fixture("valid.toml").to_str().unwrap()])
+        .args(["--format", "json", "config", "info"])
+        .output()
+        .expect("run");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("stdout is pure json");
+    assert_eq!(parsed["providers"][0]["protocol"], "openai");
+    assert_eq!(parsed["providers"][0]["currency"], "CNY");
+    assert_eq!(parsed["providers"][0]["api_key"], "DEEPSEEK_API_KEY");
 }
 
 #[test]
-fn provider_list_spells_out_the_budget_and_the_key_source() {
+fn config_init_writes_the_example_and_prints_the_path() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("nested").join("config.toml");
+
     let output = reviewbot()
-        .args(["--config", fixture("valid.toml").to_str().unwrap()])
-        .args(["--format", "json", "provider", "list"])
+        .args(["--config", path.to_str().unwrap()])
+        .args(["config", "init"])
         .output()
         .expect("run");
 
     assert!(output.status.success(), "{output:?}");
-    let parsed: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("stdout is pure json");
-    assert!(parsed["providers"].is_array(), "{parsed}");
-    assert_eq!(parsed["providers"][0]["protocol"], "openai");
-    assert_eq!(parsed["providers"][0]["currency"], "CNY");
-    assert_eq!(parsed["providers"][0]["api_key"], "DEEPSEEK_API_KEY");
+    assert!(output.stderr.is_empty(), "success writes no stderr");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(path.to_str().unwrap()), "{stdout}");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("written"),
+        reviewbot::config::EXAMPLE_CONFIG
+    );
 
-    let text = reviewbot()
-        .args(["--config", fixture("valid.toml").to_str().unwrap()])
-        .args(["provider", "list"])
+    let refused = reviewbot()
+        .args(["--config", path.to_str().unwrap()])
+        .args(["config", "init"])
         .output()
         .expect("run");
-    let stdout = String::from_utf8_lossy(&text.stdout);
-    assert!(stdout.contains("BUDGET/RUN"), "{stdout}");
-    assert!(stdout.contains("10.00 CNY"), "{stdout}");
+    assert_eq!(refused.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.starts_with("error: "),
+        "nothing was printed before this, so it is not set off: {stderr:?}"
+    );
+    assert!(stderr.contains("will not overwrite"), "{stderr}");
+}
+
+#[test]
+fn run_remove_deletes_one_run_and_prints_nothing() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let runs = directory.path().join("runs");
+    std::fs::create_dir_all(runs.join("keep")).expect("keep");
+    std::fs::create_dir_all(runs.join("gone")).expect("gone");
+    std::fs::write(runs.join("gone").join("report.md"), "gone").expect("report");
+
+    let output = reviewbot()
+        .args(["--runs-dir", runs.to_str().unwrap()])
+        .args(["run", "remove", "gone"])
+        .output()
+        .expect("run");
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "success writes no stdout");
+    assert!(output.stderr.is_empty(), "success writes no stderr");
+    assert!(!runs.join("gone").exists());
+    assert!(runs.join("keep").is_dir());
+
+    let missing = reviewbot()
+        .args(["--runs-dir", runs.to_str().unwrap()])
+        .args(["run", "remove", "gone"])
+        .output()
+        .expect("run");
+    assert_eq!(missing.status.code(), Some(2), "{missing:?}");
 }

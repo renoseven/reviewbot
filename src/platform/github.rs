@@ -40,14 +40,15 @@ pub struct GitHub {
 
 impl GitHub {
     pub fn new(entry: PlatformEntry, token: Secret, backoff: Backoff) -> Self {
+        let host = entry.host().unwrap_or("github.com").to_string();
         let http = Arc::new(HttpClient::new(
             entry.base_url.clone(),
-            entry.host.clone(),
+            host.clone(),
             token.expose(),
             backoff,
         ));
         let repo = Arc::new(GitHubRepo {
-            host: entry.host.clone(),
+            host,
             http: Arc::clone(&http),
             token: token.clone(),
             commit: Mutex::new(None),
@@ -243,7 +244,7 @@ impl Platform for GitHub {
     }
 
     fn host(&self) -> &str {
-        &self.entry.host
+        self.entry.host().unwrap_or("github.com")
     }
 
     /// The code search endpoint is always there. It indexes the default branch
@@ -751,8 +752,6 @@ mod tests {
     fn github(base_url: String) -> GitHub {
         GitHub::new(
             PlatformEntry {
-                kind: Some(PlatformKind::Github),
-                host: "github.com".to_string(),
                 base_url,
                 api_token: "GITHUB_TOKEN".to_string(),
             },
