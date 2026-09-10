@@ -42,6 +42,7 @@ use stage::report::{Report, ReportInput};
 use stage::review::{Review, ReviewOutput};
 use stage::triage::{SkippedFile, Triage, TriagePlan};
 use stage::{Adapters, StageContext, StageError};
+use worktree::WorktreeError;
 
 pub use config::{RunOptions, Settings as Configuration};
 pub use stage::input::Source;
@@ -134,9 +135,10 @@ pub enum Error {
 }
 
 impl Error {
-    /// 0 ok, 1 unexpected, 2 config, 3 budget, 4 platform or model, 5 publish
-    /// partly failed. The exit code says how reviewbot itself did; it never
-    /// encodes the review's conclusions.
+    /// 0 ok, 1 unexpected, 2 the config or something it names does not
+    /// resolve, 3 budget, 4 platform or model, 5 publish partly failed. The
+    /// exit code says how reviewbot itself did; it never encodes the
+    /// review's conclusions.
     pub fn exit_code(&self) -> i32 {
         match self {
             Error::InRun { source, .. } => source.exit_code(),
@@ -150,7 +152,22 @@ impl Error {
             ))
             // An mbox or a text file handed in as a diff is a broken input
             // reference, the same class as a URL that will not parse.
-            | Error::Stage(StageError::Diff(_)) => 2,
+            | Error::Stage(StageError::Diff(_))
+            // So is anything else named on the command line that does not
+            // resolve: a diff file that is not there, a run id nothing was
+            // ever written under, a `--worktree` that is not a checkout or
+            // is parked on the wrong commit. None of these is reviewbot
+            // breaking, and a CI job that branches on the exit code has to
+            // be able to tell the two apart.
+            | Error::Stage(StageError::UnreadableInput { .. })
+            | Error::Record(RecordError::RunNotFound { .. })
+            | Error::Stage(StageError::Record(RecordError::RunNotFound { .. }))
+            | Error::Stage(StageError::Worktree(
+                WorktreeError::NotADirectory { .. }
+                | WorktreeError::Unopenable { .. }
+                | WorktreeError::NoHead { .. }
+                | WorktreeError::HeadMismatch { .. },
+            )) => 2,
             Error::Config(_)
             | Error::Stage(StageError::Config(_))
             | Error::FingerprintMismatch { .. }

@@ -1497,17 +1497,32 @@ run  change.diff  model deepseek-v4-flash
 [6/6] publish   nothing posted: this run was not asked to publish
 run_id     9f4580b1f547aa00
 model      deepseek-v4-flash
-overall    not scored  (not scored: the run stopped before every chunk was reviewed ...)
+overall    not scored
 comments   0
 severity   critical 0 / major 0 / minor 0 / trivial 0
 confidence certain 0 / high 0 / medium 0 / low 0
 skipped    0 files
 unreviewed 1 files
-stopped    budget is 0 CNY: this run may not spend anything
 budget     0.0000 / 0.0000 CNY
 report     ./runs/9f4580b1f547aa00/report.md
 summary    ./runs/9f4580b1f547aa00/summary.json
+
+error: budget is 0 CNY: this run may not spend anything
 ```
+
+**出了什么事写在最后，而且只写一次。** `overall` 那行只放判断，不把原因折进括号里——从前它写成 `not scored (not scored: the run stopped ... (budget exhausted: 0.0382 CNY spent ...))`，同一句话在顶上和底下各出现一次，还把花费带进了不该有花费的地方。停了就只说停的理由：分数没打是停下来的结果，不另起一句把上面那句再抄一遍；没停而没打分（打分调用付不起、返回连着两次读不出）时说的是后者。理由在代码里是个类型（`Unscored`），只有渲染时才变成句子。
+
+**所有错误长一个样：空一行，然后 `error: 一句话`。** 一次跑不起来的 run（stderr）与一次没跑完的 run（stdout 摘要末尾）用的是同一个渲染件，读的人不必分辨这两件事出自哪条通道：
+
+```
+$ reviewbot review /tmp/1.difffff
+
+error: cannot read the input: cannot open /tmp/1.difffff: No such file or directory (os error 2)
+```
+
+那行空行不是装饰：错误前面通常已经有东西了——摘要的十来个字段，或者管道里一整串进度行——没有它，`error:` 会被读成又一个字段。**通道不变**：跑不起来仍然只进 stderr，跑完了（含预算截断，退出码 3）仍然只进 stdout，`--format json` 两者都不出现。
+
+**每个错误都靠 `Result` 走回同一个渲染件，包括命令行本身。** CLI 只剩两条出路：命令产出的文本，和结束这次进程的那**一个**失败；`run()` 就是这两个分支，写 stderr 的地方只有一处。解析不了的命令行也从这里回来——clap 的抱怨被当值接住（`Failure::Usage`，与库的 `Error` 并列），而不是让它自己 print 完就退出：那样它是唯一一条不经渲染件的路，也就是唯一一条会悄悄长得跟别人不一样的路，加个前导空行只是把症状按住。它的句子和底下的 `Usage:` 提示照原样留着——那两行说的是「该敲什么」，我们没有更好的话可讲。`--help` / `--version` 从同一次 `try_parse` 回来，但它们不是失败：它们就是这条命令的全部输出，照原样进 stdout、退出 0（终端上保留 clap 自己的加粗，管道里不带转义）。
 
 同一条命令再跑一遍，前四个阶段各自注明数字是从 checkpoint 读回来的，后两个照跑：
 
@@ -1565,6 +1580,7 @@ reviewing  src/lib.rs  ·  round 1/24
 
 ```
 $ reviewbot --config ./reviewbot.toml --runs-dir ./runs review --run-id 75e8b18e48cbe7a3 change.diff
+
 error: the config changed since run 75e8b18e48cbe7a3 started, so it cannot be continued
 run_id: 75e8b18e48cbe7a3
 next: reviewbot --config ./reviewbot.toml --runs-dir ./runs review --run-id 75e8b18e48cbe7a3 change.diff
@@ -1577,10 +1593,12 @@ next: reviewbot --config ./reviewbot.toml --runs-dir ./runs review --run-id 75e8
 |---|---|
 | 0 | 跑完，无论有没有提出意见 |
 | 1 | 未预期的失败（未分类错误、panic） |
-| 2 | 配置错误（含密钥不可读、引用链断裂）——没花钱 |
+| 2 | 配置错误，**或命令行上指着的东西不存在**——没花钱 |
 | 3 | 预算耗尽中止，已定稿部分已输出 |
 | 4 | 平台或模型服务不可用，重试耗尽 |
 | 5 | 评审完成但发布部分失败；把同一条 `review` 命令再跑一遍补发剩下的，模型不会再花钱 |
+
+**2 收的是「你指的东西不在」，1 收的是「reviewbot 自己出了事」。** 密钥读不到、引用链断裂算 2 是显然的；同一档还收：目标 diff 文件打不开、`--run-id` / `run show` 给的 run 号没写过、`--worktree` 指的地方不是目录 / 打不开 / 不是检出 / 停在别的 commit、URL 的 host 没配 `[[platform]]`、URL 解析不了、递进来的是 mbox 而不是 unified diff。这些都是敲错了一个路径或一个 id，不是故障；混进 1 会让 CI 里靠退出码分流的人把自己的笔误读成 reviewbot 崩了。
 
 **没有 `--fail-on`。** 要卡流水线就从摘要里自己判：
 

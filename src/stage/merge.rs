@@ -186,23 +186,63 @@ struct Alignment {
     note: Option<String>,
 }
 
-/// Step 7's outcome. Three fields rather than one enum because all three go
-/// into the checkpoint and two of them are `null` more often than not.
-#[derive(Default)]
-struct Score {
-    overall_score: Option<u8>,
-    summary: Option<String>,
-    unscored_reason: Option<String>,
+/// Step 7's outcome: the model's verdict, or the reason there is none.
+/// A `Result` because those are the two things that can come back and only
+/// one of them is the answer — carrying both in one struct is how a missing
+/// score came to be a field nobody was obliged to fill.
+type Scoring = Result<Scored, Unscored>;
+
+/// The model's verdict, both halves present. Nothing on this path may fill
+/// in 0: that is a real score the model can give.
+struct Scored {
+    overall_score: u8,
+    summary: String,
 }
 
-impl Score {
-    /// No number, and the reason said out loud. Nothing on this path may
-    /// fill in 0: that is a real score the model can give.
-    fn unscored(reason: impl Into<String>) -> Self {
-        Self {
-            overall_score: None,
-            summary: None,
-            unscored_reason: Some(reason.into()),
+/// Why a run has no overall score.
+///
+/// Typed rather than a sentence, because the sentence used to be built at
+/// four call sites and read back through two more: a stopped run ended up
+/// quoting its own stop reason inside a second one, spend and all, in a
+/// report that is not allowed to mention money. What it reads like is
+/// decided once, here, and a run that stopped says so where it stopped.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Unscored {
+    /// The review stage ended early. What ended it is on `ReviewOutput`,
+    /// and saying it twice is what this variant exists to avoid.
+    RunStopped,
+    NothingReviewed,
+    NoReadableAnswer {
+        unproduced: usize,
+        chunks: usize,
+    },
+    /// The scoring call itself could not be paid for. Not a failed run: the
+    /// findings are final and still go out.
+    Unaffordable(String),
+    /// Two replies that would not read.
+    Unreadable(String),
+}
+
+impl std::fmt::Display for Unscored {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unscored::RunStopped => {
+                write!(out, "the run stopped before every chunk was reviewed")
+            }
+            Unscored::NothingReviewed => {
+                write!(out, "no chunk was reviewed, so there was nothing to score")
+            }
+            Unscored::NoReadableAnswer { unproduced, chunks } => write!(
+                out,
+                "{unproduced} of {chunks} chunks gave no readable answer \
+                 and the rest reported nothing"
+            ),
+            Unscored::Unaffordable(reason) => {
+                write!(out, "the scoring call was not affordable ({reason})")
+            }
+            Unscored::Unreadable(reason) => {
+                write!(out, "the model's reply was unreadable ({reason})")
+            }
         }
     }
 }
@@ -280,19 +320,18 @@ impl Merge {
         // found") and still gets a score. Skip only when the run did not
         // actually finish looking: stopped, no chunks, or a chunk that never
         // produced a readable answer and left nothing else to judge.
-        let unfinished = review.stopped.is_some()
-            || review.chunks.is_empty()
-            || (comments.is_empty() && !unproduced.is_empty());
-        let score = match unfinished {
-            true => Score::unscored(nothing_to_score(review, &unproduced)),
-            false => Self::score(context, &comments)?,
+        let scoring = match nothing_to_score(review, &unproduced, comments.is_empty()) {
+            Some(reason) => Err(reason),
+            None => Self::score(context, &comments)?,
         };
         let output = MergeOutput {
             comments,
             badges,
-            overall_score: score.overall_score,
-            summary: score.summary,
-            unscored_reason: score.unscored_reason,
+            // The one place the outcome is taken apart for the checkpoint,
+            // and the one place the reason becomes words.
+            overall_score: scoring.as_ref().ok().map(|scored| scored.overall_score),
+            summary: scoring.as_ref().ok().map(|scored| scored.summary.clone()),
+            unscored_reason: scoring.as_ref().err().map(Unscored::to_string),
             unproduced,
         };
         tracing::info!(
@@ -636,7 +675,7 @@ impl Merge {
     /// Step 7. One more call, and only now that the list is final: the score
     /// judges what is about to be published, not the diff. An empty list is
     /// a finished review that found nothing, and still belongs here.
-    fn score(context: &mut StageContext<'_>, comments: &[Comment]) -> Result<Score, StageError> {
+    fn score(context: &mut StageContext<'_>, comments: &[Comment]) -> Result<Scoring, StageError> {
         let selection = context.settings.selection()?;
         let instructions = context.redactor.redact(&Prompts::SUMMARY.text()?);
         let findings = context.redactor.redact(&findings_json(comments));
@@ -660,7 +699,7 @@ impl Merge {
         // review stage's business, and it does not change here.
         if let Err(error) = context.authorize(&mut request, 0) {
             tracing::warn!("no overall score: {error}");
-            return Ok(Score::unscored(format!("not scored: {error}")));
+            return Ok(Err(Unscored::Unaffordable(error.to_string())));
         }
 
         let mut trace = Trace::new(SUMMARY_TRACE_ID);
@@ -676,9 +715,9 @@ impl Merge {
         context: &mut StageContext<'_>,
         request: &Request,
         trace: &mut Trace,
-    ) -> Result<Score, StageError> {
+    ) -> Result<Scoring, StageError> {
         let rejected = match Self::score_once(context, request, trace) {
-            Ok(score) => return Ok(score),
+            Ok(scoring) => return Ok(scoring),
             Err(rejected) => rejected,
         };
         let mut reason = rejected.reason;
@@ -711,10 +750,10 @@ impl Merge {
         );
 
         if let Err(error) = context.authorize(&mut retry, 0) {
-            return Ok(Score::unscored(format!("not scored: {error}")));
+            return Ok(Err(Unscored::Unaffordable(error.to_string())));
         }
         Ok(match Self::score_once(context, &retry, trace) {
-            Ok(score) => score,
+            Ok(scoring) => scoring,
             Err(second) => {
                 let second = second.reason;
                 reason = format!("{reason}, then {second}");
@@ -723,9 +762,7 @@ impl Merge {
                     format!("the second score reply would not read ({second})"),
                 );
                 tracing::warn!("no overall score: {reason}");
-                Score::unscored(format!(
-                    "not scored: the model's reply was unreadable ({reason})"
-                ))
+                Err(Unscored::Unreadable(reason))
             }
         })
     }
@@ -736,13 +773,13 @@ impl Merge {
         context: &mut StageContext<'_>,
         request: &Request,
         trace: &mut Trace,
-    ) -> Result<Score, Rejected> {
+    ) -> Result<Scoring, Rejected> {
         let _span = tracing::info_span!("merge", step = "score").entered();
         let response = match context.send_and_settle(request) {
             Ok(response) => response,
             Err(error) => {
                 tracing::warn!("no overall score: {error}");
-                return Ok(Score::unscored(format!("not scored: {error}")));
+                return Ok(Err(Unscored::Unreadable(error.to_string())));
             }
         };
         let reply = response.output_text();
@@ -784,11 +821,10 @@ impl Merge {
                 refusal: reason,
             }),
         })?;
-        Ok(Score {
-            overall_score: Some(score),
-            summary: Some(summary),
-            unscored_reason: None,
-        })
+        Ok(Ok(Scored {
+            overall_score: score,
+            summary,
+        }))
     }
 }
 
@@ -823,23 +859,28 @@ fn read_summary(arguments: &str) -> Result<(u8, String), String> {
     SubmitSummary::read(&parsed).map_err(|error| error.to_string())
 }
 
-/// Why scoring is skipped. "Nothing was found" is not one of these: that
-/// case still asks the model. These are the runs that never finished looking.
-fn nothing_to_score(review: &ReviewOutput, unproduced: &[Unproduced]) -> String {
-    if let Some(reason) = &review.stopped {
-        return format!("not scored: the run stopped before every chunk was reviewed ({reason})");
+/// Whether scoring is skipped, and why. `None` means ask the model: an
+/// empty list after a finished review is a real outcome ("nothing found")
+/// and gets a score like any other. These are the runs that never finished
+/// looking.
+fn nothing_to_score(
+    review: &ReviewOutput,
+    unproduced: &[Unproduced],
+    nothing_found: bool,
+) -> Option<Unscored> {
+    if review.stopped.is_some() {
+        return Some(Unscored::RunStopped);
     }
     if review.chunks.is_empty() {
-        return "not scored: no chunk was reviewed, so there was nothing to score".to_string();
+        return Some(Unscored::NothingReviewed);
     }
-    if !unproduced.is_empty() {
-        return format!(
-            "not scored: {} of {} chunks gave no readable answer and the rest reported nothing",
-            unproduced.len(),
-            review.chunks.len()
-        );
+    if nothing_found && !unproduced.is_empty() {
+        return Some(Unscored::NoReadableAnswer {
+            unproduced: unproduced.len(),
+            chunks: review.chunks.len(),
+        });
     }
-    "not scored: no chunk was reviewed, so there was nothing to score".to_string()
+    None
 }
 
 /// The band table, endpoints included. It lives here because `domain` holds
@@ -1964,20 +2005,39 @@ mod tests {
             cut_short: Vec::new(),
             unavailable: Vec::new(),
         };
-        let stopped_reason = nothing_to_score(&stopped, &[]);
-        assert!(stopped_reason.contains("stopped"), "{stopped_reason}");
-        assert!(!stopped_reason.contains("no findings"), "{stopped_reason}");
+        assert_eq!(
+            nothing_to_score(&stopped, &[], true),
+            Some(Unscored::RunStopped)
+        );
+        // What stopped it is not quoted here: the run says that once, where
+        // it stopped, and a report that may not mention money would
+        // otherwise carry the spend inside this sentence.
+        assert!(
+            !Unscored::RunStopped.to_string().contains("budget"),
+            "{}",
+            Unscored::RunStopped
+        );
 
         let clean = review(vec![chunk("src/parse.c", r#"{"comments":[]}"#)]);
-
-        let unreadable = nothing_to_score(
-            &clean,
-            &[Unproduced {
-                path: "src/parse.c".to_string(),
-                reason: "unreadable twice".to_string(),
-            }],
+        assert_eq!(
+            nothing_to_score(
+                &clean,
+                &[Unproduced {
+                    path: "src/parse.c".to_string(),
+                    reason: "unreadable twice".to_string(),
+                }],
+                true,
+            ),
+            Some(Unscored::NoReadableAnswer {
+                unproduced: 1,
+                chunks: 1
+            })
         );
-        assert!(unreadable.contains("no readable answer"), "{unreadable}");
+        assert_eq!(
+            nothing_to_score(&clean, &[], false),
+            None,
+            "a finished review with findings is scored like any other"
+        );
     }
 
     #[test]

@@ -211,11 +211,29 @@ fn a_piped_review_appends_progress_then_the_text_summary() {
     assert!(fields.iter().any(|line| line.starts_with("comments   ")));
     assert!(fields.iter().any(|line| line.starts_with("budget     ")));
     assert!(fields.iter().any(|line| line.starts_with("report     ")));
-    assert!(
+    assert!(fields.iter().any(|line| line.starts_with("summary    ")));
+    assert_eq!(
+        fields.iter().find(|line| line.starts_with("overall")),
+        Some(&"overall    not scored"),
+        "the verdict line carries the verdict and not the reason: {summary}"
+    );
+    // What went wrong reads last, in the same shape every other error takes:
+    // a blank line, then `error:`.
+    assert_eq!(
+        &fields[fields.len() - 2..],
+        [
+            "",
+            "error: budget is 0 CNY: this run may not spend anything"
+        ],
+        "why the run is incomplete is the final line: {summary}"
+    );
+    assert_eq!(
         fields
-            .last()
-            .is_some_and(|line| line.starts_with("summary    ")),
-        "the canonical summary is last: {summary}"
+            .iter()
+            .filter(|line| line.contains("this run may not spend anything"))
+            .count(),
+        1,
+        "and it is said once: {summary}"
     );
 
     let run_dir = std::fs::read_dir(&runs)
@@ -469,6 +487,61 @@ fn an_unknown_subcommand_exits_two() {
         .expect("run");
 
     assert_eq!(output.status.code(), Some(2));
+}
+
+/// A reference that does not resolve is the user's typo, not reviewbot
+/// falling over, and a CI job branching on the exit code has to be able to
+/// tell those apart. Exercised through the binary because the exit code is
+/// the thing being asserted.
+#[test]
+fn a_reference_that_does_not_resolve_is_a_config_error_not_an_unexpected_one() {
+    let target = reviewbot()
+        .args(["--config", fixture("valid.toml").to_str().unwrap()])
+        .args(["review", "/nonexistent/change.diff"])
+        .output()
+        .expect("run");
+    assert_eq!(target.status.code(), Some(2), "{target:?}");
+
+    let run = reviewbot()
+        .args(["--config", fixture("valid.toml").to_str().unwrap()])
+        .args(["run", "show", "deadbeef"])
+        .output()
+        .expect("run");
+    assert_eq!(run.status.code(), Some(2), "{run:?}");
+
+    let worktree = reviewbot()
+        .args(["--config", fixture("valid.toml").to_str().unwrap()])
+        .args(["review", fixture("change.diff").to_str().unwrap()])
+        .args(["--worktree", "/nonexistent/checkout"])
+        .output()
+        .expect("run");
+    assert_eq!(worktree.status.code(), Some(2), "{worktree:?}");
+}
+
+/// Argument parsing is the one error path that does not come back through
+/// the library, so it is the one that can quietly stop looking like the
+/// others. `--help` and `--version` arrive the same way and must not be
+/// dressed up as failures.
+#[test]
+fn a_parse_error_is_set_off_like_every_other_error_and_help_is_not() {
+    let refused = reviewbot().args(["review"]).output().expect("run");
+    assert_eq!(refused.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.starts_with("\nerror: "),
+        "a parse error opens like the rest: {stderr:?}"
+    );
+    assert!(refused.stdout.is_empty(), "and says nothing on stdout");
+
+    for flag in ["--help", "--version"] {
+        let asked = reviewbot().args([flag]).output().expect("run");
+        assert_eq!(asked.status.code(), Some(0), "{flag}");
+        assert!(asked.stderr.is_empty(), "{flag} is not a failure");
+        assert!(
+            !String::from_utf8_lossy(&asked.stdout).starts_with('\n'),
+            "{flag} is not set off like an error"
+        );
+    }
 }
 
 /// The token column names where the credential comes from, never the

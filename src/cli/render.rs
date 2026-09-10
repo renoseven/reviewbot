@@ -10,6 +10,7 @@ use reviewbot::security::Redactor;
 use reviewbot::tool::Purpose;
 use reviewbot::{Error, RunResult};
 
+use super::Failure;
 use super::args::Format;
 
 /// Stages as a person reads them, in the order the run walks them.
@@ -44,23 +45,16 @@ fn text_summary(result: &RunResult) -> String {
     let mut out = String::new();
     push_summary_line(&mut out, "run_id", &result.run_id);
     push_summary_line(&mut out, "model", &result.model);
-    match (result.overall_score, &result.summary) {
-        (Some(score), _) => push_summary_line(
+    // Just the verdict. Why there is none belongs at the end with the other
+    // things that went wrong, not folded into the line a reader skims for
+    // the answer.
+    match result.overall_score {
+        Some(score) => push_summary_line(
             &mut out,
             "overall",
             &format!("{score} / 100  (the model's judgement of what this run found)"),
         ),
-        (None, _) => push_summary_line(
-            &mut out,
-            "overall",
-            &format!(
-                "not scored  ({})",
-                result
-                    .unscored_reason
-                    .as_deref()
-                    .unwrap_or("no reason given")
-            ),
-        ),
+        None => push_summary_line(&mut out, "overall", "not scored"),
     }
     let severity = Severity::ALL
         .iter()
@@ -86,9 +80,6 @@ fn text_summary(result: &RunResult) -> String {
             "unreviewed",
             &format!("{} files", result.unreviewed.len()),
         );
-    }
-    if let Some(reason) = &result.stopped {
-        push_summary_line(&mut out, "stopped", reason);
     }
     match result.budget {
         Some(ceiling) => push_summary_line(
@@ -119,18 +110,44 @@ fn text_summary(result: &RunResult) -> String {
             &format!("{} comments", result.published.len()),
         );
     }
+    // Last, and once, in the same shape every other error takes. A run that
+    // stopped says so and nothing else: the missing score follows from the
+    // stop and does not earn a second line quoting the first one back.
+    match (&result.stopped, &result.unscored_reason) {
+        (Some(reason), _) | (None, Some(reason)) => out.push_str(&problem(reason)),
+        (None, None) => {}
+    }
     out
 }
 
-/// stderr for a failure. Names the run, because a run that got as far as its
-/// own directory is the thing the next attempt goes back into, and prints the
-/// command that goes back in — which is this very invocation, now that
-/// re-entering a run is running the same command again. `invocation` is the
-/// argument list as the process received it, and `None` on the commands that
-/// enter no run, so nothing here claims that repeating one of those would
-/// continue anything.
-pub fn failure(error: &Error, invocation: Option<&[OsString]>) -> String {
-    let mut out = format!("error: {error}\n");
+/// How everything that went wrong reaches a terminal: one blank line, then
+/// `error:` and the sentence. The blank line is what separates it from
+/// whatever the command was printing until then — a summary's fields, or a
+/// pipe's worth of progress — so it is not read as one more field.
+fn problem(reason: &str) -> String {
+    format!("\nerror: {reason}\n")
+}
+
+/// stderr for a failure — every one of them, a command line that did not
+/// parse included, because they all arrive here as one value.
+pub(super) fn failure(failure: &Failure) -> String {
+    let text = match failure {
+        // clap wrote its own `error:` sentence, and the usage hint below it
+        // is worth keeping, so the shape is all this has left to add.
+        Failure::Usage(complaint) => format!("\n{}", complaint.render()),
+        Failure::Command { error, invocation } => command_failure(error, invocation.as_deref()),
+    };
+    Redactor::new().redact(&text)
+}
+
+/// Names the run, because a run that got as far as its own directory is the
+/// thing the next attempt goes back into, and prints the command that goes
+/// back in — which is this very invocation, now that re-entering a run is
+/// running the same command again. `invocation` is `None` on the commands
+/// that enter no run, so nothing here claims that repeating one of those
+/// would continue anything.
+fn command_failure(error: &Error, invocation: Option<&[OsString]>) -> String {
+    let mut out = problem(&error.to_string());
     if let Some(run_id) = error.run_id() {
         out.push_str(&format!("run_id: {run_id}\n"));
         if let Some(invocation) = invocation.filter(|words| !words.is_empty()) {
@@ -143,7 +160,7 @@ pub fn failure(error: &Error, invocation: Option<&[OsString]>) -> String {
             ));
         }
     }
-    Redactor::new().redact(&out)
+    out
 }
 
 /// The invocation as one line a shell would read back the same way, which is
@@ -808,13 +825,20 @@ mod tests {
     /// back, since repeating it would continue nothing.
     #[test]
     fn a_failure_in_a_run_prints_the_run_id_and_the_command_that_goes_back_in() {
-        let error = Error::FingerprintMismatch {
+        let mismatch = || Error::FingerprintMismatch {
             run_id: "7f3a9c1e".to_string(),
         };
         let words =
             ["reviewbot", "--runs-dir", "/tmp/runs", "review", "x.diff"].map(OsString::from);
 
-        let text = failure(&error, Some(&words[..]));
+        let text = failure(&Failure::Command {
+            error: Box::new(mismatch()),
+            invocation: Some(words.to_vec()),
+        });
+        assert!(
+            text.starts_with("\nerror: "),
+            "every error opens the same way, set off from whatever came before: {text:?}"
+        );
         assert!(text.contains("run_id: 7f3a9c1e\n"), "{text}");
         assert!(
             text.contains("next: reviewbot --runs-dir /tmp/runs review x.diff\n"),
@@ -822,9 +846,26 @@ mod tests {
         );
         assert!(text.contains("continues run 7f3a9c1e"), "{text}");
 
-        let elsewhere = failure(&error, None);
+        let elsewhere = failure(&Failure::Command {
+            error: Box::new(mismatch()),
+            invocation: None,
+        });
         assert!(elsewhere.contains("run_id: 7f3a9c1e\n"), "{elsewhere}");
         assert!(!elsewhere.contains("next:"), "{elsewhere}");
+    }
+
+    /// A command line that did not parse arrives as a value like every other
+    /// failure, so it is set off the same way. clap's own sentence and the
+    /// usage hint under it are kept: they say what to type instead.
+    #[test]
+    fn a_command_line_that_did_not_parse_takes_the_same_shape() {
+        let complaint =
+            <super::super::args::Cli as clap::Parser>::try_parse_from(["reviewbot", "review"])
+                .expect_err("review needs something to review");
+
+        let text = failure(&Failure::Usage(complaint));
+        assert!(text.starts_with("\nerror: "), "{text:?}");
+        assert!(text.contains("Usage:"), "{text}");
     }
 
     #[test]

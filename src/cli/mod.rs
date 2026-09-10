@@ -23,30 +23,83 @@ use args::{
 use logging::LogSink;
 use status::Status;
 
-/// Parse, set up tracing, dispatch, and turn whatever comes back into an
-/// exit code. Successful runs write nothing to stderr.
+/// Turn whatever the command produced into a stream and an exit code. There
+/// are two arms and no more: text this process printed, or the one failure
+/// that ended it. Successful runs write nothing to stderr.
 pub fn run() -> i32 {
-    let cli = Cli::parse();
-    let log = init_tracing(cli.global.config.as_deref());
-
-    match dispatch(&cli, &log) {
+    match execute() {
         Ok(finished) => {
-            // `-q` silences text; `--format json` still prints (json wins).
-            let show = !finished.output.is_empty()
-                && (!cli.global.quiet || cli.global.format == args::Format::Json);
-            if show {
-                print!("{}", finished.output);
-            }
+            print!("{}", finished.output);
             finished.exit_code
         }
-        Err(error) => {
-            // The environment is read here rather than in `render`, which only
-            // formats. Only `review` enters a run, so it is the only command
-            // whose failure can offer itself as the way back in.
-            let invocation: Option<Vec<std::ffi::OsString>> =
-                matches!(cli.command, Command::Review(_)).then(|| std::env::args_os().collect());
-            eprint!("{}", render::failure(&error, invocation.as_deref()));
-            error.exit_code()
+        Err(failure) => {
+            eprint!("{}", render::failure(&failure));
+            failure.exit_code()
+        }
+    }
+}
+
+/// Parse, set up tracing, dispatch. Everything that can go wrong leaves here
+/// as `Err`, the command line included, so no failure reaches a terminal
+/// except through the one renderer above.
+fn execute() -> Result<Finished, Failure> {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        // `--help` and `--version` come back as clap errors as well, and they
+        // are not failures: they are the whole of what those two print. So
+        // they leave as this invocation's output, exactly as clap wrote it.
+        Err(asked) if !asked.use_stderr() => {
+            return Ok(Finished {
+                output: help_text(&asked),
+                exit_code: asked.exit_code(),
+            });
+        }
+        Err(complaint) => return Err(Failure::Usage(complaint)),
+    };
+    let log = init_tracing(cli.global.config.as_deref());
+    let finished = dispatch(&cli, &log).map_err(|error| Failure::Command {
+        error: Box::new(error),
+        // The environment is read here rather than in `render`, which only
+        // formats. Only `review` enters a run, so it is the only command
+        // whose failure can offer itself as the way back in.
+        invocation: matches!(cli.command, Command::Review(_))
+            .then(|| std::env::args_os().collect()),
+    })?;
+    Ok(finished.silenced(&cli.global))
+}
+
+/// What `--help` and `--version` print, as clap styles it. Whether the
+/// escapes belong in the stream is a fact about the terminal, not about the
+/// text, which is why it is decided here and not where the string is built.
+fn help_text(asked: &clap::Error) -> String {
+    match std::io::stdout().is_terminal() {
+        true => asked.render().ansi().to_string(),
+        false => asked.render().to_string(),
+    }
+}
+
+/// Why the process is ending badly. clap's complaint is one of these because
+/// it used to print itself and exit before dispatch could return anything,
+/// which left the command line as the only failure that did not travel as a
+/// `Result` — and so the only one that could quietly stop looking like the
+/// rest.
+enum Failure {
+    /// The command line did not parse. clap wrote both the sentence and the
+    /// usage hint under it.
+    Usage(clap::Error),
+    /// A command ran and failed. `invocation` is the argument list as the
+    /// process received it, and `None` on the commands that enter no run.
+    Command {
+        error: Box<Error>,
+        invocation: Option<Vec<std::ffi::OsString>>,
+    },
+}
+
+impl Failure {
+    fn exit_code(&self) -> i32 {
+        match self {
+            Failure::Usage(complaint) => complaint.exit_code(),
+            Failure::Command { error, .. } => error.exit_code(),
         }
     }
 }
@@ -65,6 +118,15 @@ impl Finished {
             output,
             exit_code: 0,
         }
+    }
+
+    /// `-q` silences text; `--format json` still prints (json wins). The exit
+    /// code is not a stream and stays whatever the command decided.
+    fn silenced(mut self, global: &GlobalArgs) -> Self {
+        if global.quiet && global.format != args::Format::Json {
+            self.output.clear();
+        }
+        self
     }
 }
 
