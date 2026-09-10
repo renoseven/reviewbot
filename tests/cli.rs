@@ -263,6 +263,61 @@ fn a_piped_review_appends_progress_then_the_text_summary() {
     );
 }
 
+/// Invalidating part of a run is worth a warning, and the warning goes
+/// where every other line of tracing goes: the run's own log.
+#[test]
+fn a_config_change_leaves_a_line_in_the_run_log_saying_what_it_cost() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let config = directory.path().join("reviewbot.toml");
+    let configured = std::fs::read_to_string(fixture("valid.toml"))
+        .expect("fixture")
+        .replace("budget_per_run = 10.0", "budget_per_run = 0.0");
+    std::fs::write(&config, &configured).expect("config");
+    let diff = fixture("change.diff");
+    let runs = directory.path().join("runs");
+
+    let review = || {
+        reviewbot()
+            .args(["--config", config.to_str().unwrap()])
+            .args(["--runs-dir", runs.to_str().unwrap()])
+            .args(["review", diff.to_str().unwrap()])
+            .output()
+            .expect("run")
+    };
+    let first = review();
+    assert_eq!(first.status.code(), Some(3), "{first:?}");
+
+    std::fs::write(
+        &config,
+        configured.replace("max_chunk_tokens = 24000", "max_chunk_tokens = 12000"),
+    )
+    .expect("rewrite config");
+    let second = review();
+
+    assert_eq!(
+        second.status.code(),
+        Some(3),
+        "the run continues rather than refusing: {second:?}"
+    );
+    assert!(second.stderr.is_empty(), "no tracing reaches stderr");
+    let run_dir = std::fs::read_dir(&runs)
+        .expect("runs")
+        .next()
+        .expect("one run, because the settings are not in its id")
+        .expect("run entry")
+        .path();
+    let log = std::fs::read_to_string(run_dir.join("log")).expect("run log");
+    assert!(
+        log.contains("the triage settings changed since this run was recorded")
+            && log.contains("running triage and every stage after it again"),
+        "the log names the slice and where the rerun starts: {log}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&second.stdout).contains("settings changed"),
+        "and it is not on stdout either"
+    );
+}
+
 #[test]
 fn a_target_that_is_neither_a_url_nor_a_file_says_so() {
     let output = reviewbot()
@@ -383,7 +438,7 @@ fn run_list_text_aligns_spent_with_currency_and_utc() {
             },
             "model": "deepseek-v4-flash",
             "provider": "deepseek",
-            "fingerprint": "fp",
+            "fingerprint": {"input": "i", "triage": "t", "review": "r"},
             "budget_limit": 10.0,
             "currency": "CNY",
             "price": {"input_per_1m_tokens": 3.0, "cached_input_per_1m_tokens": 0.1, "output_per_1m_tokens": 9.0},

@@ -9,6 +9,7 @@ use crate::domain::Stage;
 
 use super::run_id::InputIdentity;
 use crate::budget::{Budget, Price};
+use crate::config::Fingerprint;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -56,7 +57,10 @@ pub struct Meta {
     pub input: InputRecord,
     pub model: String,
     pub provider: String,
-    pub fingerprint: String,
+    /// The settings this run's checkpoints were written under, one digest
+    /// per stage that reads settings of its own. Three rather than one so
+    /// that a change invalidates the stages it can reach and no others.
+    pub fingerprint: Fingerprint,
     /// The frozen ceiling, keeping `-1` recognizable as "no ceiling".
     pub budget_limit: f64,
     pub currency: String,
@@ -78,12 +82,32 @@ pub struct Meta {
     pub updated_at: u64,
 }
 
-/// What names a run, gathered before the run directory exists.
+/// What names a run, gathered before the run directory exists. The same
+/// value whether the directory turns out to be new or to hold a run
+/// already, so the two paths cannot disagree about what is being asked for.
 #[derive(Clone, Debug)]
 pub struct RunIdentity {
     pub run_id: String,
     pub input: InputRecord,
-    pub fingerprint: String,
+    pub fingerprint: Fingerprint,
+}
+
+/// What a directory that already holds a run says about being re-entered.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Reentry {
+    /// Same input, same settings: every checkpoint still answers the
+    /// question being asked, so the run carries on where it stopped.
+    Resumed,
+    /// A settings slice changed. `from` is the stage that slice is named
+    /// after: it and everything after it are dropped, and the run goes on
+    /// under the settings in hand rather than refusing or opening a second
+    /// directory beside this one.
+    Invalidated { from: Stage },
+    /// This directory records another change, or the same one at another
+    /// commit. Nothing in it can be continued, so the caller has to fail:
+    /// `recorded` is what it does hold, which is the only useful thing to
+    /// say to whoever pointed `--run-id` here.
+    OtherInput { recorded: String },
 }
 
 impl Meta {
@@ -111,6 +135,62 @@ impl Meta {
             created_at: timestamp,
             updated_at: timestamp,
         }
+    }
+
+    /// Walk into a directory that already holds a run.
+    ///
+    /// The input is checked first and refusing is the only answer: an
+    /// explicit `--run-id` is the one way to aim a run at a directory it has
+    /// nothing to do with, and continuing on another change's checkpoints
+    /// would review the wrong thing under this one's name.
+    ///
+    /// Then the settings, slice by slice. The earliest one that differs
+    /// names the stage the rerun starts from; that stage and everything
+    /// after it are dropped, the new slices are written down, and the run
+    /// goes on. `--publish` is not in any slice and is recorded separately
+    /// on every entry, so reading a report and then asking for it to be
+    /// posted stays one run and one model bill.
+    pub fn reenter(
+        &mut self,
+        identity: &RunIdentity,
+        model: &str,
+        provider: &str,
+        budget: &Budget,
+    ) -> Reentry {
+        if self.input.identity != identity.input.identity
+            || self.input.head_sha != identity.input.head_sha
+        {
+            return Reentry::OtherInput {
+                recorded: self.input.describe(),
+            };
+        }
+        let Some(from) = self.fingerprint.earliest_change(&identity.fingerprint) else {
+            return Reentry::Resumed;
+        };
+        tracing::warn!(
+            stage = %from,
+            "the {from} settings changed since this run was recorded; \
+             running {from} and every stage after it again"
+        );
+        self.mark_incomplete(from);
+        self.fingerprint = identity.fingerprint.clone();
+        // Which model is asked, what it costs and what the run may spend all
+        // come off the `review` slice and nothing else, so they can only
+        // differ when that is the slice that changed — and then going on
+        // under the settings in hand means going on under these.
+        self.adopt(model, provider, budget);
+        Reentry::Invalidated { from }
+    }
+
+    /// The five facts the `review` slice settles — the same ones `start`
+    /// writes down for a new run — set together because they are read off
+    /// one slice and so can only change together.
+    fn adopt(&mut self, model: &str, provider: &str, budget: &Budget) {
+        self.model = model.to_string();
+        self.provider = provider.to_string();
+        self.budget_limit = budget.limit().as_value();
+        self.currency = budget.currency().to_string();
+        self.price = *budget.price();
     }
 
     pub fn is_complete(&self, stage: Stage) -> bool {
@@ -146,4 +226,174 @@ pub fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::budget::Limit;
+
+    fn fingerprint() -> Fingerprint {
+        Fingerprint {
+            input: "i".to_string(),
+            triage: "t".to_string(),
+            review: "r".to_string(),
+        }
+    }
+
+    fn budget(limit: f64) -> Budget {
+        Budget::restore(
+            Limit::from_value(limit).expect("a limit"),
+            "CNY".to_string(),
+            Price {
+                input_per_1m_tokens: 2.0,
+                cached_input_per_1m_tokens: None,
+                output_per_1m_tokens: 3.0,
+            },
+            0.0,
+        )
+    }
+
+    fn identity(number: u64, head_sha: &str) -> RunIdentity {
+        RunIdentity {
+            run_id: "abcd".to_string(),
+            input: InputRecord {
+                kind: InputKind::Url,
+                source: format!("https://gitlab.com/acme/app/-/merge_requests/{number}"),
+                identity: InputIdentity::Platform {
+                    host: "gitlab.com".to_string(),
+                    project: "acme/app".to_string(),
+                    number,
+                },
+                head_sha: head_sha.to_string(),
+            },
+            fingerprint: fingerprint(),
+        }
+    }
+
+    fn finished() -> Meta {
+        let mut meta = Meta::start(
+            identity(128, "4b1e0d2"),
+            "flash",
+            "deepseek",
+            &budget(10.0),
+            false,
+        );
+        meta.mark_complete(Stage::Publish);
+        meta
+    }
+
+    #[test]
+    fn matching_settings_resume_every_checkpoint() {
+        let mut meta = finished();
+        assert_eq!(
+            meta.reenter(
+                &identity(128, "4b1e0d2"),
+                "flash",
+                "deepseek",
+                &budget(10.0)
+            ),
+            Reentry::Resumed
+        );
+        assert_eq!(meta.completed_through, Some(Stage::Publish));
+    }
+
+    /// The whole of the invalidation rule: the slice that changed names the
+    /// stage, and the stage takes everything after it with it.
+    #[test]
+    fn a_changed_slice_drops_its_stage_and_everything_after_it() {
+        for (change, from, survives) in [
+            (
+                Fingerprint {
+                    triage: "other".to_string(),
+                    ..fingerprint()
+                },
+                Stage::Triage,
+                Some(Stage::Input),
+            ),
+            (
+                Fingerprint {
+                    review: "other".to_string(),
+                    ..fingerprint()
+                },
+                Stage::Review,
+                Some(Stage::Triage),
+            ),
+            (
+                Fingerprint {
+                    input: "other".to_string(),
+                    ..fingerprint()
+                },
+                Stage::Input,
+                None,
+            ),
+        ] {
+            let mut meta = finished();
+            let mut asked = identity(128, "4b1e0d2");
+            asked.fingerprint = change;
+            assert_eq!(
+                meta.reenter(&asked, "flash", "deepseek", &budget(10.0)),
+                Reentry::Invalidated { from }
+            );
+            assert_eq!(meta.completed_through, survives);
+            assert_eq!(
+                meta.fingerprint, asked.fingerprint,
+                "the new slices are what the next entry compares against"
+            );
+        }
+    }
+
+    /// Continuing under the settings in hand means recording them: the
+    /// model that is about to be asked is the one the summary has to name.
+    #[test]
+    fn an_invalidated_run_records_the_model_and_ceiling_it_will_run_under() {
+        let mut meta = finished();
+        let mut asked = identity(128, "4b1e0d2");
+        asked.fingerprint.review = "other".to_string();
+
+        meta.reenter(&asked, "pro", "anthropic", &budget(20.0));
+
+        assert_eq!(meta.model, "pro");
+        assert_eq!(meta.provider, "anthropic");
+        assert_eq!(meta.budget_limit, 20.0);
+    }
+
+    /// The hole an explicit `--run-id` would otherwise leave open: another
+    /// merge request, or the same one at another commit, under settings
+    /// that happen to match.
+    #[test]
+    fn another_input_is_refused_however_well_the_settings_match() {
+        for asked in [identity(129, "4b1e0d2"), identity(128, "aaaaaaa")] {
+            let mut meta = finished();
+            assert_eq!(
+                meta.reenter(&asked, "flash", "deepseek", &budget(10.0)),
+                Reentry::OtherInput {
+                    recorded: "gitlab.com/acme/app #128".to_string()
+                }
+            );
+            assert_eq!(
+                meta.completed_through,
+                Some(Stage::Publish),
+                "and nothing about the run it found was touched"
+            );
+        }
+    }
+
+    /// `--publish` is in no slice, so it cannot invalidate anything; it is
+    /// recorded on every entry instead, which is what keeps "read the
+    /// report, then post it" one run.
+    #[test]
+    fn publishing_is_recorded_rather_than_fingerprinted() {
+        let mut meta = finished();
+        assert!(!meta.publish);
+        assert_eq!(
+            meta.reenter(
+                &identity(128, "4b1e0d2"),
+                "flash",
+                "deepseek",
+                &budget(10.0)
+            ),
+            Reentry::Resumed
+        );
+    }
 }

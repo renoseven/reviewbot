@@ -25,7 +25,7 @@ pub use listing::{
     list_runs, prune_runs, remove_run, show_run,
 };
 pub use lock::DirLock;
-pub use meta::{InputKind, InputRecord, Meta, RunIdentity};
+pub use meta::{InputKind, InputRecord, Meta, Reentry, RunIdentity};
 pub use run_id::{InputIdentity, run_id};
 pub use storage::{LocalStorage, Storage};
 pub use trace::{Check, ContextFile, PublishedView, ToolCall, Trace};
@@ -43,11 +43,6 @@ pub enum RecordError {
     LockHeld,
     #[error("no run {run_id} under {runs_dir}")]
     RunNotFound { run_id: String, runs_dir: PathBuf },
-    #[error("cannot read {file}: {source}")]
-    Corrupt {
-        file: String,
-        source: serde_json::Error,
-    },
     #[error("cannot serialize {file}: {source}")]
     Serialize {
         file: String,
@@ -85,18 +80,33 @@ impl Recorder {
     }
 
     /// Read `meta.json` without taking the lock, which is what a run walking
-    /// into an existing directory needs before it can decide whether the
-    /// fingerprint still matches.
+    /// into an existing directory needs before it can decide what its
+    /// checkpoints are still worth.
+    ///
+    /// One that will not parse reads as no run at all: nothing in it can be
+    /// trusted — not the fingerprint that says which checkpoints still
+    /// answer the question, and not `spent` either, which is why letting
+    /// `review` start over costs nothing that was still readable. So
+    /// `review` starts a fresh run in the same directory, budget frozen
+    /// again, and `run list` / `run show` show the directory with the
+    /// fields they could not read left empty, rather than failing on a run
+    /// nobody can do anything about.
     pub fn peek_meta(storage: &dyn Storage) -> Result<Option<Meta>, RecordError> {
         let Some(bytes) = storage.read(layout::META)? else {
             return Ok(None);
         };
-        serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|source| RecordError::Corrupt {
-                file: layout::META.to_string(),
-                source,
-            })
+        match serde_json::from_slice(&bytes) {
+            Ok(meta) => Ok(Some(meta)),
+            Err(error) => {
+                tracing::warn!(
+                    file = layout::META,
+                    %error,
+                    "{} will not parse; treating this run directory as a new run",
+                    layout::META
+                );
+                Ok(None)
+            }
+        }
     }
 
     pub fn with_max_tool_output_bytes(mut self, bytes: usize) -> Self {
@@ -143,6 +153,21 @@ impl Recorder {
                 Ok(None)
             }
         }
+    }
+
+    /// Delete the checkpoints of `stage` and every stage after it.
+    ///
+    /// Clearing the flags in `meta.json` is not enough on its own: these
+    /// files parse perfectly — they were written under settings that have
+    /// since changed, not corrupted — and `review` picks its own
+    /// in-progress snapshot back up whether or not the stage was ever
+    /// marked done, so a chunk reviewed under the old settings would be
+    /// kept and the new ones would never reach the model.
+    pub fn discard_from(&self, stage: Stage) -> Result<(), RecordError> {
+        for dropped in Stage::ALL.into_iter().filter(|later| *later >= stage) {
+            self.storage.remove(&layout::stage_file(dropped))?;
+        }
+        Ok(())
     }
 
     /// Write the checkpoint without marking the stage done. `review` does

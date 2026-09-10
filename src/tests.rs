@@ -582,52 +582,245 @@ fn a_second_process_on_the_same_run_directory_fails_at_once() {
         .expect("the holder let go, so the next one gets in");
 }
 
-/// The config is in the run id, so the same command after a config change
-/// asks a different question and gets a run of its own. The old run keeps its
-/// checkpoints; nothing is half rewritten under the answers it already gave.
-#[test]
-fn a_changed_config_starts_a_new_run_rather_than_continuing_the_old_one() {
-    let workspace = Workspace::new();
-    let first = review(&workspace, Arc::new(Calls::default())).expect("run completes");
-
-    let changed = CONFIG.replace("budget_per_run = 10.0", "budget_per_run = 20.0");
-    std::fs::write(&workspace.config_path, changed).expect("rewrite config");
-
-    let second = review(&workspace, Arc::new(Calls::default())).expect("a second run completes");
-
-    assert_ne!(second.run_id, first.run_id);
-    for path in stage_paths(&workspace.run_dir(&first.run_id)) {
-        assert!(path.is_file(), "{} is left alone", path.display());
-    }
+/// A diff run, which is the shape with real chunks behind it: the model is
+/// asked twice for a first entry and must be asked again for whatever a
+/// config change put back on the table.
+fn enter_diff_run(
+    workspace: &Workspace,
+    settings: &Settings,
+    progress: &dyn Progress,
+    calls: Arc<Calls>,
+) -> RunResult {
+    crate::review_with(
+        settings,
+        &workspace.diff_file(),
+        &diff_adapters(calls),
+        progress,
+    )
+    .expect("the run completes")
 }
 
-/// Pinning the id is the one way to aim a run at a directory the config no
-/// longer agrees with, and it is refused there rather than allowed to write a
-/// second config's conclusions into the first one's run.
+fn from_checkpoint(watcher: &Watcher) -> Vec<bool> {
+    watcher.stages().iter().map(|(_, _, done)| *done).collect()
+}
+
+/// The settings are not in the run id, so a config change walks back into
+/// the run it already has and drops only what the change can reach.
+/// `[triage]` is first read by triage, so the input checkpoint still answers
+/// the question it was written for and is used again.
 #[test]
-fn an_explicit_run_id_does_not_get_around_the_fingerprint_check() {
+fn a_changed_triage_table_reruns_from_triage_in_the_same_run() {
+    let workspace = Workspace::new();
+    let fresh = Arc::new(Calls::default());
+    let first = enter_diff_run(
+        &workspace,
+        &workspace.settings(),
+        &Silent,
+        Arc::clone(&fresh),
+    );
+
+    std::fs::write(
+        &workspace.config_path,
+        CONFIG.replace("max_chunk_tokens = 24000", "max_chunk_tokens = 12000"),
+    )
+    .expect("rewrite config");
+
+    let watcher = Watcher::default();
+    let calls = Arc::new(Calls::default());
+    let second = enter_diff_run(
+        &workspace,
+        &workspace.settings(),
+        &watcher,
+        Arc::clone(&calls),
+    );
+
+    assert_eq!(
+        second.run_id, first.run_id,
+        "no second directory, so no orphan"
+    );
+    assert_eq!(
+        from_checkpoint(&watcher),
+        vec![true, false, false, false, false, false],
+        "input survived; triage and everything after it ran again"
+    );
+    assert_eq!(
+        Calls::get(&calls.send),
+        Calls::get(&fresh.send),
+        "the files were really reviewed again, not read back off a snapshot \
+         written under the old settings"
+    );
+}
+
+/// One stage later, and the two before it are untouched: `[review]` is read
+/// by nothing earlier than review.
+#[test]
+fn a_changed_review_table_leaves_input_and_triage_alone() {
+    let workspace = Workspace::new();
+    let fresh = Arc::new(Calls::default());
+    let first = enter_diff_run(
+        &workspace,
+        &workspace.settings(),
+        &Silent,
+        Arc::clone(&fresh),
+    );
+
+    std::fs::write(
+        &workspace.config_path,
+        CONFIG.replace("max_hits_per_search = 50", "max_hits_per_search = 20"),
+    )
+    .expect("rewrite config");
+
+    let watcher = Watcher::default();
+    let calls = Arc::new(Calls::default());
+    let second = enter_diff_run(
+        &workspace,
+        &workspace.settings(),
+        &watcher,
+        Arc::clone(&calls),
+    );
+
+    assert_eq!(second.run_id, first.run_id);
+    assert_eq!(
+        from_checkpoint(&watcher),
+        vec![true, true, false, false, false, false],
+    );
+    assert_eq!(
+        Calls::get(&calls.send),
+        Calls::get(&fresh.send),
+        "and review really ran again"
+    );
+}
+
+/// Three things that look like changes and are not: asking for debug
+/// logging must not cost a run its checkpoints, and neither `--publish` nor
+/// `--retries` says anything about what the review will conclude.
+#[test]
+fn debug_logging_publishing_and_retries_invalidate_nothing() {
+    let workspace = Workspace::new();
+    let mr = Arc::new(Mr::default());
+    let first = crate::review_with(
+        &workspace.settings(),
+        &Source::Url(URL.to_string()),
+        &publishing_adapters(Arc::new(Calls::default()), Arc::clone(&mr), Vec::new()),
+        &Silent,
+    )
+    .expect("run completes");
+
+    std::fs::write(
+        &workspace.config_path,
+        format!("{CONFIG}\n[log]\nlevel = \"debug\"\n"),
+    )
+    .expect("rewrite config");
+    let settings = workspace.settings_with(RunOptions {
+        runs_dir: workspace.runs_dir.clone(),
+        retries: 7,
+        publish: true,
+        ..RunOptions::default()
+    });
+
+    let watcher = Watcher::default();
+    let calls = Arc::new(Calls::default());
+    let second = crate::review_with(
+        &settings,
+        &Source::Url(URL.to_string()),
+        &publishing_adapters(Arc::clone(&calls), Arc::clone(&mr), Vec::new()),
+        &watcher,
+    )
+    .expect("the same run continues");
+
+    assert_eq!(second.run_id, first.run_id);
+    assert_eq!(
+        from_checkpoint(&watcher),
+        vec![true, true, true, true, false, false],
+        "the four paid stages all came back off their checkpoints"
+    );
+    assert_eq!(Calls::get(&calls.send), 0, "the model was not asked again");
+    assert_eq!(
+        Calls::get(&calls.existing_comments),
+        1,
+        "publish still ran, which is the point of asking for it on a second entry"
+    );
+}
+
+/// Pinning the id is the one way to aim a run at a directory that has
+/// nothing to do with this change, and it is refused there rather than
+/// allowed to carry on from another change's checkpoints.
+#[test]
+fn an_explicit_run_id_pointed_at_another_input_fails() {
     let workspace = Workspace::new();
     let first = review(&workspace, Arc::new(Calls::default())).expect("run completes");
 
-    let changed = CONFIG.replace("budget_per_run = 10.0", "budget_per_run = 20.0");
-    std::fs::write(&workspace.config_path, changed).expect("rewrite config");
     let settings = workspace.settings_with(RunOptions {
         runs_dir: workspace.runs_dir.clone(),
         run_id: Some(first.run_id.clone()),
         ..RunOptions::default()
     });
-
     let error = crate::review_with(
         &settings,
-        &Source::Url(URL.to_string()),
-        &adapters(Arc::new(Calls::default())),
+        &workspace.diff_file(),
+        &diff_adapters(Arc::new(Calls::default())),
         &Silent,
     )
-    .expect_err("the same check applies");
-    assert!(matches!(error, Error::FingerprintMismatch { .. }));
+    .expect_err("that directory records another input");
+
+    assert!(matches!(error, Error::DifferentInput { .. }), "got {error}");
     assert_eq!(error.exit_code(), 2);
+    assert_eq!(error.run_id(), Some(first.run_id.as_str()));
+    assert!(
+        error.to_string().contains("acme/app #128"),
+        "it names what the directory does record: {error}"
+    );
+    for path in stage_paths(&workspace.run_dir(&first.run_id)) {
+        assert!(path.is_file(), "{} was not written over", path.display());
+    }
 }
 
+/// A `meta.json` nobody can read is a broken run, not a fatal one.
+#[test]
+fn an_unreadable_meta_starts_a_fresh_run_and_still_lists() {
+    let workspace = Workspace::new();
+    let first = review(&workspace, Arc::new(Calls::default())).expect("run completes");
+    let run_dir = workspace.run_dir(&first.run_id);
+    std::fs::write(run_dir.join(layout::META), b"{ not json").expect("corrupt meta");
+
+    let rows = crate::record::list_runs(&workspace.runs_dir).expect("run list still answers");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].run_id, first.run_id, "the directory is still named");
+    assert!(
+        rows[0].completed_stages.is_empty(),
+        "and claims nothing it could not read"
+    );
+    let show = crate::record::show_run(&workspace.runs_dir, &first.run_id)
+        .expect("run show still answers");
+    assert_eq!(show.run_id, first.run_id);
+    assert_eq!(show.spent, 0.0);
+
+    let watcher = Watcher::default();
+    let calls = Arc::new(Calls::default());
+    let second = crate::review_with(
+        &workspace.settings(),
+        &Source::Url(URL.to_string()),
+        &adapters(Arc::clone(&calls)),
+        &watcher,
+    )
+    .expect("a fresh run in the same directory");
+
+    assert_eq!(second.run_id, first.run_id);
+    assert_eq!(
+        from_checkpoint(&watcher),
+        vec![false; 6],
+        "every stage ran again, because none of them could be vouched for"
+    );
+    assert_eq!(Calls::get(&calls.fetch_change), 1);
+    assert_eq!(
+        second.budget,
+        Some(10.0),
+        "the ceiling was frozen a second time"
+    );
+    assert_eq!(second.spent, 0.0);
+}
+
+/// What each command line option puts in which slice.
 #[test]
 fn run_parameters_do_not_change_identity_but_conclusions_do() {
     let workspace = Workspace::new();
@@ -643,23 +836,27 @@ fn run_parameters_do_not_change_identity_but_conclusions_do() {
     assert_eq!(
         noisy.fingerprint(),
         baseline,
-        "--retries, --publish and artifact locations stay out of the fingerprint"
+        "--retries, --publish and artifact locations stay out of every slice"
     );
 
     let other_model = workspace.settings_with(RunOptions {
         model: Some("deepseek-v4-pro".to_string()),
         ..RunOptions::default()
     });
-    assert_ne!(other_model.fingerprint(), baseline, "--model is in it");
+    assert_eq!(
+        baseline.earliest_change(&other_model.fingerprint()),
+        Some(Stage::Review),
+        "--model is first read by review"
+    );
 
     let with_worktree = workspace.settings_with(RunOptions {
         worktree: Some(PathBuf::from("/tmp/checkout")),
         ..RunOptions::default()
     });
-    assert_ne!(
-        with_worktree.fingerprint(),
-        baseline,
-        "the content source mode is in it"
+    assert_eq!(
+        baseline.earliest_change(&with_worktree.fingerprint()),
+        Some(Stage::Input),
+        "whether a checkout was named is first read by input"
     );
 
     std::fs::write(
@@ -667,10 +864,10 @@ fn run_parameters_do_not_change_identity_but_conclusions_do() {
         CONFIG.replace("budget_per_run = 10.0", "budget_per_run = 11.0"),
     )
     .expect("rewrite config");
-    assert_ne!(
-        workspace.settings().fingerprint(),
-        baseline,
-        "any parsed config change is in it"
+    assert_eq!(
+        baseline.earliest_change(&workspace.settings().fingerprint()),
+        Some(Stage::Review),
+        "a provider budget is first read by review"
     );
 }
 

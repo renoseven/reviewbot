@@ -17,6 +17,8 @@ use globset::Glob;
 use crate::common::{Secret, SecretSource};
 
 pub use crate::common::Backoff;
+pub use fingerprint::Fingerprint;
+
 pub use file::{
     Config, LogLevel, LogSettings, Model, ParamKind, ParamSpec, PlatformEntry, PlatformKind,
     Provider, ReviewSettings, SecuritySettings, ToolEntry, TriageSettings,
@@ -344,7 +346,7 @@ impl Settings {
         self.config.select_model(self.options.model.as_deref())
     }
 
-    pub fn fingerprint(&self) -> String {
+    pub fn fingerprint(&self) -> Fingerprint {
         fingerprint::fingerprint(
             &self.config,
             self.options.model.as_deref(),

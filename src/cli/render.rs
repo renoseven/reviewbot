@@ -151,13 +151,18 @@ pub(super) fn failure(failure: &Failure) -> String {
 /// thing the next attempt goes back into, and prints the command that goes
 /// back in — which is this very invocation, now that re-entering a run is
 /// running the same command again. `invocation` is `None` on the commands
-/// that enter no run, so nothing here claims that repeating one of those
-/// would continue anything.
+/// that enter no run, and the replay is withheld from the one failure the
+/// same command cannot get past — a directory recording another input,
+/// which this command is what aimed at — so nothing here offers a line that
+/// would only fail again.
 fn command_failure(error: &Error, invocation: Option<&[OsString]>) -> String {
     let mut out = error_line(&error.to_string());
     if let Some(run_id) = error.run_id() {
         out.push_str(&format!("run_id: {run_id}\n"));
-        if let Some(invocation) = invocation.filter(|words| !words.is_empty()) {
+        if let Some(invocation) = invocation
+            .filter(|words| !words.is_empty())
+            .filter(|_| error.same_command_continues())
+        {
             // Echoed rather than rebuilt, so `--runs-dir` and everything else
             // that decided which run this is comes back exactly as it went in.
             out.push_str(&format!("next: {}\n", shell_command(invocation)));
@@ -763,14 +768,15 @@ mod tests {
     /// back, since repeating it would continue nothing.
     #[test]
     fn a_failure_in_a_run_prints_the_run_id_and_the_command_that_goes_back_in() {
-        let mismatch = || Error::FingerprintMismatch {
+        let stopped = || Error::InRun {
             run_id: "7f3a9c1e".to_string(),
+            source: Box::new(Error::PublishNeedsPlatform),
         };
         let words =
             ["reviewbot", "--runs-dir", "/tmp/runs", "review", "x.diff"].map(OsString::from);
 
         let text = failure(&Failure::Command {
-            error: Box::new(mismatch()),
+            error: Box::new(stopped()),
             invocation: Some(words.to_vec()),
         });
         assert!(
@@ -785,11 +791,40 @@ mod tests {
         assert!(text.contains("continues run 7f3a9c1e"), "{text}");
 
         let elsewhere = failure(&Failure::Command {
-            error: Box::new(mismatch()),
+            error: Box::new(stopped()),
             invocation: None,
         });
         assert!(elsewhere.contains("run_id: 7f3a9c1e\n"), "{elsewhere}");
         assert!(!elsewhere.contains("next:"), "{elsewhere}");
+    }
+
+    /// The one failure repeating the command cannot get past: the command is
+    /// what pointed at the wrong directory. The run id still goes out — it
+    /// names the run that is in the way, and what that run holds is in the
+    /// sentence — but the replay does not, because it would only fail again.
+    #[test]
+    fn a_directory_recording_another_input_is_not_offered_the_command_back() {
+        let words = [
+            "reviewbot",
+            "review",
+            "--run-id",
+            "7f3a9c1e",
+            "https://host/x",
+        ]
+        .map(OsString::from);
+
+        let text = failure(&Failure::Command {
+            error: Box::new(Error::DifferentInput {
+                run_id: "7f3a9c1e".to_string(),
+                recorded: "gitlab.com/acme/app #99".to_string(),
+            }),
+            invocation: Some(words.to_vec()),
+        });
+        assert!(text.starts_with("error: "), "{text:?}");
+        assert!(text.contains("records a different input"), "{text}");
+        assert!(text.contains("gitlab.com/acme/app #99"), "{text}");
+        assert!(text.contains("run_id: 7f3a9c1e\n"), "{text}");
+        assert!(!text.contains("next:"), "{text}");
     }
 
     /// A command line that did not parse arrives as a value like every other

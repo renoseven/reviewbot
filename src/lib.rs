@@ -33,7 +33,9 @@ use domain::{Comment, Confidence, Severity, Stage};
 use platform::PlatformError;
 use progress::{Event, Outcome, Progress};
 use protocol::ProtocolError;
-use record::{DirLock, LocalStorage, Meta, RecordError, Recorder, RunIdentity, Storage, layout};
+use record::{
+    DirLock, LocalStorage, Meta, RecordError, Recorder, Reentry, RunIdentity, Storage, layout,
+};
 use stage::input::Input;
 use stage::merge::{Merge, MergeOutput};
 use stage::orient::Orientation;
@@ -120,8 +122,11 @@ pub enum Error {
     Platform(#[from] PlatformError),
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
-    #[error("the config changed since run {run_id} started, so it cannot be continued")]
-    FingerprintMismatch { run_id: String },
+    /// The directory named by `--run-id` belongs to something else. A
+    /// changed config is not this: that re-enters the run and drops the
+    /// stages it reaches.
+    #[error("run {run_id} records a different input ({recorded}), so it cannot be continued")]
+    DifferentInput { run_id: String, recorded: String },
     #[error("--publish needs a merge request or pull request URL, not a diff")]
     PublishNeedsPlatform,
     /// Wraps a failure that happened after the run directory existed, so the
@@ -170,7 +175,7 @@ impl Error {
             )) => 2,
             Error::Config(_)
             | Error::Stage(StageError::Config(_))
-            | Error::FingerprintMismatch { .. }
+            | Error::DifferentInput { .. }
             | Error::PublishNeedsPlatform => 2,
             Error::Budget(_) | Error::Stage(StageError::Budget(_)) => 3,
             Error::Platform(_)
@@ -185,12 +190,26 @@ impl Error {
     pub fn run_id(&self) -> Option<&str> {
         match self {
             Error::InRun { run_id, .. } => Some(run_id),
-            Error::FingerprintMismatch { run_id } => Some(run_id),
+            Error::DifferentInput { run_id, .. } => Some(run_id),
             Error::Record(RecordError::RunNotFound { run_id, .. }) => Some(run_id),
             Error::Stage(StageError::Record(RecordError::RunNotFound { run_id, .. })) => {
                 Some(run_id)
             }
             _ => None,
+        }
+    }
+
+    /// Whether giving the same command again would carry on from this
+    /// failure. Nearly always yes — that is the whole shape of re-entering a
+    /// run, a changed config included. A directory that records another
+    /// input is the exception: the command is what aimed at it, so
+    /// repeating the command aims there again and fails the same way, and
+    /// offering it back would be advice that cannot work.
+    pub fn same_command_continues(&self) -> bool {
+        match self {
+            Error::InRun { source, .. } => source.same_command_continues(),
+            Error::DifferentInput { .. } => false,
+            _ => true,
         }
     }
 }
@@ -227,12 +246,13 @@ pub(crate) fn review_with(
     let input = Input::identify(adapters, source)?;
     // The head sha is settled now, and repository reads are always by it.
     adapters.bind_repo(&input);
-    let fingerprint = settings.fingerprint();
+    // The settings are not in the id: the same change at the same commit is
+    // always the same directory, and a config edit re-enters it.
     let run_id = settings
         .options
         .run_id
         .clone()
-        .unwrap_or_else(|| record::run_id(&input.identity, &input.head_sha, &fingerprint));
+        .unwrap_or_else(|| record::run_id(&input.identity, &input.head_sha));
 
     let run_dir = settings.options.runs_dir.join(&run_id);
     // Nothing below may run without the lock, which is why it is taken with
@@ -244,22 +264,35 @@ pub(crate) fn review_with(
     adapters.open_worktree(&run_dir)?;
     let selection = settings.selection()?;
     let frozen = Budget::freeze(&selection)?;
+    let identity = RunIdentity {
+        run_id: run_id.clone(),
+        input,
+        fingerprint: settings.fingerprint(),
+    };
 
-    // Re-entering a run is only sound while it answers the same question, so
-    // an existing directory is refused when the config no longer matches the
-    // one its checkpoints were written under. Without the check an explicit
-    // --run-id would be the way around it.
+    // Walking into a directory that already holds a run: it has to be this
+    // same change — an explicit --run-id is the one way it might not be —
+    // and whichever settings slice has changed since takes its stage and
+    // every stage after it with it.
+    let mut invalidated_from = None;
     let meta = match Recorder::peek_meta(run.storage.as_ref())? {
-        Some(existing) if existing.fingerprint != fingerprint => {
-            return Err(Error::FingerprintMismatch { run_id });
+        Some(mut existing) => {
+            match existing.reenter(
+                &identity,
+                &selection.model.name,
+                &selection.provider.name,
+                &frozen,
+            ) {
+                Reentry::OtherInput { recorded } => {
+                    return Err(Error::DifferentInput { run_id, recorded });
+                }
+                Reentry::Invalidated { from } => invalidated_from = Some(from),
+                Reentry::Resumed => {}
+            }
+            existing
         }
-        Some(existing) => existing,
         None => Meta::start(
-            RunIdentity {
-                run_id: run_id.clone(),
-                input,
-                fingerprint,
-            },
+            identity,
             &selection.model.name,
             &selection.provider.name,
             &frozen,
@@ -268,6 +301,9 @@ pub(crate) fn review_with(
     };
 
     let mut recorder = open_recorder(settings, run, meta)?;
+    if let Some(from) = invalidated_from {
+        recorder.discard_from(from)?;
+    }
     recorder.set_publish_intent(settings.options.publish)?;
     // Said once the directory, the id and the model are settled and the
     // config has been agreed with, so nothing that has already announced

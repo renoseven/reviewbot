@@ -1,4 +1,11 @@
-//! `run_id = hash(input identity + head_sha + config fingerprint)`.
+//! `run_id = hash(input identity + head_sha)`.
+//!
+//! The settings are deliberately not in it: the same merge request at the
+//! same commit is always the same directory, so editing the config re-enters
+//! that run — dropping whichever stages the edit reaches — instead of
+//! starting a fresh directory and orphaning the old one. It also makes the
+//! id something the caller can work out from the URL alone, which is what
+//! `--run-id` is for.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -39,10 +46,9 @@ impl InputIdentity {
 }
 
 /// `head_sha` is empty for diff input without `--worktree`.
-pub fn run_id(identity: &InputIdentity, head_sha: &str, fingerprint: &str) -> String {
+pub fn run_id(identity: &InputIdentity, head_sha: &str) -> String {
     const LENGTH: usize = 16;
-    let digest =
-        Sha256::digest(format!("{}\n{head_sha}\n{fingerprint}", identity.key()).as_bytes());
+    let digest = Sha256::digest(format!("{}\n{head_sha}", identity.key()).as_bytes());
     format!("{digest:x}")[..LENGTH].to_string()
 }
 
@@ -55,19 +61,29 @@ mod tests {
         let one = InputIdentity::diff("--- a\n+++ b\n");
         let same = InputIdentity::diff("--- a\n+++ b\n");
         let other = InputIdentity::diff("--- a\n+++ c\n");
-        assert_eq!(run_id(&one, "", "fp"), run_id(&same, "", "fp"));
-        assert_ne!(run_id(&one, "", "fp"), run_id(&other, "", "fp"));
+        assert_eq!(run_id(&one, ""), run_id(&same, ""));
+        assert_ne!(run_id(&one, ""), run_id(&other, ""));
     }
 
+    /// The commit is half the identity: the same merge request reviewed
+    /// again after a push is a different run, because the answers the old
+    /// one recorded were about other bytes.
     #[test]
-    fn head_sha_and_fingerprint_both_change_the_run() {
+    fn a_new_commit_on_the_same_change_is_a_new_run() {
         let identity = InputIdentity::Platform {
             host: "gitlab.com".to_string(),
             project: "acme/app".to_string(),
             number: 128,
         };
-        let base = run_id(&identity, "4b1e0d2", "fp");
-        assert_ne!(base, run_id(&identity, "aaaaaaa", "fp"));
-        assert_ne!(base, run_id(&identity, "4b1e0d2", "other"));
+        assert_ne!(
+            run_id(&identity, "4b1e0d2"),
+            run_id(&identity, "aaaaaaa"),
+            "the head sha is in the id"
+        );
+        assert_eq!(
+            run_id(&identity, "4b1e0d2"),
+            run_id(&identity, "4b1e0d2"),
+            "and nothing else is, so the id is predictable from the URL"
+        );
     }
 }
