@@ -26,6 +26,10 @@ pub struct ReportInput<'a> {
     pub plan: &'a TriagePlan,
     pub merged: &'a MergeOutput,
     pub unreviewed: &'a [String],
+    /// Why the run stopped short, when it did. Recorded for scripts reading
+    /// `summary.json`; the report itself says which files went unreviewed
+    /// and leaves the money out of it.
+    pub stopped: Option<&'a str>,
     /// Chunks whose investigation the loop ended early. A file the model was
     /// still reading around must not read like one it finished with.
     pub cut_short: &'a [CutShort],
@@ -50,6 +54,11 @@ pub struct Summary {
     pub by_severity: Vec<CountBySeverity>,
     pub skipped: Vec<String>,
     pub unreviewed: Vec<String>,
+    /// Why the run stopped short of reviewing everything. Said here rather
+    /// than folded into `unscored_reason`, which used to quote it and so
+    /// carried the spend into a report that may not mention money.
+    #[serde(default)]
+    pub stopped: Option<String>,
     /// Chunks that gave nothing usable. Named so a thin report is not
     /// mistaken for a clean review.
     #[serde(default)]
@@ -180,6 +189,7 @@ impl Report {
                 .map(|file| file.path.clone())
                 .collect(),
             unreviewed: input.unreviewed.to_vec(),
+            stopped: input.stopped.map(str::to_string),
             unproduced: input
                 .merged
                 .unproduced
@@ -380,6 +390,7 @@ mod tests {
             plan: &plan,
             merged,
             unreviewed: &[],
+            stopped: None,
             cut_short: &[],
             unavailable: &[],
         };
@@ -415,6 +426,7 @@ mod tests {
             plan: &plan,
             merged: &merged,
             unreviewed: &[],
+            stopped: None,
             cut_short: &[],
             unavailable: &[],
         };
@@ -598,6 +610,7 @@ mod tests {
             plan: &plan,
             merged: &merged,
             unreviewed: &[],
+            stopped: None,
             cut_short: &cut_short,
             unavailable: &[],
         };
@@ -647,6 +660,7 @@ mod tests {
             plan: &plan,
             merged: &merged,
             unreviewed: &[],
+            stopped: None,
             cut_short: &[],
             unavailable: &unavailable,
         };

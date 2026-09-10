@@ -470,6 +470,7 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
             plan: &plan,
             merged: &merged,
             unreviewed: &reviewed.unreviewed,
+            stopped: reviewed.stopped.as_deref(),
             cut_short: &reviewed.cut_short,
             unavailable: &reviewed.unavailable,
         },

@@ -133,6 +133,10 @@ impl Reply {
 struct ScriptedProtocol {
     replies: Mutex<VecDeque<Reply>>,
     sent: Arc<Mutex<Vec<Request>>>,
+    /// What every reply reports having used, when a test asked for turns
+    /// that cost money. Zero otherwise, which is what most stage tests
+    /// want: no budget moves and nothing to reason about.
+    billed: Arc<Mutex<TokenUsage>>,
 }
 
 impl Protocol for ScriptedProtocol {
@@ -147,9 +151,14 @@ impl Protocol for ScriptedProtocol {
             sent.len()
         };
         let reply = self.replies.lock().expect("replies").pop_front();
-        Ok(reply
+        let mut response = reply
             .map(|reply| reply.into_response(turn))
-            .unwrap_or_default())
+            .unwrap_or_default();
+        let billed = *self.billed.lock().expect("billed");
+        if billed != TokenUsage::default() {
+            response.usage = billed;
+        }
+        Ok(response)
     }
 }
 
@@ -161,6 +170,7 @@ pub struct StageFixture {
     budget: Budget,
     paths: PathPolicy,
     sent: Arc<Mutex<Vec<Request>>>,
+    billed: Arc<Mutex<TokenUsage>>,
     progress: Heard,
 }
 
@@ -213,6 +223,7 @@ impl StageFixture {
         .expect("valid config");
 
         let sent = Arc::new(Mutex::new(Vec::new()));
+        let billed = Arc::new(Mutex::new(TokenUsage::default()));
         let mut tools = Registry::new();
         tools.register(Box::new(SubmitComment::new()));
         tools.register(Box::new(crate::tool::FinishReview::new()));
@@ -230,6 +241,7 @@ impl StageFixture {
             protocol: Box::new(ScriptedProtocol {
                 replies: Mutex::new(replies.into_iter().collect()),
                 sent: Arc::clone(&sent),
+                billed: Arc::clone(&billed),
             }),
             tools,
             worktree: Arc::new(worktree),
@@ -280,6 +292,7 @@ impl StageFixture {
             budget,
             paths,
             sent,
+            billed,
             progress: Heard::default(),
         }
     }
@@ -314,6 +327,27 @@ impl StageFixture {
 
     pub fn with_tools(mut self, tools: Registry) -> Self {
         self.adapters.tools = tools;
+        self
+    }
+
+    /// Make every scripted turn report this usage, so a test about running
+    /// out of money has turns that cost some. Without it a reply is free and
+    /// the budget never moves.
+    pub fn billing(self, usage: TokenUsage) -> Self {
+        *self.billed.lock().expect("billed") = usage;
+        self
+    }
+
+    /// Replace the frozen prices. A stage test that wants a real model's
+    /// output ceiling on a fixture that otherwise uses toy numbers uses this,
+    /// rather than rewriting the whole config.
+    pub fn with_price(mut self, price: Price) -> Self {
+        self.budget = Budget::restore(
+            self.budget.limit(),
+            self.budget.currency().to_string(),
+            price,
+            self.budget.spent(),
+        );
         self
     }
 

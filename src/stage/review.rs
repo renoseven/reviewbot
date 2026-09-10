@@ -5,9 +5,10 @@
 //! The protocol is stateless, so every round resends the whole conversation:
 //! the model's calls and their outputs are put back into `input` by hand.
 //!
-//! Two checks run before every call, both locally: the budget, and whether
-//! the answer would still fit in the context window. Neither waits for the
-//! vendor to say no.
+//! Two checks run before every call, both locally: the budget (which also
+//! caps `max_output_tokens` to what is left to spend), and whether the answer
+//! would still fit in the context window. Neither waits for the vendor to
+//! say no.
 
 use std::collections::BTreeSet;
 use std::time::Instant;
@@ -94,6 +95,9 @@ struct ChunkRun {
     output: ChunkOutput,
     unused: Option<UnusedCheckers>,
     cut_short: Option<CutShort>,
+    /// Set when the money ran out inside this chunk. The chunk still counts
+    /// — its findings are in `output` — but nothing after it may start.
+    stopped: Option<String>,
     /// What the next piece of the same file should be told, when there is
     /// one. `None` for a whole file and for the last piece of a cut one.
     handoff: Option<Handoff>,
@@ -110,6 +114,12 @@ struct Handoff {
     findings: Vec<String>,
     note: String,
 }
+
+/// What a concluding turn asks for when the budget, rather than the window,
+/// ended the investigation. Small on purpose: the turn exists to get
+/// findings already arrived at out of the model, not to buy more thinking,
+/// and it is paid for out of the little that is left.
+const CONCLUDING_OUTPUT_TOKENS: u32 = 4_096;
 
 /// Room for the handoff. It rides along with every remaining piece, so an
 /// unbounded one would grow the input the cut was meant to shrink.
@@ -195,10 +205,19 @@ impl Review {
                     output.unused_checkers.extend(done.unused);
                     output.cut_short.extend(done.cut_short);
                     handoff = done.handoff;
+                    // The money ran out part way through this chunk, which
+                    // still concluded and still counts. Only what comes
+                    // after it is left unreviewed.
+                    if let Some(reason) = done.stopped {
+                        tracing::warn!(chunk = index, "{reason}");
+                        output.unreviewed = remaining_paths(&plan.chunks[index + 1..]);
+                        output.stopped = Some(reason);
+                        break;
+                    }
                 }
-                // A budget that runs out stops the stage where it stands and
-                // names what was left, rather than quietly reviewing less or
-                // dropping the work already paid for.
+                // The budget did not stretch to this chunk's first call, so
+                // nothing was paid for here and the chunk itself is
+                // unreviewed along with everything behind it.
                 Err(StageError::Budget(error)) => {
                     tracing::warn!(chunk = index, "{error}");
                     output.unreviewed = remaining_paths(&plan.chunks[index..]);
@@ -314,6 +333,7 @@ impl Review {
             submissions: Vec::new(),
         };
 
+        let mut stopped = None;
         let raw_output = loop {
             let mut request = Request {
                 model: model.clone(),
@@ -352,11 +372,48 @@ impl Review {
                 request.tools = concluding_schemas.clone();
             }
 
-            context.budget.check(
-                context
-                    .budget
-                    .estimate(request.estimated_input_tokens(), max_output_tokens),
-            )?;
+            // The budget decides two things here, in this order: whether
+            // this call may go out at all, and how much of the answer it may
+            // pay for. A refusal on the first turn is a chunk that never
+            // started, and the stage says so. A refusal later is different:
+            // rounds have already been paid for and the model is holding
+            // findings it has not filed, so the last of the money buys a
+            // conclusion instead of being left unspent beside discarded
+            // work. That is the same turn the context window asks for, and
+            // it costs one cheap call.
+            // Room for a conclusion is held back only once there is
+            // something to conclude. On the opening turn the model has
+            // found nothing yet, so a chunk stopped before it and a chunk
+            // stopped after it come to the same nothing — and holding the
+            // money back there is what stopped a run from starting at all.
+            let reserve = match chat.concluding || chat.rounds == 0 {
+                true => 0,
+                false => max_output_tokens.min(CONCLUDING_OUTPUT_TOKENS),
+            };
+            if let Err(error) = context.authorize(&mut request, reserve) {
+                if chat.rounds == 0 {
+                    return Err(error.into());
+                }
+                if chat.concluding {
+                    stopped = Some(error.to_string());
+                    break comments_json(&chat.submissions);
+                }
+                chat.conclude(
+                    context.redactor,
+                    format!(
+                        "the budget ran out after {} rounds, so the investigation \
+                         stopped and the model was asked to hand over what it had",
+                        chat.rounds
+                    ),
+                )?;
+                request.input = chat.input.clone();
+                request.tools = concluding_schemas.clone();
+                request.max_output_tokens = max_output_tokens.min(CONCLUDING_OUTPUT_TOKENS);
+                if let Err(error) = context.authorize(&mut request, 0) {
+                    stopped = Some(error.to_string());
+                    break comments_json(&chat.submissions);
+                }
+            }
             let _span = tracing::info_span!(
                 "review",
                 path,
@@ -386,7 +443,7 @@ impl Review {
                     (call_id.to_string(), name.to_string(), arguments.to_string())
                 })
                 .collect();
-            if response.truncated(max_output_tokens) && !chat.concluding {
+            if response.truncated(request.max_output_tokens) && !chat.concluding {
                 chat.ask_after_truncate(context.redactor)?;
                 continue;
             }
@@ -428,6 +485,7 @@ impl Review {
                 path: path.to_string(),
                 reason,
             }),
+            stopped,
             handoff,
         })
     }
@@ -1038,7 +1096,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::budget::Limit;
+    use crate::budget::{Limit, Price, TokenUsage};
     use crate::stage::fixture::{Reply, StageFixture};
     use crate::stage::triage::Chunk;
     use crate::tool::{Purpose, Round, Signature, SubmitComment, Tool, ToolError, ToolOutput};
@@ -1428,6 +1486,114 @@ mod tests {
             trace.tool_calls[0].output.contains("nothing filed"),
             "{}",
             trace.tool_calls[0].output
+        );
+    }
+
+    /// A model's configured ceiling is billed as if the call will think that
+    /// far. Remaining money now caps the request, so a budget that cannot
+    /// pay for the ceiling still goes out rather than stopping with every
+    /// file unreviewed.
+    #[test]
+    fn a_budget_below_a_full_thinking_ceiling_still_sends_a_capped_call() {
+        let mut fixture = StageFixture::scripted(
+            vec![Reply::calls(&[("submit_comment", "{}")])],
+            Limit::Amount(0.1),
+        )
+        .with_price(Price {
+            // Cheap input so the prompt cannot itself exhaust 0.10 CNY, and
+            // output dear enough that the fixture model's 4096 token ceiling
+            // costs 0.2048 CNY — more than the whole budget, while 0.10
+            // still buys an answer worth having.
+            input_per_1m_tokens: 0.01,
+            cached_input_per_1m_tokens: Some(0.001),
+            output_per_1m_tokens: 50.0,
+        })
+        .with_tools(with_submit(Registry::new()));
+
+        let output = review(&mut fixture);
+        assert!(output.stopped.is_none(), "{:?}", output.stopped);
+        let sent = fixture.sent();
+        assert_eq!(sent.len(), 1, "the call went out");
+        assert!(
+            (1024..4096).contains(&sent[0].max_output_tokens),
+            "capped to what 0.10 CNY covers, and still worth answering with: {}",
+            sent[0].max_output_tokens
+        );
+    }
+
+    /// A real run spent six rounds investigating the first of four files,
+    /// ran out of money on the seventh, and threw all six away: the file
+    /// went into the unreviewed list beside the three nobody had opened, and
+    /// 0.0382 CNY bought nothing at all. The money already spent has to come
+    /// back as findings, and only the files that really were never opened
+    /// belong in that list.
+    #[test]
+    fn money_running_out_mid_file_buys_a_conclusion_rather_than_discarding_the_rounds() {
+        let (tools, _) = counted("clean");
+        let mut fixture = StageFixture::scripted(
+            vec![
+                Reply::calls(&[("cppcheck", r#"{"path":"src/parse.c"}"#)]),
+                Reply::calls(&[("cppcheck", r#"{"path":"src/parse.c"}"#)]),
+                Reply::calls(&[("submit_comment", COMMENT)]),
+            ],
+            Limit::Amount(0.1),
+        )
+        .with_price(Price {
+            input_per_1m_tokens: 0.01,
+            cached_input_per_1m_tokens: Some(0.001),
+            output_per_1m_tokens: 9.0,
+        })
+        // 0.036 a round, so the third round is where the money for another
+        // round plus the conclusion it has to leave room for runs out.
+        .billing(TokenUsage {
+            input_tokens: 1_000,
+            cached_input_tokens: 0,
+            output_tokens: 4_000,
+        })
+        .with_tools(with_submit(tools));
+
+        // Two files, and rounds enough that money rather than the ceiling is
+        // what ends the first one.
+        let plan = TriagePlan {
+            chunks: vec![piece("src/parse.c", 0, 1), piece("src/other.c", 1, 1)],
+            skipped: Vec::new(),
+            window: crate::stage::triage::Window::dictated(20_000, 24, 80_000),
+        };
+        let output = review_over(&mut fixture, &plan);
+
+        assert_eq!(output.chunks.len(), 1, "the file is kept, not discarded");
+        assert!(
+            output.chunks[0].raw_output.contains("confidence_score"),
+            "and the finding the last of the money bought is in it: {}",
+            output.chunks[0].raw_output
+        );
+        assert_eq!(
+            output.unreviewed,
+            vec!["src/other.c".to_string()],
+            "only the file nobody opened is unreviewed"
+        );
+        assert!(
+            output
+                .stopped
+                .as_deref()
+                .expect("the run says it stopped")
+                .contains("budget exhausted"),
+            "{:?}",
+            output.stopped
+        );
+        assert!(
+            output.cut_short[0].reason.contains("budget ran out"),
+            "the report has to be able to say that file was not finished: {:?}",
+            output.cut_short
+        );
+        let sent = fixture.sent();
+        assert!(
+            sent.last()
+                .expect("a concluding call went out")
+                .tools
+                .iter()
+                .all(|tool| tool.name != "cppcheck"),
+            "the concluding turn has no investigation tools left"
         );
     }
 

@@ -261,6 +261,25 @@ impl StageContext<'_> {
         Ok(())
     }
 
+    /// The one gate every model call passes: cap this request's output to
+    /// what the money on hand buys, and refuse the call when that is no
+    /// longer enough to answer with. The allowance is written onto the
+    /// request rather than checked against a number the request does not
+    /// carry, so the vendor is held to it.
+    ///
+    /// `reserve` is the output allowance a caller wants kept back for a call
+    /// after this one — the turn that ends a conversation properly. Zero
+    /// from a caller with nothing to follow.
+    pub fn authorize(&self, request: &mut Request, reserve: u32) -> Result<(), BudgetError> {
+        let ceiling = request.max_output_tokens;
+        let allowed = self.budget.allow(ceiling, reserve)?;
+        if allowed < ceiling {
+            tracing::debug!(allowed, ceiling, "output capped to what is left to spend");
+        }
+        request.max_output_tokens = allowed;
+        Ok(())
+    }
+
     /// One model call with the wait visible on the log: a line before the
     /// HTTP round trip, and one after with duration, tokens and spend.
     pub fn send_and_settle(&mut self, request: &Request) -> Result<Response, ProtocolError> {

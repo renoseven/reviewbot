@@ -65,9 +65,10 @@ pub struct Request {
 }
 
 impl Request {
-    /// Everything that goes out, in tokens. One estimate serves both checks
-    /// made before a call: whether the budget covers it and whether the
-    /// answer still fits inside the context window.
+    /// Everything that goes out, in tokens, for the one check that needs it:
+    /// whether the answer still fits inside the context window. The budget
+    /// does not use this — it charges input when the vendor bills it, since
+    /// how much of this the cache will absorb is not knowable here.
     pub fn estimated_input_tokens(&self) -> u32 {
         let items: u32 = self
             .input

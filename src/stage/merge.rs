@@ -640,7 +640,7 @@ impl Merge {
         let selection = context.settings.selection()?;
         let instructions = context.redactor.redact(&Prompts::SUMMARY.text()?);
         let findings = context.redactor.redact(&findings_json(comments));
-        let request = Request {
+        let mut request = Request {
             model: selection.model.name.clone(),
             instructions,
             input: vec![InputItem::Message {
@@ -654,15 +654,11 @@ impl Merge {
             max_output_tokens: selection.model.max_output_tokens,
             reasoning_effort: selection.model.reasoning_effort.clone(),
         };
-        let estimate = context.budget.estimate(
-            request.estimated_input_tokens(),
-            selection.model.max_output_tokens,
-        );
 
         // Skipping the score is not the same as failing the run: the comments
         // are already final and they still go out. The exit code is the
         // review stage's business, and it does not change here.
-        if let Err(error) = context.budget.check(estimate) {
+        if let Err(error) = context.authorize(&mut request, 0) {
             tracing::warn!("no overall score: {error}");
             return Ok(Score::unscored(format!("not scored: {error}")));
         }
@@ -714,10 +710,7 @@ impl Merge {
             format!("the scoring call did not arrive ({reason}); asked once more"),
         );
 
-        let estimate = context
-            .budget
-            .estimate(retry.estimated_input_tokens(), retry.max_output_tokens);
-        if let Err(error) = context.budget.check(estimate) {
+        if let Err(error) = context.authorize(&mut retry, 0) {
             return Ok(Score::unscored(format!("not scored: {error}")));
         }
         Ok(match Self::score_once(context, &retry, trace) {

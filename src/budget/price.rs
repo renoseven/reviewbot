@@ -53,6 +53,21 @@ impl Price {
             + usage.output_tokens as f64 * self.output_per_1m_tokens)
             / PER_MILLION
     }
+
+    /// How many output tokens `amount` of this currency can pay for.
+    /// Free output (`output_per_1m_tokens <= 0`) is unbounded, so the
+    /// model's own ceiling remains the other cap.
+    pub fn output_tokens_for(&self, amount: f64) -> u32 {
+        if self.output_per_1m_tokens <= 0.0 {
+            return u32::MAX;
+        }
+        if amount <= 0.0 {
+            return 0;
+        }
+        (amount * 1_000_000.0 / self.output_per_1m_tokens)
+            .floor()
+            .min(u32::MAX as f64) as u32
+    }
 }
 
 #[cfg(test)]
@@ -101,5 +116,17 @@ mod tests {
             output_tokens: 0,
         };
         assert!((price.cost(&usage) - 8.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn output_tokens_for_a_budget_slice_rounds_down() {
+        let price = Price {
+            input_per_1m_tokens: 3.0,
+            cached_input_per_1m_tokens: Some(0.1),
+            output_per_1m_tokens: 9.0,
+        };
+        // 0.0699 CNY / 9 per 1M = 7766.66... tokens, floored.
+        assert_eq!(price.output_tokens_for(0.0699), 7_766);
+        assert_eq!(price.output_tokens_for(0.0), 0);
     }
 }

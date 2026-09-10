@@ -763,10 +763,14 @@ published 视图仍是去掉文件正文的那份——给需要外发一份 tra
   用 `-1` 而不是 `0` 表示无上限，是因为这里的误读方向特别贵：想让 reviewbot 别花钱的人最自然会写 `budget = 0`，若那等于放开上限，他会在毫无提示的情况下花光账户，且不可撤销。所以 `0` 保留它的字面含义，`review` 会在第一次调用前的检查处就停下，照常输出未评审清单——顺带成了一个有用的空跑模式：切片与费用预估照做，真要花钱时停住。
 
   `-1` 时调用前检查恒通过，usage 照常累计与结算，只是不再有人拦。`summary.json` 与 CLI stdout 里预算那一行写成「已花费 X（无上限）」而不是留空——数字照记，只是没有分母；报告和评论不写花费。无上限是合法配置，默认日志不打；要确认闸门撤了看 debug。退出码 3、`triage` 按预算截断、汇总打分那步的「预算不足则跳过」，在 `-1` 下都不会发生。
-- **估算**：DeepSeek 没有本地 tokenizer，用字符数估算（ASCII 约 4 字符/token，中文约 1 字符/token）乘 1.2 保守系数估输入；输出按该模型的 `max_output_tokens` 上限估——思维链也占用这段输出额度，所以估算已经按「这次最多能想满」来挡。同一个估算函数也供 [§7](#7-关键阶段的算法) 的分片切分与上下文检查使用。
-- **调用前检查**：`已花费 + 本次估算 > limit` 就停，不允许超支后补救。Tool 间接触发的模型调用同样计入。`budget = -1` 时这道检查恒通过，`budget = 0` 时恒不通过。
-- **结算**：响应回来后用真实 `usage` 换算实际花费覆盖估算值，累计写进 checkpoint 和相关 trace；缓存命中走 `cached_input_per_1m`。`usage.output_tokens` **已经含思维链**（`output_tokens_details.reasoning_tokens` 是其中的拆分，不是另开一笔）；按输出单价乘 `output_tokens`，不要把 `reasoning_tokens` 再加一遍。
-- **中止**：预算耗尽时输出已定稿 comments + 明确的中止原因 + **未评审文件清单**，不静默丢弃、不偷偷换便宜模型继续跑。
+- **不预测单次调用的花费**，只累计厂商真收了多少。预测试过两次、错了两次：先是按模型的 `max_output_tokens` 给每次调用记上满额思维链（DeepSeek V4 是 384K × 9 CNY/1M = 3.46 CNY），一个 0.1 的预算连第一次调用都发不出；改成按本次 run 量到的缓存命中率估输入之后，又在收尾那一轮翻车——前十轮命中率都在 90% 以上，收尾那一轮只有 39%，估算差了四倍。**命中率本身就不稳定，所以它不是一个可以拿来当闸门的数。**
+
+  剩下的是没有猜测成分的算术：**输出有已知单价、而且从不走缓存**，所以手上的钱能精确换算成输出 token 数。`allow(上限, 预留) = min(模型上限, 剩余 ÷ 输出单价 − 预留)`，算出来的数**写进请求的 `max_output_tokens`**，厂商因此是被约束住的，不是被信任的。DeepSeek 没有本地 tokenizer，字符估算函数（ASCII 约 4 字符/token，中文约 1 字符/token，乘 1.2）仍然存在，但只服务 [§7](#7-关键阶段的算法) 的分片切分与上下文检查——上下文检查按模型配置的上限预留，与剩余预算无关。
+- **调用前检查**：只有一道闸，就是「这次调用能发多长」。拒绝的唯一形状是：扣掉预留之后剩的钱买不到一段值得要的回答。另有一条地板（`LEAST_USEFUL_OUTPUT_TOKENS`）——允许的输出低到装不下一次工具调用时直接拒绝，否则最后一点钱买回来的只是一句被截断的话；调用方主动要短答案（上限本来就低于地板）时照发。`budget = -1` 时恒通过、也不封顶；`budget = 0` 时恒不通过。Tool 间接触发的模型调用同样计入。
+- **超支的边界是一次调用的输入。** 输入贵不贵取决于厂商这次给多少缓存，那件事在回复之前不可知，所以它不进闸门、只在结算时入账。代价是账目可以越线一点：实测一次 0.1 CNY 的 run 收在 **0.1067**，多出来的 0.0067 全部来自收尾那一轮的输入（20739 token 里只命中 8064）。换来的是没有任何一次调用因为猜错而被误拒。越线量随对话长度增长，真要收紧就调小 `budget_per_run` 之外的那个变量——分片上限，它决定了对话能长到多大。
+- **为收尾留一笔**：工具循环在还付得起收尾那一次调用时就停止调查，而不是等到一分不剩。调用方把「后面还要留多少输出额度」交给预算（同样是 token 数，直接相减），剩余不够时这一轮就不发，改走和上下文撑满时同一条收尾路径——撤掉检视工具、只留 `submit_comment` 与 `finish_review`，要模型把已经查到的东西交出来。**开局那一轮不留**：还没查到任何东西，停在它前面和停在它后面换来的是同样的空手，而留了反倒可能让 run 根本起不了步。这条规矩存在的理由是踩过的坑：一次 0.1 CNY 的 run 在第一个文件上跑满 6 轮、花掉 0.0382，第 7 轮被拦下后**这 6 轮连同文件一起被丢进未评审清单**，钱花光了一条发现都没有；补上收尾之后同样的预算换回了 2 条 major。
+- **结算**：响应回来后用真实 `usage` 换算实际花费，累加进账并写进 checkpoint 和相关 trace；缓存命中走 `cached_input_per_1m`。这是 `spent` 唯一变动的地方，所以对外报的每一个数都是厂商收过的数。`usage.output_tokens` **已经含思维链**（`output_tokens_details.reasoning_tokens` 是其中的拆分，不是另开一笔）；按输出单价乘 `output_tokens`，不要把 `reasoning_tokens` 再加一遍。
+- **中止**：预算耗尽时输出已定稿 comments + 明确的中止原因 + **未评审文件清单**，不静默丢弃、不偷偷换便宜模型继续跑。已经收尾过的分片算「评审过、调查被掐断」，进 `cut_short` 而不是未评审清单——未评审只列真的一次都没打开过的文件。
 - **全程串行**：这条规则约束的是评审流水线——六个阶段串行，`review` 的分片也逐个跑，不并发；否则两个调用都可能通过同一份调用前预算检查，预算闸就失效。状态屏另有一个只读共享状态、约每 100ms 画一帧的线程，但它只画终端，不运行阶段、不发模型调用、不碰预算或 checkpoint，因此没有削弱这条规则。
 
 ### 严重程度与置信度
@@ -1484,25 +1488,25 @@ reviewbot provider list                 # provider 条目：protocol、base_url�
 ```
 $ reviewbot --config ./reviewbot.toml --runs-dir ./runs review change.diff
 run  change.diff  model deepseek-v4-flash
-[1/6] input     2 files
-[2/6] triage    2 chunks, 0 files skipped
-[3/6] review    file 1/2  src/parse.c
-[3/6] review    0 chunks reviewed, 2 files unreviewed
+[1/6] input     1 file
+[2/6] triage    1 chunk, 0 files skipped
+[3/6] review    file 1/1  src/parse.c
+[3/6] review    0 chunks reviewed, 1 file unreviewed
 [4/6] merge     0 comments, not scored
 [5/6] report    report.md and summary.json written
 [6/6] publish   nothing posted: this run was not asked to publish
-run_id     75e8b18e48cbe7a3
+run_id     9f4580b1f547aa00
 model      deepseek-v4-flash
 overall    not scored  (not scored: the run stopped before every chunk was reviewed ...)
 comments   0
 severity   critical 0 / major 0 / minor 0 / trivial 0
 confidence certain 0 / high 0 / medium 0 / low 0
 skipped    0 files
-unreviewed 2 files
+unreviewed 1 files
 stopped    budget is 0 CNY: this run may not spend anything
 budget     0.0000 / 0.0000 CNY
-report     ./runs/75e8b18e48cbe7a3/report.md
-summary    ./runs/75e8b18e48cbe7a3/summary.json
+report     ./runs/9f4580b1f547aa00/report.md
+summary    ./runs/9f4580b1f547aa00/summary.json
 ```
 
 同一条命令再跑一遍，前四个阶段各自注明数字是从 checkpoint 读回来的，后两个照跑：
@@ -1654,7 +1658,7 @@ crate 同时产出 `lib` 与 `bin` 两个 target。**业务逻辑一律针对 li
 - **正常流程不删 run**：造出一批远超阈值的 run，断言 `review` 跑完一次、又重新进来一次之后**一个都没少**；断言超阈时 `review` 收尾出一条 `warn`，里面那句 `run prune` 命令整行复制出来能真的跑（用了非默认 runs 目录时带上 `--runs-dir`）。
 - **`run prune`**：造出 25 个 run，不写 `--keep` 断言一个都不留（含各自的 `report.md` 与 `summary.json`）；断言 `--keep 10` 只留最新 10 个；断言 `--keep 50` 时一个都不删；断言排序只看时间、不区分终态，成功与失败的按同一条队列收；断言 `--keep` 大于 0 时刚失败的那个必然还在、再跑一遍那条命令仍接得上；断言 `--dry-run` 只列不删。
 - **重试**：假 protocol 依次返回「两次 503 后成功」，断言最终成功且只结算一次真实 usage；返回 401 时断言不重试、立即失败；打分那次调用没交出 `submit_summary` 时断言只重问一次。
-- **预算**：喂一个必然超预算的 changeset，断言在调用前检查处停住且给出未评审清单。
+- **预算**：喂一个必然超预算的 changeset，断言在调用前检查处停住且给出未评审清单。断言剩余的钱直接换算成输出额度、请求里的 `max_output_tokens` 就是那个数（0.10 CNY 对 9.0/1M 就是 11111），付不起模型配置上限（例如 384K 思维链）的预算照样发出调用；断言预算够时模型上限原样保留。断言**输入不进闸门**：结算一条 `input 17500 / cached 17024` 的真实 usage，断言账上加的是厂商那 0.0038、且下一次的允许额度正好按这个数缩小，闸门本身不看请求有多长。断言允许的输出低到装不下一次工具调用时整个调用被拒，而调用方主动要短答案时照发。**断言中途没钱不丢弃已经付过的调查**：让一个分片跑几轮后耗尽预算，断言它走收尾轮（只剩交付工具）、收尾拿到的意见进了这个分片的产出、这个文件出现在 `cut_short` 而**不在**未评审清单里，未评审只列它后面那些一次都没打开过的文件；断言收尾拿到的是真正剩下的额度而不是它开口要的那个数；断言开局那一轮不为收尾预留，否则一份刚好够跑几轮的预算会连第一次调用都发不出。
 - **通用 command tool**：只加一段 `[[tool]]` 就能启用一个假的外部检查器，断言不改任何源码即出现在给模型的 function 列表里、被 `function_call` 调起来后诊断原文进了 `function_call_output`；断言 `args` 直接 `execve` 不经 shell（argv 里写 `; rm -rf /` 只会作为一个字面参数传下去）；断言模型填的路径参数过路径校验、且叫 `--foo.sh` 的文件不会被当成选项；断言随仓库交付的示例配置能通过 `config check` 且真能启动。
 - **没调工具要留痕**：注册了外部检查器、而假模型整个分片一次都没调时，断言这件事进 trace、出现在报告的同一份清单里、并出一条 `warn`；断言报告里「调了没发现问题」与「没调」呈现不同；断言这不影响退出码——它是提示不是失败。
 - **被掐断要留痕**：假模型只调工具不交结论，撞上轮数上限时断言掐断理由既进 trace 也进 `review` 的输出，并出现在 `report.md` 与 `summary.json` 的同一份清单里；断言掐断的那一轮仍能收到 `submit_comment` 的意见，即「被掐断」与「没产出」是两件事；断言模型自己收尾的分片**不带**这条记号——每次都出现的记号等于没有。

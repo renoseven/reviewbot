@@ -417,6 +417,7 @@ mod tests {
             by_severity: Vec::new(),
             skipped: Vec::new(),
             unreviewed: Vec::new(),
+            stopped: None,
             unproduced: Vec::new(),
             cut_short: Vec::new(),
             unavailable: Vec::new(),
