@@ -2001,9 +2001,7 @@ mod tests {
             chunks: vec![chunk("src/parse.c", r#"{"comments":[]}"#)],
             unreviewed: vec!["src/other.c".to_string()],
             stopped: Some("budget exhausted".to_string()),
-            unused_checkers: Vec::new(),
-            cut_short: Vec::new(),
-            unavailable: Vec::new(),
+            ..ReviewOutput::default()
         };
         assert_eq!(
             nothing_to_score(&stopped, &[], true),

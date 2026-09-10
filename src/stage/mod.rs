@@ -261,6 +261,17 @@ impl StageContext<'_> {
         Ok(())
     }
 
+    /// Write the checkpoint without marking the stage done.
+    pub fn save<T: Serialize>(&self, stage: Stage, output: &T) -> Result<(), StageError> {
+        self.recorder.save(stage, output)?;
+        Ok(())
+    }
+
+    /// The checkpoint as last written, whether or not the stage finished.
+    pub fn saved<T: DeserializeOwned>(&self, stage: Stage) -> Result<Option<T>, StageError> {
+        Ok(self.recorder.saved(stage)?)
+    }
+
     /// The one gate every model call passes: cap this request's output to
     /// what the money on hand buys, and refuse the call when that is no
     /// longer enough to answer with. The allowance is written onto the
@@ -282,7 +293,7 @@ impl StageContext<'_> {
 
     /// One model call with the wait visible on the log: a line before the
     /// HTTP round trip, and one after with duration, tokens and spend.
-    pub fn send_and_settle(&mut self, request: &Request) -> Result<Response, ProtocolError> {
+    pub fn send_and_settle(&mut self, request: &Request) -> Result<Response, StageError> {
         let started = Instant::now();
         tracing::info!(
             model = %request.model,
@@ -311,6 +322,10 @@ impl StageContext<'_> {
             budget: self.budget.ceiling(),
             currency: self.budget.currency().to_string(),
         });
+        // The one place money moves, so the one place it is written down.
+        // A run that dies mid-chunk still knows what it has already spent
+        // when it comes back.
+        self.recorder.record_spend(self.budget.spent())?;
         Ok(response)
     }
 }

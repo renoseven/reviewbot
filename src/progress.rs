@@ -142,8 +142,10 @@ pub enum Event {
         outcome: Outcome,
         from_checkpoint: bool,
     },
-    /// The review stage has moved on to a file. Counted from 1 for the reader
-    /// rather than from 0 for the loop.
+    /// The review stage has moved on to a file. `index` / `of` are that
+    /// file's place in the plan, counted from 1 — including files an earlier
+    /// attempt already finished, so a re-entered run does not look like it
+    /// started over.
     ///
     /// A file too big for one request is reviewed in several pieces, so `piece`
     /// says which one this is and `pieces` how many there are — 1 of 1 for a

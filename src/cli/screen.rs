@@ -612,7 +612,7 @@ mod tests {
             rows[FIRST_STAGE + 1]
         );
         assert!(
-            rows[FIRST_STAGE + 2].starts_with("▸ 3 review    file 1/7  ·  1.8300 / 10.0000 CNY"),
+            rows[FIRST_STAGE + 2].starts_with("▸ 3 review    file 3/7  ·  1.8300 / 10.0000 CNY"),
             "counted in files, and pieces only for a file that got cut: {:?}",
             rows[FIRST_STAGE + 2]
         );

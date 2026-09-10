@@ -10,7 +10,6 @@
 //! The facts live here rather than in either renderer, so the two cannot come
 //! to disagree about what the run said.
 
-use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -134,7 +133,6 @@ pub(super) struct State {
     /// assembled. Cleared by the next stage to start, for the same reason.
     pub(super) preparing: Option<Instant>,
     input_files: Option<usize>,
-    paths_seen: BTreeSet<String>,
 }
 
 impl Default for State {
@@ -169,7 +167,6 @@ impl Default for State {
             opening: Some(Instant::now()),
             preparing: None,
             input_files: None,
-            paths_seen: BTreeSet::new(),
         }
     }
 }
@@ -266,16 +263,17 @@ impl State {
                 Some(line)
             }
             Event::Chunk {
-                index: _,
+                index,
                 of,
                 path,
                 piece,
                 pieces,
             } => {
                 self.piece = Some((piece, pieces));
-                if self.paths_seen.insert(path.clone()) {
-                    self.files_seen += 1;
-                }
+                // The plan's place, not how many paths this process has
+                // seen: a re-entered run skips finished files and would
+                // otherwise look like it started at file 1 again.
+                self.files_seen = index;
                 self.path = Some(path.clone());
                 self.exchange = None;
                 self.waiting_since = None;
@@ -490,7 +488,7 @@ pub(crate) mod tests {
 run  change.diff  model deepseek-v4-flash  worktree /repo
 [1/6] input     9 files
 [2/6] triage    7 chunks, 2 files skipped
-[3/6] review    file 1/7  src/foo.c
+[3/6] review    file 3/7  src/foo.c
 [3/6] review    7 chunks reviewed
 "
         );
@@ -549,7 +547,7 @@ run  change.diff  model deepseek-v4-flash  worktree /repo
         let text = String::from_utf8(shared.0.lock().expect("lock").clone()).expect("utf8");
         assert_eq!(
             text,
-            "[3/6] review    file 1/4  src/bar.c  1.8300 / 10.0000 CNY\n"
+            "[3/6] review    file 2/4  src/bar.c  1.8300 / 10.0000 CNY\n"
         );
     }
 
@@ -560,7 +558,7 @@ run  change.diff  model deepseek-v4-flash  worktree /repo
 
         assert_eq!(state.piece, Some((1, 1)), "one request was enough for it");
         assert_eq!(state.path.as_deref(), Some("src/foo.c"));
-        assert_eq!(state.files_seen, 1);
+        assert_eq!(state.files_seen, 3);
         assert_eq!(state.files_total, Some(7), "9 files, 2 of them skipped");
         assert_eq!(state.exchange, Some((2, 6)));
         assert_eq!(state.run_id, "7f3a9c1e");
@@ -602,25 +600,69 @@ run  change.diff  model deepseek-v4-flash  worktree /repo
                 of: 7,
                 path: "src/baz.c".to_string(),
                 piece: 1,
-                pieces: 1,
+                pieces: 2,
             },
             now,
         );
-        assert_eq!(state.files_seen, 2);
+        assert_eq!(state.files_seen, 4);
 
         state.apply(
             Event::Chunk {
-                index: 5,
+                index: 4,
                 of: 7,
                 path: "src/baz.c".to_string(),
+                piece: 2,
+                pieces: 2,
+            },
+            now,
+        );
+        assert_eq!(
+            state.files_seen, 4,
+            "the same file split in two is one file"
+        );
+    }
+
+    /// A re-entered run emits only the files it still has to do. The number
+    /// on screen is that file's place in the plan, not "the first one this
+    /// process happened to look at".
+    #[test]
+    fn a_resumed_file_keeps_its_place_in_the_plan() {
+        let now = Instant::now();
+        let mut state = State::default();
+        state.apply(
+            Event::StageFinished {
+                stage: Stage::Input,
+                outcome: Outcome::Input { files: 65 },
+                from_checkpoint: true,
+            },
+            now,
+        );
+        state.apply(
+            Event::StageFinished {
+                stage: Stage::Triage,
+                outcome: Outcome::Triage {
+                    chunks: 57,
+                    skipped: 8,
+                },
+                from_checkpoint: true,
+            },
+            now,
+        );
+        let line = state.apply(
+            Event::Chunk {
+                index: 2,
+                of: 57,
+                path: "assets/style.css".to_string(),
                 piece: 1,
                 pieces: 1,
             },
             now,
         );
+        assert_eq!(state.files_seen, 2);
+        assert_eq!(state.files_total, Some(57));
         assert_eq!(
-            state.files_seen, 2,
-            "the same file split in two is one file"
+            line.as_deref(),
+            Some("[3/6] review    file 2/57  assets/style.css\n")
         );
     }
 }

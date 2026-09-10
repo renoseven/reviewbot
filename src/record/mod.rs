@@ -145,11 +145,39 @@ impl Recorder {
         }
     }
 
+    /// Write the checkpoint without marking the stage done. `review` does
+    /// this after each chunk so a re-entered run does not pay for those
+    /// again. The stage flag stays off until `complete`: a success flag
+    /// with work still behind it would be a lie.
+    pub fn save<T: Serialize>(&self, stage: Stage, output: &T) -> Result<(), RecordError> {
+        self.write_json(&layout::stage_file(stage), output)
+    }
+
+    /// The checkpoint as last written, whether or not the stage finished.
+    /// A file that will not parse is treated as missing: the stage starts
+    /// again rather than trusting a half-written snapshot.
+    pub fn saved<T: DeserializeOwned>(&self, stage: Stage) -> Result<Option<T>, RecordError> {
+        let file = layout::stage_file(stage);
+        let Some(bytes) = self.storage.read(&file)? else {
+            return Ok(None);
+        };
+        match serde_json::from_slice(&bytes) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) => {
+                tracing::warn!(
+                    %stage,
+                    %error,
+                    "in-progress checkpoint will not parse; starting the stage again"
+                );
+                Ok(None)
+            }
+        }
+    }
+
     /// Write the checkpoint, then record the stage as done. In that order:
     /// a success flag with no file behind it would be a lie.
     pub fn complete<T: Serialize>(&mut self, stage: Stage, output: &T) -> Result<(), RecordError> {
-        let file = layout::stage_file(stage);
-        self.write_json(&file, output)?;
+        self.save(stage, output)?;
         self.meta.mark_complete(stage);
         self.write_meta()
     }

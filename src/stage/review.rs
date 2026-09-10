@@ -1,5 +1,9 @@
 //! Stage 3. One model call per chunk, with the tool loop in between.
 //!
+//! Each finished chunk is written down before the next one starts, so a
+//! run that dies mid-review comes back from the next unpaid file rather
+//! than from the first.
+//!
 //! The assembled instructions stay byte identical across the run and `input`
 //! carries only this file's redacted diff plus whatever the loop appended.
 //! The protocol is stateless, so every round resends the whole conversation:
@@ -87,6 +91,12 @@ pub struct ReviewOutput {
     /// carried to the reader.
     #[serde(default)]
     pub unavailable: Vec<String>,
+    /// What the next piece of a cut file should be told, when this snapshot
+    /// was written between pieces. Cleared once the stage finishes. A
+    /// re-entered run restores it so the later piece still knows what the
+    /// earlier one filed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pending_handoff: Option<Handoff>,
 }
 
 /// Everything one finished chunk contributes to the stage output: the raw
@@ -109,7 +119,8 @@ struct ChunkRun {
 /// is worth carrying is much smaller — what was already reported, so the
 /// same defect is not filed twice, and what the model wants its successor to
 /// know, in its own words.
-struct Handoff {
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub(crate) struct Handoff {
     path: String,
     findings: Vec<String>,
     note: String,
@@ -169,21 +180,32 @@ impl Review {
         instructions: &str,
         narrative: Option<&str>,
     ) -> Result<ReviewOutput, StageError> {
-        let mut output = ReviewOutput {
-            // Written down before the first chunk, because it is true of the
-            // whole run and has to survive as far as the report whatever the
-            // chunks turn out to do.
-            unavailable: went_without(context.adapters.worktree.reach()),
-            ..ReviewOutput::default()
+        let mut output = match context.saved(Stage::Review)? {
+            Some(saved) => saved,
+            None => ReviewOutput {
+                // Written down before the first chunk, because it is true of
+                // the whole run and has to survive as far as the report
+                // whatever the chunks turn out to do.
+                unavailable: went_without(context.adapters.worktree.reach()),
+                ..ReviewOutput::default()
+            },
         };
-        let of = plan.chunks.len();
+        let of = file_count(&plan.chunks);
         // Pieces of one file are consecutive, so one slot is enough. Filtered
         // by path so a handoff can never reach a different file, whatever the
-        // plan's order turns out to be.
-        let mut handoff: Option<Handoff> = None;
-        for (index, chunk) in plan.chunks.iter().enumerate() {
+        // plan's order turns out to be. Restored from the last snapshot when
+        // this run is picking up a cut file mid-way.
+        let mut handoff = output.pending_handoff.take();
+        // Saved everything, then died before the stage was marked done: just
+        // finish the bookkeeping. Same if the money had already run out.
+        if output.stopped.is_some() || output.chunks.len() >= plan.chunks.len() {
+            output.pending_handoff = None;
+            context.complete(Stage::Review, &output)?;
+            return Ok(output);
+        }
+        for (index, chunk) in plan.chunks.iter().enumerate().skip(output.chunks.len()) {
             context.progress.emit(Event::Chunk {
-                index: chunk.index + 1,
+                index: file_number(&plan.chunks, index),
                 of,
                 path: chunk.path.clone(),
                 piece: chunk.piece + 1,
@@ -205,6 +227,7 @@ impl Review {
                     output.unused_checkers.extend(done.unused);
                     output.cut_short.extend(done.cut_short);
                     handoff = done.handoff;
+                    output.pending_handoff = handoff.clone();
                     // The money ran out part way through this chunk, which
                     // still concluded and still counts. Only what comes
                     // after it is left unreviewed.
@@ -212,8 +235,10 @@ impl Review {
                         tracing::warn!(chunk = index, "{reason}");
                         output.unreviewed = remaining_paths(&plan.chunks[index + 1..]);
                         output.stopped = Some(reason);
+                        output.pending_handoff = None;
                         break;
                     }
+                    context.save(Stage::Review, &output)?;
                 }
                 // The budget did not stretch to this chunk's first call, so
                 // nothing was paid for here and the chunk itself is
@@ -222,11 +247,13 @@ impl Review {
                     tracing::warn!(chunk = index, "{error}");
                     output.unreviewed = remaining_paths(&plan.chunks[index..]);
                     output.stopped = Some(error.to_string());
+                    output.pending_handoff = None;
                     break;
                 }
                 Err(other) => return Err(other),
             }
         }
+        output.pending_handoff = None;
         context.complete(Stage::Review, &output)?;
         Ok(output)
     }
@@ -1065,6 +1092,25 @@ fn bullets(lines: Vec<String>) -> String {
         .join("\n")
 }
 
+/// This file's place in the plan, counted from 1. Pieces of one file share
+/// a number: the screen counts files, and the piece fields say the rest.
+fn file_number(chunks: &[super::triage::Chunk], at: usize) -> usize {
+    chunks
+        .iter()
+        .take(at + 1)
+        .map(|chunk| chunk.path.as_str())
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
+fn file_count(chunks: &[super::triage::Chunk]) -> usize {
+    chunks
+        .iter()
+        .map(|chunk| chunk.path.as_str())
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
 /// The files behind the chunks that were never sent, each named once even
 /// when a big file was cut into several chunks.
 fn remaining_paths(chunks: &[super::triage::Chunk]) -> Vec<String> {
@@ -1838,6 +1884,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn file_number_counts_paths_not_pieces() {
+        let chunks = vec![
+            piece("src/parse.c", 0, 2),
+            piece("src/parse.c", 1, 2),
+            piece("src/lex.c", 0, 1),
+        ];
+        assert_eq!(file_number(&chunks, 0), 1);
+        assert_eq!(file_number(&chunks, 1), 1);
+        assert_eq!(file_number(&chunks, 2), 2);
+        assert_eq!(file_count(&chunks), 2);
+    }
+
     /// A chunk the model finished on its own terms is not cut short, or the
     /// note would appear on every run and stop meaning anything.
     #[test]
@@ -1852,6 +1911,125 @@ mod tests {
 
         assert_eq!(output.chunks.len(), 1);
         assert!(output.cut_short.is_empty(), "{:?}", output.cut_short);
+    }
+
+    /// The stage used to write nothing until every file was done, so a
+    /// Ctrl-C at file 4 of 65 threw away the first three. Each finished
+    /// chunk is now on disk; a second entry sends only what is left.
+    #[test]
+    fn an_interrupted_review_resumes_from_the_chunks_it_already_wrote() {
+        let mut fixture = StageFixture::scripted(
+            vec![Reply::calls(&[("submit_comment", COMMENT)]), Reply::Fail],
+            Limit::Amount(10.0),
+        )
+        .with_tools(with_submit(Registry::new()));
+        let plan = TriagePlan {
+            chunks: vec![piece("src/parse.c", 0, 1), piece("src/lex.c", 1, 1)],
+            ..TriagePlan::default()
+        };
+
+        {
+            let mut context = fixture.context();
+            let error = Review::run(&mut context, &plan, &instructions(), None)
+                .expect_err("the second file fails");
+            assert!(matches!(error, StageError::Protocol(_)), "{error}");
+        }
+        assert_eq!(
+            fixture.sent().len(),
+            2,
+            "the first file plus the call that failed"
+        );
+        let saved: ReviewOutput = fixture
+            .recorder()
+            .saved(Stage::Review)
+            .expect("readable")
+            .expect("the first file was written down");
+        assert_eq!(saved.chunks.len(), 1);
+        assert_eq!(saved.chunks[0].path, "src/parse.c");
+        assert!(
+            !fixture.recorder().meta().is_complete(Stage::Review),
+            "a half-finished stage must not look done"
+        );
+
+        fixture.queue([Reply::calls(&[("submit_comment", COMMENT)])]);
+        let output = {
+            let mut context = fixture.context();
+            Review::run(&mut context, &plan, &instructions(), None)
+                .expect("the second file finishes")
+        };
+
+        assert_eq!(output.chunks.len(), 2);
+        assert_eq!(output.chunks[0].path, "src/parse.c");
+        assert_eq!(output.chunks[1].path, "src/lex.c");
+        assert_eq!(fixture.sent().len(), 3, "the first file is not sent again");
+        assert!(
+            fixture.recorder().meta().is_complete(Stage::Review),
+            "the second entry marks the stage done"
+        );
+        let announced: Vec<(usize, usize, String)> = fixture
+            .progress()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Chunk {
+                    index, of, path, ..
+                } => Some((index, of, path)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            announced,
+            vec![
+                (1, 2, "src/parse.c".to_string()),
+                (2, 2, "src/lex.c".to_string()),
+                (2, 2, "src/lex.c".to_string()),
+            ],
+            "the second entry still names file 2, not file 1 of this process"
+        );
+    }
+
+    /// A cut file that dies between pieces must still tell the later piece
+    /// what the earlier one filed. That note lives on the in-progress
+    /// checkpoint, not only in memory.
+    #[test]
+    fn a_handoff_survives_an_interrupt_between_pieces() {
+        let mut fixture = StageFixture::scripted(
+            vec![Reply::calls(&[("submit_comment", COMMENT)]), Reply::Fail],
+            Limit::Amount(10.0),
+        )
+        .with_tools(with_submit(Registry::new()));
+        let plan = TriagePlan {
+            chunks: vec![piece("src/parse.c", 0, 2), piece("src/parse.c", 1, 2)],
+            ..TriagePlan::default()
+        };
+
+        {
+            let mut context = fixture.context();
+            Review::run(&mut context, &plan, &instructions(), None)
+                .expect_err("the second piece fails");
+        }
+        let saved: ReviewOutput = fixture
+            .recorder()
+            .saved(Stage::Review)
+            .expect("readable")
+            .expect("the first piece was written down");
+        assert!(
+            saved.pending_handoff.is_some(),
+            "the handoff has to be on disk, not only in memory"
+        );
+
+        fixture.queue([Reply::calls(&[("submit_comment", COMMENT)])]);
+        {
+            let mut context = fixture.context();
+            Review::run(&mut context, &plan, &instructions(), None)
+                .expect("the second piece finishes");
+        }
+
+        let second = &fixture.sent()[2];
+        let input = format!("{:?}", second.input);
+        assert!(
+            input.contains(": b") || input.contains("b"),
+            "the later piece is told what the earlier one filed: {input}"
+        );
     }
 
     /// A file cut into pieces used to give every piece the same `trace_id`,

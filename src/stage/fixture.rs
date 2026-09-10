@@ -66,6 +66,8 @@ pub enum Reply {
     Truncated {
         output_tokens: u32,
     },
+    /// The next send fails, so a test can stop a stage mid-way and come back.
+    Fail,
 }
 
 impl Reply {
@@ -123,6 +125,7 @@ impl Reply {
                 },
                 incomplete: Some("max_output_tokens".to_string()),
             },
+            Reply::Fail => unreachable!("Fail is handled in send, not turned into a response"),
         }
     }
 }
@@ -131,7 +134,7 @@ impl Reply {
 /// empty response, which is what a model that found nothing to say looks
 /// like on the wire.
 struct ScriptedProtocol {
-    replies: Mutex<VecDeque<Reply>>,
+    replies: Arc<Mutex<VecDeque<Reply>>>,
     sent: Arc<Mutex<Vec<Request>>>,
     /// What every reply reports having used, when a test asked for turns
     /// that cost money. Zero otherwise, which is what most stage tests
@@ -151,6 +154,13 @@ impl Protocol for ScriptedProtocol {
             sent.len()
         };
         let reply = self.replies.lock().expect("replies").pop_front();
+        if matches!(reply, Some(Reply::Fail)) {
+            return Err(ProtocolError::Fatal {
+                protocol: "openai",
+                reason: "scripted failure".to_string(),
+                status: None,
+            });
+        }
         let mut response = reply
             .map(|reply| reply.into_response(turn))
             .unwrap_or_default();
@@ -170,6 +180,7 @@ pub struct StageFixture {
     budget: Budget,
     paths: PathPolicy,
     sent: Arc<Mutex<Vec<Request>>>,
+    replies: Arc<Mutex<VecDeque<Reply>>>,
     billed: Arc<Mutex<TokenUsage>>,
     progress: Heard,
 }
@@ -223,6 +234,7 @@ impl StageFixture {
         .expect("valid config");
 
         let sent = Arc::new(Mutex::new(Vec::new()));
+        let replies = Arc::new(Mutex::new(replies.into_iter().collect()));
         let billed = Arc::new(Mutex::new(TokenUsage::default()));
         let mut tools = Registry::new();
         tools.register(Box::new(SubmitComment::new()));
@@ -239,7 +251,7 @@ impl StageFixture {
         let adapters = Adapters {
             platform: None,
             protocol: Box::new(ScriptedProtocol {
-                replies: Mutex::new(replies.into_iter().collect()),
+                replies: Arc::clone(&replies),
                 sent: Arc::clone(&sent),
                 billed: Arc::clone(&billed),
             }),
@@ -292,6 +304,7 @@ impl StageFixture {
             budget,
             paths,
             sent,
+            replies,
             billed,
             progress: Heard::default(),
         }
@@ -380,6 +393,12 @@ impl StageFixture {
     /// Every request the scripted model received, in order.
     pub fn sent(&self) -> Vec<Request> {
         self.sent.lock().expect("sent").clone()
+    }
+
+    /// Queue more replies after a scripted failure, so the same fixture can
+    /// pick the stage up again.
+    pub fn queue(&self, extra: impl IntoIterator<Item = Reply>) {
+        self.replies.lock().expect("replies").extend(extra);
     }
 
     pub fn report(&self) -> String {
