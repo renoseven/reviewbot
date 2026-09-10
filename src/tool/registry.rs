@@ -26,6 +26,13 @@ impl Registry {
             .map(|tool| tool.as_ref())
     }
 
+    /// Whether this name is a delivery tool this run registered.
+    /// An unknown name is not delivery: a failed look is still a look.
+    pub fn is_delivery(&self, name: &str) -> bool {
+        self.get(name)
+            .is_some_and(|tool| tool.purpose() == Purpose::Delivery)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
     }
@@ -45,12 +52,10 @@ impl Registry {
         self.tools.iter().map(|tool| tool.as_ref()).collect()
     }
 
-    /// The tools of one purpose that this run's worktree can actually answer,
-    /// which is what `review` needs so it can say a checker went unused. By
-    /// purpose, not by where the tool was written: what matters is that its
-    /// answer means something. And usable rather than merely registered,
-    /// because a checker this run cannot answer is not a checker nobody
-    /// bothered to call.
+    /// The tools of one purpose that this run's worktree can actually answer.
+    /// By purpose, not by where the tool was written: what matters is that
+    /// its answer means something. And usable rather than merely registered,
+    /// because a checker this run cannot answer is not one to prefetch.
     pub fn usable_with_purpose(&self, purpose: Purpose) -> Vec<&str> {
         self.tools
             .iter()

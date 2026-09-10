@@ -55,7 +55,7 @@ tests/                # 少量整装与 CLI 契约测试（assert_cmd）
 
 **M3 review 主干**。`protocol::openai` 打 `POST {base_url}/responses`，无流式、无 `previous_response_id`；prompt 六段写进 `src/prompts/review.md` 用 `include_str!`，`instructions` 在整个 run 内逐字不变，`input` 只装一个文件的 diff；调用前预算检查 + usage 结算 + 脱敏 + 瞬时故障退避重试（500ms 起、翻倍、上限 8s、抖动，只对超时 / 5xx / 429 / 空 body）。不含工具。
 
-**M4 merge + 报告**。七步：解析 → 剔越界（越出文件、`diff_lines` 一行都不落在变更行集合上即整条丢弃）→ 行号对齐（精确 → ±3 窗口 → `diff_lines` 兜底 → 退化文件级）→ 核对标注 → 去重（同 `path`、区间相交、正文规范化后逐字相同）→ 定序统计 → 汇总打分（单独一次模型调用，预算不足或不合 schema 就 `overall_score = null` 并写明原因，禁止填 0）。`publish` 先只做写 `report.md` / `summary.json`；trace 留在 `traces/`，不折进报告。
+**M4 merge + 报告**。七步：解析 → 剔越界（越出文件、`evidence.lines` 一行都不落在变更行集合上即整条丢弃）→ 行号对齐（精确 → ±3 窗口 → `evidence.lines` 兜底 → 退化文件级）→ 核对标注 → 去重（同 `path`、区间相交、正文规范化后逐字相同）→ 定序统计 → 汇总打分（单独一次模型调用，预算不足或不合 schema 就 `overall_score = null` 并写明原因，禁止填 0）。`publish` 先只做写 `report.md` / `summary.json`；trace 留在 `traces/`，不折进报告。
 
 **M5 platform + 发帖**。URL 解析 → host 匹配 `[[platform]]` → `kind` 由内置两条已知 host 或显式字段定，禁止从 `base_url` 形状反推；GitLab 逐条 discussions（带 `base_sha` / `start_sha` / `head_sha` 与 `new_line`），GitHub 一次 `POST .../reviews`；幂等标记 `<!-- reviewbot:{run_id}:{trace_id} -->`，汇总评论用 `{run_id}:summary`；发前拉已有评论比对，成功一条写一条 `published.json`；422 退化为文件级重试一次。流程到此走完。
 

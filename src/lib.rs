@@ -431,16 +431,12 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
     let reviewed_before: Option<ReviewOutput> = context.completed(Stage::Review)?;
     // One set of bytes for both stages: `review` sends them and `triage`
     // holds their measured size back from the window, and those two have to
-    // agree. Assembled only when one of them is going to run, because the
-    // layout digest in the instructions goes to the network -- a run re-entered
-    // with only the report and the posting left has no business fetching a tree.
+    // agree. Assembled only when one of them is going to run. The change
+    // list comes from the changeset already in hand — a run re-entered with
+    // only the report and the posting left has no business building either.
     let preamble = match planned.is_none() || reviewed_before.is_none() {
         true => {
-            // Between two stages and belonging to neither, so it says so
-            // itself: the tree this fetches is seconds of work on a large
-            // project, and no stage is running to account for them.
-            context.progress.emit(Event::Preparing);
-            let orientation = Orientation::build(context, &changeset);
+            let orientation = Orientation::build(&changeset);
             let instructions = stage::review::assemble_instructions(
                 context.tools,
                 context.worktree,
@@ -531,7 +527,6 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
             merged: &merged,
             unreviewed: &reviewed.unreviewed,
             stopped: reviewed.stopped.as_deref(),
-            cut_short: &reviewed.cut_short,
             unavailable: &reviewed.unavailable,
         },
     )?;

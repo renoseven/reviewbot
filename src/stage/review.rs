@@ -42,27 +42,6 @@ pub struct ChunkOutput {
     pub raw_output: String,
 }
 
-/// A chunk where external checkers could have answered and the model called
-/// none of them. Written on the chunk's trace: which checkers apply is a
-/// judgement the model makes from their descriptions, so an unused checker
-/// is not a gap in the change and does not belong in the report.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct UnusedCheckers {
-    pub path: String,
-    pub tools: Vec<String>,
-}
-
-/// A chunk where the loop, not the model, decided the investigation was over:
-/// the round ceiling, the context window, or a reply that spent the output
-/// budget before submitting anything. The model still gets one turn to hand
-/// over what it has, so this is not the same as producing nothing — but a
-/// chunk that never finished looking must not read like a clean one.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct CutShort {
-    pub path: String,
-    pub reason: String,
-}
-
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct ReviewOutput {
     pub chunks: Vec<ChunkOutput>,
@@ -72,15 +51,6 @@ pub struct ReviewOutput {
     /// money still finishes: it writes the report, names what it could not
     /// look at, and says so through the exit code.
     pub stopped: Option<String>,
-    /// Chunks that had a checker available and never used it. A trace note,
-    /// not a report item and not a failure: it does not touch the exit code.
-    #[serde(default)]
-    pub unused_checkers: Vec<UnusedCheckers>,
-    /// Chunks whose investigation the loop ended rather than the model. Also
-    /// a note rather than a failure, and named in the report: a file the
-    /// loop stopped looking at must not read like one it finished.
-    #[serde(default)]
-    pub cut_short: Vec<CutShort>,
     /// What this run's worktree could not do at all, in the report's words.
     ///
     /// Not a failure: reviewing a plain diff with nothing behind it is a
@@ -100,11 +70,9 @@ pub struct ReviewOutput {
 }
 
 /// Everything one finished chunk contributes to the stage output: the raw
-/// answer plus the two notes about how it was reached.
+/// answer plus the note about how it was reached.
 struct ChunkRun {
     output: ChunkOutput,
-    unused: Option<UnusedCheckers>,
-    cut_short: Option<CutShort>,
     /// Set when the money ran out inside this chunk. The chunk still counts
     /// — its findings are in `output` — but nothing after it may start.
     stopped: Option<String>,
@@ -151,15 +119,13 @@ const NARRATIVE_SUBJECT_CHARS: usize = 120;
 struct Conversation {
     input: Vec<InputItem>,
     trace: Trace,
-    /// Names of the tools the model actually called, for the unused check.
-    called: BTreeSet<String>,
     rounds: u32,
     /// True once the model has been told the investigation tools are gone.
     /// From then on the next reply is the last one, whatever it contains.
     concluding: bool,
-    /// Why the loop ended the investigation, when it was the loop's doing.
-    /// Stays `None` for a chunk the model finished on its own terms.
-    cut_short: Option<String>,
+    /// Why the loop asked for a concluding turn, when it did. The screen
+    /// shows it; the report does not keep a list.
+    concluding_why: Option<String>,
     /// The most recent reply text, kept apart from the trace's running log of
     /// every turn: only the last one is the model's word to the next piece.
     last_reply: String,
@@ -229,8 +195,6 @@ impl Review {
             ) {
                 Ok(done) => {
                     output.chunks.push(done.output);
-                    output.unused_checkers.extend(done.unused);
-                    output.cut_short.extend(done.cut_short);
                     handoff = done.handoff;
                     output.pending_handoff = handoff.clone();
                     // The money ran out part way through this chunk, which
@@ -290,10 +254,10 @@ impl Review {
         let concluding_schemas = context.tools.request_schemas(Round::Conclusion);
 
         // A checker opens the file itself, so the file under review has to be
-        // in the worktree before the first round — the prompt asks for
-        // checkers first, and a checker that cannot find the file is read as
-        // "this file does not exist". Free on a checkout, one fetch into a
-        // cache, and skipped when no checker of this run can answer anyway.
+        // in the worktree before the first round — a checker that cannot find
+        // the file is read as "this file does not exist". Free on a checkout,
+        // one fetch into a cache, and skipped when no checker of this run can
+        // answer anyway.
         if !context.tools.usable_with_purpose(Purpose::Check).is_empty()
             && let Err(error) = context
                 .worktree
@@ -354,10 +318,9 @@ impl Review {
         let mut chat = Conversation {
             input,
             trace,
-            called: BTreeSet::new(),
             rounds: 0,
             concluding: false,
-            cut_short: None,
+            concluding_why: None,
             last_reply: String::new(),
             submissions: Vec::new(),
         };
@@ -455,7 +418,7 @@ impl Review {
             // as one is how this came out as `round 13/12`.
             match chat.concluding {
                 true => context.progress.emit(Event::Concluding {
-                    why: chat.cut_short.clone().unwrap_or_default(),
+                    why: chat.concluding_why.clone().unwrap_or_default(),
                 }),
                 false => context.progress.emit(Event::Round {
                     round: chat.rounds + 1,
@@ -477,27 +440,47 @@ impl Review {
                 continue;
             }
             if calls.is_empty() {
+                // An empty body is "found nothing". Prose with no call is
+                // the other way a finding disappears: the model wrote
+                // finish_review or the comments in the chat, and the loop
+                // treated that as an empty list. Ask once, the way a
+                // truncated reply is asked once; a second prose turn ends.
+                if !chat.concluding && !response.output_text().trim().is_empty() {
+                    chat.ask_after_prose(context.redactor)?;
+                    continue;
+                }
                 break comments_json(&chat.submissions);
             }
 
-            chat.rounds += 1;
-            let delivered = Self::run_round(context, &mut chat, path, &calls, round_bytes);
-            if delivered || chat.concluding {
+            // submit_comment and finish_review are how a finding is handed
+            // over and how the file ends. They are not investigation, so
+            // they do not spend the ceiling. A turn that only delivers
+            // continues or ends without bumping the count.
+            let investigated = calls
+                .iter()
+                .any(|(_, name, _)| !context.tools.is_delivery(name));
+            if investigated {
+                chat.rounds += 1;
+            }
+            let concluded = Self::run_round(context, &mut chat, path, &calls, round_bytes);
+            if concluded || chat.concluding {
                 break comments_json(&chat.submissions);
             }
 
-            match chat.rounds >= max_rounds {
-                true => chat.conclude(
-                    context.redactor,
-                    format!("the tool loop reached its ceiling of {max_rounds} rounds"),
-                )?,
-                // Said every round, because the prompt asks the model to spend
-                // this budget wisely and until now never told it the balance.
-                false => chat.say_rounds_left(context.redactor, max_rounds)?,
+            if investigated {
+                match chat.rounds >= max_rounds {
+                    true => chat.conclude(
+                        context.redactor,
+                        format!("the tool loop reached its ceiling of {max_rounds} rounds"),
+                    )?,
+                    // Ordinary rounds get nothing. The count was read as a
+                    // quota. The last-round warning is the one sentence that
+                    // changes what the next call should do.
+                    false => chat.warn_if_last_round(context.redactor, max_rounds)?,
+                }
             }
         };
 
-        let unused = chat.note_unused_checkers(path, context.tools);
         context.recorder.write_trace(&chat.trace)?;
         let handoff = match chunk.piece + 1 < chunk.pieces {
             true => Some(chat.handoff(path, carried)),
@@ -509,19 +492,16 @@ impl Review {
                 trace_id,
                 raw_output,
             },
-            unused,
-            cut_short: chat.cut_short.map(|reason| CutShort {
-                path: path.to_string(),
-                reason,
-            }),
             stopped,
             handoff,
         })
     }
 
-    /// Every call the model made in one round. Returns true when this round
-    /// was the conclusion: only deliveries, whether that means findings or the
-    /// model saying it has none. Read off the calls' own answers rather than
+    /// Every call the model made in one turn. Returns true when this turn
+    /// carried an end signal: `finish_review`. A recorded finding is not
+    /// that signal — one file can file several, and a model that speaks
+    /// function calls files them one call at a time. A blank submit is
+    /// refused, not an ending. Read off the calls' own answers rather than
     /// off their names — an end signal recognised by name is one more place
     /// that has to agree with the registry.
     fn run_round(
@@ -541,9 +521,7 @@ impl Review {
         let mut room = round_bytes;
         let mut delivered = 0;
         let mut finished = 0;
-        let mut other = 0;
         for (call_id, name, arguments) in calls {
-            chat.called.insert(name.clone());
             // Said here rather than inside `execute_call`, which answers to
             // the registry and the redactor and nothing else. The moment is
             // the same one: the call is about to run.
@@ -562,7 +540,7 @@ impl Review {
                     delivered += 1;
                 }
                 None if call.finished => finished += 1,
-                None => other += 1,
+                None => {}
             }
             let output = fit_into_round(call.output, &mut room);
             chat.trace.tool_calls.push(ToolCall {
@@ -583,7 +561,7 @@ impl Review {
             // chunk that produced nothing because something went wrong.
             chat.note("the model finished this file with nothing to file".to_string());
         }
-        other == 0 && (delivered > 0 || finished > 0)
+        finished > 0
     }
 }
 
@@ -594,7 +572,7 @@ impl Conversation {
     fn conclude(&mut self, redactor: &Redactor, why: String) -> Result<(), StageError> {
         self.concluding = true;
         tracing::warn!("{why}");
-        self.cut_short = Some(why.clone());
+        self.concluding_why = Some(why.clone());
         self.note(why);
         self.input.push(InputItem::Message {
             role: Role::User,
@@ -603,23 +581,15 @@ impl Conversation {
         Ok(())
     }
 
-    /// Where the count stands, and a word when the next round is the last one
-    /// there is: a model that has been asked to ration its rounds can only do
-    /// that if it knows how many are left.
-    fn say_rounds_left(&mut self, redactor: &Redactor, total: u32) -> Result<(), StageError> {
-        let warning = match self.rounds + 1 >= total {
-            true => Some(Prompts::ROUNDS_LAST.text()?),
-            false => None,
-        };
-        let content = Prompts::ROUNDS_LEFT
-            .fill()
-            .set("used", self.rounds.to_string())
-            .set("total", total.to_string())
-            .maybe("warning", warning)
-            .render()?;
+    /// The next round is the last one there is. Earlier rounds get no
+    /// note: showing the remaining count was read as a quota to spend.
+    fn warn_if_last_round(&mut self, redactor: &Redactor, total: u32) -> Result<(), StageError> {
+        if self.rounds + 1 < total {
+            return Ok(());
+        }
         self.input.push(InputItem::Message {
             role: Role::User,
-            content: redactor.redact(&content),
+            content: redactor.redact(&Prompts::ROUNDS_LAST.text()?),
         });
         Ok(())
     }
@@ -630,7 +600,7 @@ impl Conversation {
         let why = "the model reply was truncated before any finding; asking once more".to_string();
         self.concluding = true;
         tracing::warn!("{why}");
-        self.cut_short = Some(why.clone());
+        self.concluding_why = Some(why.clone());
         self.note(why);
         self.input.push(InputItem::Message {
             role: Role::User,
@@ -674,7 +644,7 @@ impl Conversation {
             .unwrap_or_default();
         for finding in &self.submissions {
             let line = finding
-                .get("line")
+                .get("start_line")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0);
             let body = finding
@@ -703,31 +673,18 @@ impl Conversation {
         self.trace.note(Stage::Review, note);
     }
 
-    /// A checker that could have answered and never was called is a trace
-    /// note: the operator can see a chunk nobody scanned. It is not a report
-    /// item, because which checkers apply is the model's call from their
-    /// descriptions, and a C checker left unused on a Rust file is not a
-    /// gap in the change. Only the ones this run's worktree can answer
-    /// count — a checker that would have refused is not a checker the
-    /// model neglected.
-    fn note_unused_checkers(&mut self, path: &str, tools: &Registry) -> Option<UnusedCheckers> {
-        let usable: Vec<String> = tools
-            .usable_with_purpose(Purpose::Check)
-            .into_iter()
-            .map(|name| name.to_string())
-            .collect();
-        if usable.is_empty() || usable.iter().any(|name| self.called.contains(name)) {
-            return None;
-        }
-        let names = usable.join(", ");
-        self.trace.note(
-            Stage::Review,
-            format!("external checkers were available ({names}) and the model called none of them"),
-        );
-        Some(UnusedCheckers {
-            path: path.to_string(),
-            tools: usable,
-        })
+    /// One extra turn after a review written in the chat body. Delivery
+    /// tools stay; investigation tools come off — the model already decided
+    /// it was done. Not a cut-short: the loop did not end the looking, it
+    /// asked for the call that was missing.
+    fn ask_after_prose(&mut self, redactor: &Redactor) -> Result<(), StageError> {
+        self.concluding = true;
+        self.note("the model wrote a review as prose; asking once for a function call".to_string());
+        self.input.push(InputItem::Message {
+            role: Role::User,
+            content: redactor.redact(&Prompts::AFTER_PROSE.text()?),
+        });
+        Ok(())
     }
 }
 
@@ -922,12 +879,13 @@ pub(crate) fn narrative_preface(
 /// file is told nothing: the ordinary case must keep sending the ordinary
 /// bytes, or every review pays for a caveat that does not apply to it.
 ///
-/// Three things are worth saying, each with one home in the templates. That the
+/// Three things are worth saying, each with one home in `split.md`. That the
 /// file was cut — otherwise the model reads a partial file as the whole of it
 /// and concludes that the definition it cannot see does not exist. What the
 /// earlier pieces already filed, so the same defect is not reported twice under
 /// two `trace_id`s. And, unless this is the last piece, that it owes the next
-/// one a handoff.
+/// one a handoff. The slots fill the list and the note; the headings stay in
+/// the template and leave with an empty slot.
 fn split_preface(
     chunk: &super::triage::Chunk,
     carried: Option<&Handoff>,
@@ -935,53 +893,39 @@ fn split_preface(
     if !chunk.is_split() {
         return Ok(None);
     }
-    let earlier = match carried.filter(|previous| !previous.findings.is_empty()) {
-        Some(previous) => {
-            let listed = CappedList::new(
+    let earlier = carried
+        .filter(|previous| !previous.findings.is_empty())
+        .map(|previous| {
+            CappedList::new(
                 previous.findings.clone(),
                 HANDOFF_FINDINGS,
                 Keep::Last,
                 Overflow::Silent,
-            );
-            Some(
-                Prompts::SPLIT_FINDINGS
-                    .fill()
-                    .set("findings", listed.render())
-                    .render()?,
             )
-        }
-        None => None,
-    };
-    let note = match carried.filter(|previous| !previous.note.is_empty()) {
-        Some(previous) => Some(
-            Prompts::SPLIT_NOTE
-                .fill()
-                .set("note", previous.note.clone())
-                .render()?,
-        ),
-        None => None,
-    };
-    let handoff = match chunk.piece + 1 < chunk.pieces {
-        true => Some(Prompts::SPLIT_HANDOFF.text()?),
-        false => None,
-    };
+            .render()
+        });
+    let note = carried
+        .filter(|previous| !previous.note.is_empty())
+        .map(|previous| previous.note.clone());
     let text = Prompts::SPLIT
         .fill()
         .set("pieces", chunk.pieces.to_string())
         .set("piece", (chunk.piece + 1).to_string())
-        .maybe("earlier_findings", earlier)
-        .maybe("previous_note", note)
-        .maybe("handoff_request", handoff)
-        .render()?;
+        .maybe("findings", earlier)
+        .maybe("note", note);
+    let text = match chunk.piece + 1 < chunk.pieces {
+        true => text.keep("handoff"),
+        false => text.omit("handoff"),
+    }
+    .render()?;
     Ok(Some(text))
 }
 
-/// The six-section body plus the three things that vary by run rather than by
-/// chunk: which abilities exist, what else this change touches, and the shape
-/// of the repository. Filled once, so every chunk sees the same bytes — which
-/// is what the vendor's prompt cache needs, and what makes the whole-change
-/// view affordable at all: it is paid for on the first chunk and cached for the
-/// rest.
+/// The six-section body plus the two things that vary by run rather than by
+/// chunk: which abilities exist, and what else this change touches. Filled
+/// once, so every chunk sees the same bytes — which is what the vendor's
+/// prompt cache needs, and what makes the whole-change view affordable at
+/// all: it is paid for on the first chunk and cached for the rest.
 pub(crate) fn assemble_instructions(
     tools: &Registry,
     worktree: &Worktree,
@@ -991,12 +935,10 @@ pub(crate) fn assemble_instructions(
     let assembled = Prompts::REVIEW
         .fill()
         .set("capabilities", capability_paragraph(tools, worktree)?)
-        // Either of these can be missing rather than empty, and the template
-        // takes the whole section away with the value: a heading with nothing
-        // under it would say this change touched one file, or that the
-        // repository has no shape, neither of which is what happened.
+        // Missing rather than empty: the template takes the whole section
+        // away with the value. A heading with nothing under it would say
+        // this change touched one file, which is not what happened.
         .set("change", orientation.change.clone())
-        .set("layout", orientation.layout.clone())
         .render()?;
     Ok(redactor.redact(&assembled))
 }
@@ -1113,8 +1055,14 @@ mod tests {
         tools
     }
 
-    const COMMENT: &str = r#"{"path":"src/parse.c","line":1,"body":"b",
-                              "suggestion":"s","severity_score":50,"confidence_score":80,"evidence":{"diff_lines":[1]}}"#;
+    const COMMENT: &str = r#"{"path":"src/parse.c","start_line":1,"body":"b",
+                              "suggestion":"s","severity_score":50,"confidence_score":80,"evidence":{"lines":[1]}}"#;
+
+    /// A recorded finding is not the end of the file. Tests that mean "this
+    /// chunk is done" have to send the end signal too.
+    fn filed() -> Reply {
+        Reply::calls(&[("submit_comment", COMMENT), ("finish_review", "{}")])
+    }
 
     struct Listed;
 
@@ -1345,7 +1293,6 @@ mod tests {
             .fill()
             .set("capabilities", "- `submit_comment`: hand over a finding")
             .omit("change")
-            .omit("layout")
             .render()
             .expect("the shipped prompt fills")
     }
@@ -1403,7 +1350,7 @@ mod tests {
         let mut fixture = StageFixture::scripted(
             vec![
                 Reply::calls(&[("cppcheck", r#"{"path":"src/parse.c"}"#)]),
-                Reply::calls(&[("submit_comment", COMMENT)]),
+                filed(),
             ],
             Limit::Amount(10.0),
         )
@@ -1434,22 +1381,24 @@ mod tests {
             "{replayed:?}"
         );
 
-        assert!(output.unused_checkers.is_empty(), "the checker was called");
         let trace = fixture
             .recorder()
             .read_trace("review-src_parse.c")
             .expect("readable")
             .expect("the trace is on disk");
-        assert_eq!(trace.tool_calls.len(), 2);
+        assert_eq!(trace.tool_calls.len(), 3);
         assert!(trace.tool_calls[0].succeeded);
         assert_eq!(trace.tool_calls[0].output, "clean for src/parse.c");
     }
 
     #[test]
     fn submit_comment_without_a_path_uses_the_file_under_review() {
-        const BARE: &str = r#"{"line":1,"body":"b","suggestion":"s","severity_score":50,"confidence_score":80,"evidence":{"diff_lines":[1]}}"#;
+        const BARE: &str = r#"{"start_line":1,"body":"b","suggestion":"s","severity_score":50,"confidence_score":80,"evidence":{"lines":[1]}}"#;
         let mut fixture = StageFixture::scripted(
-            vec![Reply::calls(&[("submit_comment", BARE)])],
+            vec![Reply::calls(&[
+                ("submit_comment", BARE),
+                ("finish_review", "{}"),
+            ])],
             Limit::Amount(10.0),
         )
         .with_tools(with_submit(Registry::new()));
@@ -1477,16 +1426,48 @@ mod tests {
         );
     }
 
+    /// A recorded finding used to end the file. The model filed one and the
+    /// rest never got a turn. The end signal is finish_review; submit is how
+    /// a finding is handed over, one call at a time. Delivery does not spend
+    /// the investigation ceiling, so the default one-round plan is enough.
     #[test]
-    fn an_empty_submit_comment_ends_the_chunk_without_a_retry() {
+    fn a_recorded_finding_is_not_the_end_of_the_file() {
         let mut fixture = StageFixture::scripted(
-            vec![Reply::calls(&[("submit_comment", "{}")])],
+            vec![
+                Reply::calls(&[("submit_comment", COMMENT)]),
+                Reply::calls(&[("submit_comment", COMMENT)]),
+                Reply::calls(&[("finish_review", "{}")]),
+            ],
             Limit::Amount(10.0),
         )
         .with_tools(with_submit(Registry::new()));
 
         let output = review(&mut fixture);
-        assert_eq!(fixture.sent().len(), 1, "an empty call is not retried");
+        assert_eq!(fixture.sent().len(), 3, "each finding is its own turn");
+        assert_eq!(
+            output.chunks[0]
+                .raw_output
+                .matches("confidence_score")
+                .count(),
+            2,
+            "{}",
+            output.chunks[0].raw_output
+        );
+    }
+
+    #[test]
+    fn an_empty_submit_comment_is_refused_and_the_file_is_not_over() {
+        let mut fixture = StageFixture::scripted(
+            vec![
+                Reply::calls(&[("submit_comment", "{}")]),
+                Reply::calls(&[("finish_review", "{}")]),
+            ],
+            Limit::Amount(10.0),
+        )
+        .with_tools(with_submit(Registry::new()));
+
+        let output = review(&mut fixture);
+        assert_eq!(fixture.sent().len(), 2, "a refused submit is not an ending");
         assert!(
             output.chunks[0].raw_output.contains(r#""comments":[]"#),
             "{}",
@@ -1497,11 +1478,34 @@ mod tests {
             .read_trace("review-src_parse.c")
             .expect("readable")
             .expect("the trace is on disk");
-        assert!(trace.tool_calls[0].succeeded);
+        assert!(!trace.tool_calls[0].succeeded);
         assert!(
-            trace.tool_calls[0].output.contains("nothing filed"),
+            trace.tool_calls[0].output.contains("finish_review"),
             "{}",
             trace.tool_calls[0].output
+        );
+    }
+
+    /// The default plan is one investigation round. Filing and finishing
+    /// used to spend it, so a submit then a finish was already over the
+    /// ceiling. They are not a look.
+    #[test]
+    fn delivery_turns_do_not_consume_the_investigation_ceiling() {
+        let mut fixture = StageFixture::scripted(
+            vec![
+                Reply::calls(&[("submit_comment", COMMENT)]),
+                Reply::calls(&[("finish_review", "{}")]),
+            ],
+            Limit::Amount(10.0),
+        )
+        .with_tools(with_submit(Registry::new()));
+
+        let output = review(&mut fixture);
+        assert_eq!(fixture.sent().len(), 2);
+        assert!(
+            output.chunks[0].raw_output.contains("confidence_score"),
+            "{}",
+            output.chunks[0].raw_output
         );
     }
 
@@ -1512,7 +1516,7 @@ mod tests {
     #[test]
     fn a_budget_below_a_full_thinking_ceiling_still_sends_a_capped_call() {
         let mut fixture = StageFixture::scripted(
-            vec![Reply::calls(&[("submit_comment", "{}")])],
+            vec![Reply::calls(&[("finish_review", "{}")])],
             Limit::Amount(0.1),
         )
         .with_price(Price {
@@ -1550,7 +1554,7 @@ mod tests {
             vec![
                 Reply::calls(&[("cppcheck", r#"{"path":"src/parse.c"}"#)]),
                 Reply::calls(&[("cppcheck", r#"{"path":"src/parse.c"}"#)]),
-                Reply::calls(&[("submit_comment", COMMENT)]),
+                filed(),
             ],
             Limit::Amount(0.1),
         )
@@ -1597,11 +1601,6 @@ mod tests {
             "{:?}",
             output.stopped
         );
-        assert!(
-            output.cut_short[0].reason.contains("budget ran out"),
-            "the report has to be able to say that file was not finished: {:?}",
-            output.cut_short
-        );
         let sent = fixture.sent();
         assert!(
             sent.last()
@@ -1610,36 +1609,6 @@ mod tests {
                 .iter()
                 .all(|tool| tool.name != "cppcheck"),
             "the concluding turn has no investigation tools left"
-        );
-    }
-
-    /// "The checker found nothing" and "the checker never ran" have to read
-    /// differently on the trace; the second one is written down and the first
-    /// is not. Neither is a report item.
-    #[test]
-    fn a_checker_nobody_called_is_recorded_and_one_that_was_called_is_not() {
-        let (tools, _) = counted("clean");
-        let mut fixture =
-            StageFixture::scripted(vec![Reply::Message(String::new())], Limit::Amount(10.0))
-                .with_tools(tools);
-
-        let output = review(&mut fixture);
-
-        assert_eq!(output.unused_checkers.len(), 1);
-        assert_eq!(output.unused_checkers[0].path, "src/parse.c");
-        assert_eq!(output.unused_checkers[0].tools, vec!["cppcheck"]);
-        let trace = fixture
-            .recorder()
-            .read_trace("review-src_parse.c")
-            .expect("readable")
-            .expect("the trace is on disk");
-        assert!(
-            trace
-                .notes_by(Stage::Review)
-                .iter()
-                .any(|check| check.contains("called none of them")),
-            "{:?}",
-            trace.checks
         );
     }
 
@@ -1652,7 +1621,7 @@ mod tests {
             vec![
                 Reply::calls(&[("cppcheck", r#"{"path":"a"}"#)]),
                 Reply::calls(&[("cppcheck", r#"{"path":"b"}"#)]),
-                Reply::calls(&[("submit_comment", COMMENT)]),
+                filed(),
             ],
             Limit::Amount(10.0),
         )
@@ -1679,17 +1648,17 @@ mod tests {
         );
     }
 
-    /// The prompt asks the model to ration its rounds, which it can only do if
-    /// it is told the balance. Said after every round it spends, with a word
-    /// when the next one is the last.
+    /// Ordinary rounds get no balance. The turn before the ceiling is
+    /// told it is the last, so the next batch of calls can take what is
+    /// still needed.
     #[test]
-    fn every_round_says_how_many_have_been_used() {
+    fn only_the_round_before_the_ceiling_is_told_it_is_the_last() {
         let (tools, _) = counted("clean");
         let mut fixture = StageFixture::scripted(
             vec![
                 Reply::calls(&[("cppcheck", r#"{"path":"a"}"#)]),
                 Reply::calls(&[("cppcheck", r#"{"path":"b"}"#)]),
-                Reply::calls(&[("submit_comment", COMMENT)]),
+                filed(),
             ],
             Limit::Amount(10.0),
         )
@@ -1698,27 +1667,30 @@ mod tests {
         review_over(&mut fixture, &plan_with("src/parse.c", 3, 32_768));
 
         let sent = fixture.sent();
-        let counts: Vec<&str> = sent
+        let notes: Vec<&str> = sent
             .iter()
             .flat_map(|request| request.input.iter())
             .filter_map(|item| match item {
-                InputItem::Message { content, .. } if content.contains("rounds used") => {
+                InputItem::Message { content, .. }
+                    if content.contains("rounds used")
+                        || content.contains("This is the last one") =>
+                {
                     Some(content.as_str())
                 }
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            counts.first().map(|said| said.trim()),
-            Some("1 of 3 rounds used."),
-            "{counts:?}"
-        );
         assert!(
-            counts
-                .last()
-                .is_some_and(|said| said.contains("2 of 3 rounds used.")
-                    && said.contains("This is the last one")),
-            "the round before the ceiling says so: {counts:?}"
+            notes.iter().all(|said| !said.contains("rounds used")),
+            "the count was read as a quota: {notes:?}"
+        );
+        assert_eq!(
+            notes
+                .iter()
+                .filter(|said| said.contains("This is the last one"))
+                .count(),
+            1,
+            "the last-round warning lands once: {notes:?}"
         );
     }
 
@@ -1734,7 +1706,7 @@ mod tests {
             vec![
                 Reply::calls(&[("cppcheck", r#"{"path":"a"}"#)]),
                 Reply::calls(&[("cppcheck", r#"{"path":"b"}"#)]),
-                Reply::calls(&[("submit_comment", COMMENT)]),
+                filed(),
                 Reply::calls(&[("cppcheck", r#"{"path":"c"}"#)]),
             ],
             Limit::Amount(10.0),
@@ -1767,14 +1739,6 @@ mod tests {
         assert!(output.chunks[0].raw_output.contains("confidence_score"));
         // The fourth scripted turn was never asked for: the loop stopped.
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        // Findings came back, so nothing else says this chunk was hurried.
-        assert_eq!(output.cut_short.len(), 1);
-        assert_eq!(output.cut_short[0].path, "src/parse.c");
-        assert!(
-            output.cut_short[0].reason.contains("ceiling of 2 rounds"),
-            "{:?}",
-            output.cut_short[0]
-        );
     }
 
     /// The reason the two content sources were merged into one worktree: a run
@@ -1787,7 +1751,7 @@ mod tests {
         let fixture = StageFixture::scripted(
             vec![
                 Reply::calls(&[("cppcheck", r#"{"path":"src/parse.c"}"#)]),
-                Reply::calls(&[("submit_comment", COMMENT)]),
+                filed(),
             ],
             Limit::Amount(10.0),
         )
@@ -1840,7 +1804,6 @@ mod tests {
 
         assert_eq!(fixture.sent().len(), 1, "one turn, and it ended there");
         assert_eq!(output.chunks[0].raw_output, r#"{"comments":[]}"#);
-        assert!(output.cut_short.is_empty(), "{:?}", output.cut_short);
         let trace = fixture
             .recorder()
             .read_trace("review-src_parse.c")
@@ -1874,16 +1837,12 @@ mod tests {
     /// note would appear on every run and stop meaning anything.
     #[test]
     fn a_chunk_the_model_finished_itself_carries_no_note() {
-        let mut fixture = StageFixture::scripted(
-            vec![Reply::calls(&[("submit_comment", COMMENT)])],
-            Limit::Amount(10.0),
-        )
-        .with_tools(with_submit(Registry::new()));
+        let mut fixture = StageFixture::scripted(vec![filed()], Limit::Amount(10.0))
+            .with_tools(with_submit(Registry::new()));
 
         let output = review(&mut fixture);
 
         assert_eq!(output.chunks.len(), 1);
-        assert!(output.cut_short.is_empty(), "{:?}", output.cut_short);
     }
 
     /// The stage used to write nothing until every file was done, so a
@@ -1891,11 +1850,8 @@ mod tests {
     /// chunk is now on disk; a second entry sends only what is left.
     #[test]
     fn an_interrupted_review_resumes_from_the_chunks_it_already_wrote() {
-        let mut fixture = StageFixture::scripted(
-            vec![Reply::calls(&[("submit_comment", COMMENT)]), Reply::Fail],
-            Limit::Amount(10.0),
-        )
-        .with_tools(with_submit(Registry::new()));
+        let mut fixture = StageFixture::scripted(vec![filed(), Reply::Fail], Limit::Amount(10.0))
+            .with_tools(with_submit(Registry::new()));
         let plan = TriagePlan {
             chunks: vec![piece("src/parse.c", 0, 1), piece("src/lex.c", 1, 1)],
             ..TriagePlan::default()
@@ -1924,7 +1880,7 @@ mod tests {
             "a half-finished stage must not look done"
         );
 
-        fixture.queue([Reply::calls(&[("submit_comment", COMMENT)])]);
+        fixture.queue([filed()]);
         let output = {
             let mut context = fixture.context();
             Review::run(&mut context, &plan, &instructions(), None)
@@ -1965,11 +1921,8 @@ mod tests {
     /// checkpoint, not only in memory.
     #[test]
     fn a_handoff_survives_an_interrupt_between_pieces() {
-        let mut fixture = StageFixture::scripted(
-            vec![Reply::calls(&[("submit_comment", COMMENT)]), Reply::Fail],
-            Limit::Amount(10.0),
-        )
-        .with_tools(with_submit(Registry::new()));
+        let mut fixture = StageFixture::scripted(vec![filed(), Reply::Fail], Limit::Amount(10.0))
+            .with_tools(with_submit(Registry::new()));
         let plan = TriagePlan {
             chunks: vec![piece("src/parse.c", 0, 2), piece("src/parse.c", 1, 2)],
             ..TriagePlan::default()
@@ -1990,7 +1943,7 @@ mod tests {
             "the handoff has to be on disk, not only in memory"
         );
 
-        fixture.queue([Reply::calls(&[("submit_comment", COMMENT)])]);
+        fixture.queue([filed()]);
         {
             let mut context = fixture.context();
             Review::run(&mut context, &plan, &instructions(), None)
@@ -2010,14 +1963,8 @@ mod tests {
     /// pieces pointed at the last piece's evidence.
     #[test]
     fn the_pieces_of_one_file_get_a_trace_each() {
-        let mut fixture = StageFixture::scripted(
-            vec![
-                Reply::calls(&[("submit_comment", COMMENT)]),
-                Reply::calls(&[("submit_comment", COMMENT)]),
-            ],
-            Limit::Amount(10.0),
-        )
-        .with_tools(with_submit(Registry::new()));
+        let mut fixture = StageFixture::scripted(vec![filed(), filed()], Limit::Amount(10.0))
+            .with_tools(with_submit(Registry::new()));
         let plan = TriagePlan {
             chunks: vec![piece("src/parse.c", 0, 2), piece("src/parse.c", 1, 2)],
             ..TriagePlan::default()
@@ -2052,14 +1999,8 @@ mod tests {
     /// assembly buys — "the prompt that went out" is now one thing to compare.
     #[test]
     fn every_chunk_of_a_run_gets_the_same_prompt_bytes() {
-        let mut fixture = StageFixture::scripted(
-            vec![
-                Reply::calls(&[("submit_comment", COMMENT)]),
-                Reply::calls(&[("submit_comment", COMMENT)]),
-            ],
-            Limit::Amount(10.0),
-        )
-        .with_tools(with_submit(Registry::new()));
+        let mut fixture = StageFixture::scripted(vec![filed(), filed()], Limit::Amount(10.0))
+            .with_tools(with_submit(Registry::new()));
         let plan = TriagePlan {
             chunks: vec![piece("src/parse.c", 0, 1), piece("src/lex.c", 1, 1)],
             ..TriagePlan::default()
@@ -2099,11 +2040,8 @@ mod tests {
     /// piece suffix cannot creep into every trace id in the run directory.
     #[test]
     fn a_whole_file_keeps_the_plain_trace_id() {
-        let mut fixture = StageFixture::scripted(
-            vec![Reply::calls(&[("submit_comment", COMMENT)])],
-            Limit::Amount(10.0),
-        )
-        .with_tools(with_submit(Registry::new()));
+        let mut fixture = StageFixture::scripted(vec![filed()], Limit::Amount(10.0))
+            .with_tools(with_submit(Registry::new()));
 
         let output = review(&mut fixture);
 
@@ -2123,9 +2061,9 @@ mod tests {
             vec![
                 Reply::saying(
                     "the header guard is opened in this piece",
-                    &[("submit_comment", COMMENT)],
+                    &[("submit_comment", COMMENT), ("finish_review", "{}")],
                 ),
-                Reply::calls(&[("submit_comment", COMMENT)]),
+                filed(),
             ],
             Limit::Amount(10.0),
         )
@@ -2145,6 +2083,14 @@ mod tests {
         let first = message(&sent[0].input[0]);
         assert!(first.contains("into 2 pieces"), "{first}");
         assert!(first.contains("piece 1"), "{first}");
+        assert!(
+            first.contains("still there to be read by path"),
+            "the whole file is still there: {first}"
+        );
+        assert!(
+            !first.contains("Read it whenever"),
+            "saying it is there is not a duty to read it: {first}"
+        );
         assert!(first.contains("handing off to the next one"), "{first}");
         assert!(
             !first.contains("already filed"),
@@ -2185,7 +2131,7 @@ mod tests {
                     ("cppcheck", r#"{"path":"b"}"#),
                     ("cppcheck", r#"{"path":"c"}"#),
                 ]),
-                Reply::calls(&[("submit_comment", COMMENT)]),
+                filed(),
             ],
             Limit::Amount(10.0),
         )
@@ -2271,10 +2217,7 @@ mod tests {
     fn a_tool_that_fails_answers_the_model_instead_of_ending_the_stage() {
         let (tools, _) = counted("clean");
         let mut fixture = StageFixture::scripted(
-            vec![
-                Reply::calls(&[("no_such_tool", "{}")]),
-                Reply::calls(&[("submit_comment", COMMENT)]),
-            ],
+            vec![Reply::calls(&[("no_such_tool", "{}")]), filed()],
             Limit::Amount(10.0),
         )
         .with_tools(with_submit(tools));
@@ -2294,7 +2237,7 @@ mod tests {
             .read_trace("review-src_parse.c")
             .expect("readable")
             .expect("the trace is on disk");
-        assert_eq!(trace.tool_calls.len(), 2);
+        assert_eq!(trace.tool_calls.len(), 3);
         assert!(!trace.tool_calls[0].succeeded);
     }
 
@@ -2308,7 +2251,7 @@ mod tests {
         let mut fixture = StageFixture::scripted(
             vec![
                 Reply::calls(&[("read_repo_file", r#"{"path":"src/parse.h"}"#)]),
-                Reply::calls(&[("submit_comment", COMMENT)]),
+                filed(),
             ],
             Limit::Amount(10.0),
         )
@@ -2336,7 +2279,7 @@ mod tests {
                 Reply::Truncated {
                     output_tokens: 4096,
                 },
-                Reply::calls(&[("submit_comment", COMMENT)]),
+                filed(),
             ],
             Limit::Amount(10.0),
         );
@@ -2395,6 +2338,76 @@ mod tests {
         assert_eq!(output.chunks[0].raw_output, r#"{"comments":[]}"#);
     }
 
+    /// A review written in the chat is discarded. Asking once more is what
+    /// recovers the findings that used to vanish; a second prose turn ends.
+    #[test]
+    fn a_prose_review_is_asked_once_for_a_function_call() {
+        let mut fixture = StageFixture::scripted(
+            vec![
+                Reply::Message("finish_review\n\nI found no defect.".to_string()),
+                Reply::calls(&[("finish_review", "{}")]),
+            ],
+            Limit::Amount(10.0),
+        )
+        .with_tools(with_submit(Registry::new()));
+
+        let output = review(&mut fixture);
+
+        let sent = fixture.sent();
+        assert_eq!(sent.len(), 2, "one prose turn, then the call");
+        let concluding: Vec<&str> = sent[1]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(concluding, vec!["submit_comment", "finish_review"]);
+        assert!(
+            matches!(
+                sent[1].input.last(),
+                Some(InputItem::Message { content, .. })
+                    if content.contains("written as prose")
+                        && content.contains("discarded")
+            ),
+            "{:?}",
+            sent[1].input.last()
+        );
+        assert_eq!(output.chunks[0].raw_output, r#"{"comments":[]}"#);
+        let trace = fixture
+            .recorder()
+            .read_trace("review-src_parse.c")
+            .expect("readable")
+            .expect("the trace is on disk");
+        assert!(
+            trace
+                .notes_by(Stage::Review)
+                .iter()
+                .any(|note| note.contains("wrote a review as prose")),
+            "{:?}",
+            trace.checks
+        );
+    }
+
+    #[test]
+    fn findings_written_as_prose_are_recovered_on_the_reask() {
+        let mut fixture = StageFixture::scripted(
+            vec![
+                Reply::Message("the overflow is on line 11".to_string()),
+                filed(),
+            ],
+            Limit::Amount(10.0),
+        )
+        .with_tools(with_submit(Registry::new()));
+
+        let output = review(&mut fixture);
+
+        assert_eq!(fixture.sent().len(), 2);
+        assert!(
+            output.chunks[0].raw_output.contains("confidence_score"),
+            "{}",
+            output.chunks[0].raw_output
+        );
+    }
+
     #[test]
     fn the_shipped_prompt_fills_and_leaves_no_marker_behind() {
         let redactor = Redactor::new();
@@ -2415,6 +2428,10 @@ mod tests {
         assert!(!first.contains("{{change}}"), "{first}");
         assert!(!first.contains("{{layout}}"), "{first}");
         assert!(
+            !first.contains("The shape of this repository"),
+            "a directory digest is a map the model walks: {first}"
+        );
+        assert!(
             !first.contains("\n\n\n"),
             "an unused marker leaves no gap behind: {first}"
         );
@@ -2431,23 +2448,44 @@ mod tests {
         let checkout = assembled_over(&Registry::new(), &checkout(), &redactor, &orientation);
         assert!(checkout.contains("the checkout under review"), "{checkout}");
         assert!(
-            checkout.contains("Look locally first")
-                && checkout.contains("fetch it from the repository")
-                && checkout.contains("several paths at once"),
-            "the working order has to be in the body, not inferred from names: {checkout}"
+            checkout.contains("the whole project is on disk"),
+            "{checkout}"
+        );
+        assert!(
+            !checkout.contains("every ability above can be answered"),
+            "a checkout without a repository still refuses the repo half: {checkout}"
+        );
+        assert!(
+            checkout.contains("You may only look at files directly related to this change"),
+            "the gate is in the body; the working order is not assigned: {checkout}"
         );
 
         let cached = assembled_over(&Registry::new(), &cache(), &redactor, &orientation);
         assert!(cached.contains("directory of this run's own"), "{cached}");
         assert!(
-            cached.contains("A local search covers only what is on disk right now")
+            cached.contains("A listing of the repository")
+                && cached.contains("A local listing or search covers only what is on disk right now")
                 && cached.contains("a miss there is not evidence"),
-            "a cache miss is not absence: {cached}"
+            "repo listing and local listing are not the same reach: {cached}"
+        );
+        assert!(
+            !cached.contains("search the repository, or fetch")
+                && !cached.contains("search again"),
+            "saying a miss is not evidence is not a duty to search elsewhere: {cached}"
         );
 
         let nothing = assembled_over(&Registry::new(), &Worktree::Empty, &redactor, &orientation);
         assert!(
             nothing.contains("empty and has nothing behind it"),
+            "{nothing}"
+        );
+        assert!(
+            nothing.contains("Every investigation ability above will refuse")
+                && nothing.contains("Delivery still answers"),
+            "submit and finish still work on an empty worktree: {nothing}"
+        );
+        assert!(
+            !nothing.contains("every one of them will refuse"),
             "{nothing}"
         );
         assert!(
@@ -2546,7 +2584,6 @@ mod tests {
     fn the_whole_change_view_is_in_the_cached_half_of_the_prompt() {
         let orientation = Orientation {
             change: "This change touches 3 files. ...".to_string(),
-            layout: "The shape of this repository ...".to_string(),
         };
         let first = assembled(&Registry::new(), &Redactor::new(), &orientation);
         let second = assembled(&Registry::new(), &Redactor::new(), &orientation);
@@ -2556,7 +2593,10 @@ mod tests {
             "the prompt cache needs the same bytes twice"
         );
         assert!(first.contains("This change touches 3 files"), "{first}");
-        assert!(first.contains("The shape of this repository"), "{first}");
+        assert!(
+            !first.contains("The shape of this repository"),
+            "the change list is the whole-change view; a directory digest is not: {first}"
+        );
     }
 
     /// What `triage` holds back has to be what the request actually carries.
@@ -2602,11 +2642,8 @@ mod tests {
         let preface = narrative_preface(&narrative, &Redactor::new())
             .expect("the prompt fills")
             .expect("there is prose");
-        let mut fixture = StageFixture::scripted(
-            vec![Reply::calls(&[("submit_comment", COMMENT)])],
-            Limit::Amount(10.0),
-        )
-        .with_tools(with_submit(Registry::new()));
+        let mut fixture = StageFixture::scripted(vec![filed()], Limit::Amount(10.0))
+            .with_tools(with_submit(Registry::new()));
 
         let mut context = fixture.context();
         Review::run(

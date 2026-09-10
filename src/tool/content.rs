@@ -28,7 +28,7 @@ use crate::worktree::{Worktree, WorktreeError};
 
 use super::availability::{
     NO_FILES_PRECONDITION, NO_FILES_SHORT, NO_KEYWORD_PRECONDITION, NO_KEYWORD_SHORT,
-    NO_REGEX_PRECONDITION, NO_REGEX_SHORT, NO_REPO_PRECONDITION, NO_REPO_SHORT, local_side,
+    NO_REGEX_PRECONDITION, NO_REGEX_SHORT, NO_REPO_PRECONDITION, NO_REPO_SHORT,
     no_files, no_keyword_search, no_regex_search, no_repo, unavailable_description,
 };
 use super::signature::{Arguments, Parameter, Shape, Signature};
@@ -496,18 +496,9 @@ impl ListLocalFiles {
         if no_files(worktree).is_some() {
             return unavailable_description(WHAT, NO_FILES_SHORT);
         }
-        let source = if worktree.is_checkout() {
-            "It scans the checkout, so the listing is complete and a path missing from it is not \
-             there."
-        } else {
-            "It lists only what has been fetched so far, so a path missing from it may still be \
-             in the repository — fetch_repo_file first, or list_repo_files to see the whole tree."
-        };
         format!(
-            "{WHAT} {} {source} A size that is there was handed over in one go; a size that is \
-             missing does not mean the file cannot be measured. At most {} paths; overflow says how \
-             many remain.",
-            local_side(worktree),
+            "{WHAT} A size that is there was handed over in one go; a size that is missing does \
+             not mean the file cannot be measured. At most {} paths; overflow says how many remain.",
             limits.max_files_per_listing,
         )
     }
@@ -555,8 +546,7 @@ impl Tool for ListLocalFiles {
             .map_err(|error| ToolError::failed(self.name(), error))?;
         let extra = self.worktree.is_cache().then_some(
             "this listed the files that are local right now; a path missing from it may \
-             still be in the repository — try list_repo_files, or fetch the relevant files \
-             first",
+             still be in the repository",
         );
         Ok(Answer::from(&self.paths, self.limits).listing(listing.files, listing.complete, extra))
     }
@@ -595,12 +585,8 @@ impl SuggestLocalRead {
             return unavailable_description(WHAT, NO_FILES_SHORT);
         }
         format!(
-            "{WHAT} {} Returns the conclusion and the numbers it was computed from, never file \
-             content, so it is cheap. Ask this before reading a file whose size you do not know: one \
-             call here turns one refused read into a plan, against the {} bytes a single answer may \
-             carry. On a cache, a file that is not on disk yet has to be fetched with fetch_repo_file \
-             first.",
-            local_side(worktree),
+            "{WHAT} Returns the conclusion and the numbers it was computed from, never file \
+             content, so it is cheap. A single answer may carry at most {} bytes.",
             limits.max_output_bytes,
         )
     }
@@ -678,21 +664,12 @@ impl ReadLocalFile {
         if no_files(worktree).is_some() {
             return unavailable_description(WHAT, NO_FILES_SHORT);
         }
-        let fetching = if worktree.is_cache() {
-            " A file not on disk yet is a miss, not a fetch: call fetch_repo_file first, then \
-             read it. Reading it again after that is free."
-        } else {
-            ""
-        };
         format!(
-            "{WHAT} {}{fetching} Optional line range (first_line \
-             and last_line together); without one you get the whole file. Nothing is ever truncated: \
-             a file over {} bytes cannot be read at all, and a single answer may carry at most {} \
-             bytes, so a read that would not fit is refused with the file's size. Ask \
-             suggest_local_read first when you do not know how big a file is, and page through a \
-             large one in line ranges. The path must be one the diff or a listing gave you: a \
+            "{WHAT} Optional line range (first_line and last_line together); without one you get \
+             the whole file. Nothing is ever truncated: a file over {} bytes cannot be read at all, \
+             and a single answer may carry at most {} bytes, so a read that would not fit is \
+             refused with the file's size. The path must be one the diff or a listing gave you: a \
              guessed path that misses costs a whole round.",
-            local_side(worktree),
             limits.max_file_bytes,
             limits.max_output_bytes,
         )
@@ -777,19 +754,10 @@ impl SearchLocalRegex {
         if no_files(worktree).is_some() {
             return unavailable_description(WHAT, NO_FILES_SHORT);
         }
-        let strength = if worktree.is_checkout() {
-            "query is a regular expression matched over every file in the checkout, so a miss \
-             usually means it is not there."
-        } else {
-            "query is a regular expression matched over the files that have been fetched so far, \
-             not over the repository. A miss does not mean it is absent from the repository — \
-             search_repo_regex or search_repo_keyword, or fetch the relevant files and search \
-             again."
-        };
         format!(
-            "{WHAT} {} {strength} Optional glob to limit the files. At most {} hits, grouped by \
-             file with counts; files whose hits were cut are named with their counts.",
-            local_side(worktree),
+            "{WHAT} query is a regular expression. Optional glob to limit the files. At most {} \
+             hits, grouped by file with counts; files whose hits were cut are named with their \
+             counts.",
             limits.max_hits_per_search,
         )
     }
@@ -839,8 +807,7 @@ impl Tool for SearchLocalRegex {
         if self.worktree.is_cache() {
             extras.push(format!(
                 "this searched the {} files that are local right now; a miss does not mean the \
-                 repository lacks it — try search_repo_*, or fetch the relevant files first and \
-                 search again",
+                 repository lacks it",
                 scan.searched
             ));
         }
@@ -879,20 +846,10 @@ impl ListRepoFiles {
         if no_repo(worktree).is_some() {
             return unavailable_description(WHAT, NO_REPO_SHORT);
         }
-        let source = if worktree.is_checkout() {
-            "It asks the platform API about the reviewed commit. The local side already holds \
-             the whole project, so this is worth it when you want the platform's view rather \
-             than another scan of the checkout."
-        } else {
-            "It asks the platform API about the reviewed commit rather than about what has been \
-             fetched so far, so it answers for the whole repository. An answer the platform \
-             could not complete says so."
-        };
         format!(
-            "{WHAT} {} {source} A size that is there was handed over in one go; a size that is \
-             missing does not mean the file cannot be measured. At most {} paths; overflow says how \
-             many remain.",
-            local_side(worktree),
+            "{WHAT} It asks the platform API about the reviewed commit. A size that is there was \
+             handed over in one go; a size that is missing does not mean the file cannot be \
+             measured. At most {} paths; overflow says how many remain.",
             limits.max_files_per_listing,
         )
     }
@@ -972,17 +929,9 @@ impl FetchRepoFile {
         if no_repo(worktree).is_some() {
             return unavailable_description(WHAT, NO_REPO_SHORT);
         }
-        let landing = if worktree.is_checkout() {
-            "The checkout already is the whole tree at the reviewed commit, so a path missing \
-             from it is one the repository does not have, and nothing is written."
-        } else {
-            "Each file is written into this run's cache. A file already on disk is the answer, \
-             and costs no request."
-        };
         format!(
-            "{WHAT} {} {landing} A file over {} bytes is refused without being downloaded. At most \
-             {} paths; a longer list is refused without fetching any.",
-            local_side(worktree),
+            "{WHAT} A file over {} bytes is refused without being downloaded. At most {} paths; a \
+             longer list is refused without fetching any.",
             limits.max_file_bytes,
             limits.max_files_per_fetch,
         )
@@ -1092,19 +1041,11 @@ impl SearchRepoRegex {
         if no_regex_search(worktree).is_some() {
             return unavailable_description(WHAT, NO_REGEX_SHORT);
         }
-        let strength = if worktree.is_checkout() {
-            "query is a regular expression. The platform index covers the default branch, while \
-             the local side stands on the reviewed commit's head_sha, so a miss here is not the \
-             same as a miss from search_local_regex — ask the local side when you need to know \
-             what this commit actually has."
-        } else {
-            "query is a regular expression, matched by the platform over the reviewed commit, so \
-             a miss usually means it is not there."
-        };
         format!(
-            "{WHAT} {} {strength} Optional glob to limit the files. At most {} hits, grouped by \
+            "{WHAT} query is a regular expression. The platform index covers the default branch, \
+             while the reviewed commit is head_sha, so a miss here is not the same as a miss from \
+             search_local_regex. Optional glob to limit the files. At most {} hits, grouped by \
              file with counts; files whose hits were cut are named with their counts.",
-            local_side(worktree),
             limits.max_hits_per_search,
         )
     }
@@ -1171,9 +1112,7 @@ impl SearchRepoKeyword {
     pub const NAME: &'static str = "search_repo_keyword";
 
     const EMPTY_KEYWORD_NOTE: &'static str = "A miss does not mean it is absent: this search used a keyword index that only covers \
-         the default branch, so something new on this branch may not be indexed. To confirm \
-         presence, use list_repo_files, fetch_repo_file and read_local_file, or \
-         search_local_regex.";
+         the default branch, so something new on this branch may not be indexed.";
 
     pub fn new(worktree: Arc<Worktree>, paths: PathPolicy, limits: ToolLimits) -> Self {
         let description = Self::describe(&worktree, limits);
@@ -1191,21 +1130,12 @@ impl SearchRepoKeyword {
         if no_keyword_search(worktree).is_some() {
             return unavailable_description(WHAT, NO_KEYWORD_SHORT);
         }
-        let contrast = if worktree.is_checkout() {
-            " The local side stands on the reviewed commit's head_sha, so a miss here is not \
-             the same as a miss from search_local_regex."
-        } else {
-            ""
-        };
         format!(
-            "{WHAT} {} query is case-insensitive keyword matching against the platform's index; \
+            "{WHAT} query is case-insensitive keyword matching against the platform's index; \
              regex metacharacters are literal, not a regex. That index covers the default branch \
-             only, so a miss does not mean it is absent — confirm with list_repo_files, \
-             fetch_repo_file and read_local_file, or search_local_regex on files you have, before \
-             concluding anything from an empty result.{contrast} Optional glob to limit the files. \
-             At most {} hits, grouped by file with counts; files whose hits were cut are named with \
-             their counts.",
-            local_side(worktree),
+             only, so a miss does not mean it is absent. Optional glob to limit the files. At most \
+             {} hits, grouped by file with counts; files whose hits were cut are named with their \
+             counts.",
             limits.max_hits_per_search,
         )
     }
@@ -1817,61 +1747,56 @@ mod tests {
         assert_eq!(repository.calls(), 0);
     }
 
-    /// The names are fixed now, so the description is the only thing that can
-    /// say what this run's worktree is and how far a search reaches. Every
-    /// shape has to say it, because the model reads only the description.
+    /// Descriptions state what the tool does. Which worktree this is lives in
+    /// the worktree paragraph, not under every name.
     #[test]
-    fn the_descriptions_say_which_worktree_this_is_and_how_far_it_reaches() {
+    fn the_descriptions_say_what_the_tool_does_not_which_worktree_this_is() {
         let (_directory, whole, _) = checkout_with_repo(Arc::new(CountingRepository::empty()));
-        let read = ReadLocalFile::new(Arc::clone(&whole), policy(&[], whole.root()), LIMITS);
-        assert_eq!(read.name(), "read_local_file");
-        assert!(read.description().contains("checkout under review"));
+        let (_run, fetched, _) = cache(Arc::new(CountingRepository::empty()));
+        let read_whole = ReadLocalFile::new(Arc::clone(&whole), policy(&[], whole.root()), LIMITS);
+        let read_cache =
+            ReadLocalFile::new(Arc::clone(&fetched), policy(&[], fetched.root()), LIMITS);
+        assert_eq!(read_whole.name(), "read_local_file");
+        assert_eq!(read_whole.description(), read_cache.description());
         assert!(
-            read.description().contains("262144"),
+            read_whole.description().contains("262144"),
             "the fetch ceiling is a number, not a word: {}",
-            read.description()
+            read_whole.description()
         );
         assert!(
             SearchLocalRegex::new(Arc::clone(&whole), policy(&[], whole.root()), LIMITS)
                 .description()
                 .contains("regular expression")
         );
-        assert!(
-            SearchLocalRegex::new(Arc::clone(&whole), policy(&[], whole.root()), LIMITS)
-                .description()
-                .contains("usually means it is not there")
-        );
         let remote = SearchRepoKeyword::new(Arc::clone(&whole), policy(&[], whole.root()), LIMITS);
         assert!(remote.description().contains("default branch"));
-        assert!(remote.description().contains("head_sha"));
+        assert!(remote.description().contains("does not mean it is absent"));
 
-        let (_run, fetched, _) = cache(Arc::new(CountingRepository::empty()));
-        let read = ReadLocalFile::new(Arc::clone(&fetched), policy(&[], fetched.root()), LIMITS);
-        assert!(
-            read.description().contains("started empty"),
-            "{}",
-            read.description()
-        );
-        assert!(
-            read.description().contains("fetch_repo_file"),
-            "{}",
-            read.description()
-        );
-        let search =
-            SearchLocalRegex::new(Arc::clone(&fetched), policy(&[], fetched.root()), LIMITS);
-        assert!(search.description().contains("fetched so far"));
-        assert!(search.description().contains("does not mean it is absent"));
-        let listing =
-            ListLocalFiles::new(Arc::clone(&fetched), policy(&[], fetched.root()), LIMITS);
-        assert!(
-            listing.description().contains("fetched so far"),
-            "a local listing on a cache is not the whole tree: {}",
-            listing.description()
-        );
+        for description in [
+            read_cache.description(),
+            SearchLocalRegex::new(Arc::clone(&fetched), policy(&[], fetched.root()), LIMITS)
+                .description(),
+            ListLocalFiles::new(Arc::clone(&fetched), policy(&[], fetched.root()), LIMITS)
+                .description(),
+            SuggestLocalRead::new(Arc::clone(&fetched), policy(&[], fetched.root()), LIMITS)
+                .description(),
+            ListRepoFiles::new(Arc::clone(&fetched), policy(&[], fetched.root()), LIMITS)
+                .description(),
+            FetchRepoFile::new(Arc::clone(&fetched), policy(&[], fetched.root()), LIMITS)
+                .description(),
+        ] {
+            assert!(
+                !description.contains("cache")
+                    && !description.contains("fetched so far")
+                    && !description.contains("started empty")
+                    && !description.contains("checkout under review"),
+                "the worktree is not restated under the tool: {description}"
+            );
+        }
         let repo_listing =
             ListRepoFiles::new(Arc::clone(&fetched), policy(&[], fetched.root()), LIMITS);
         assert!(
-            repo_listing.description().contains("whole repository"),
+            repo_listing.description().contains("reviewed commit"),
             "{}",
             repo_listing.description()
         );

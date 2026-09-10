@@ -15,7 +15,7 @@ use crate::domain::{Confidence, Severity, Stage};
 use crate::record::layout;
 
 use super::merge::MergeOutput;
-use super::review::CutShort;
+use super::prompt::code_span;
 use super::triage::TriagePlan;
 use super::{StageContext, StageError};
 
@@ -30,9 +30,6 @@ pub struct ReportInput<'a> {
     /// `summary.json`; the report itself says which files went unreviewed
     /// and leaves the money out of it.
     pub stopped: Option<&'a str>,
-    /// Chunks whose investigation the loop ended early. A file the model was
-    /// still reading around must not read like one it finished with.
-    pub cut_short: &'a [CutShort],
     /// What this run's worktree could not do at all. A run that saw only the
     /// diff must not read like one that looked everywhere.
     pub unavailable: &'a [String],
@@ -63,11 +60,6 @@ pub struct Summary {
     /// mistaken for a clean review.
     #[serde(default)]
     pub unproduced: Vec<String>,
-    /// Chunks the loop stopped investigating before the model was done. Named
-    /// for the same reason, and because the remedy is a config knob: a run
-    /// where most files land here is asking for more rounds.
-    #[serde(default)]
-    pub cut_short: Vec<String>,
     /// What this run's worktree could not do, which bounds everything above
     /// it. Empty on a run that could look at whatever it liked.
     #[serde(default)]
@@ -196,11 +188,6 @@ impl Report {
                 .iter()
                 .map(|chunk| format!("{}: {}", chunk.path, chunk.reason))
                 .collect(),
-            cut_short: input
-                .cut_short
-                .iter()
-                .map(|chunk| format!("{}: {}", chunk.path, chunk.reason))
-                .collect(),
             unavailable: input.unavailable.to_vec(),
             spent: context.budget.spent(),
             budget: context.budget.ceiling(),
@@ -229,12 +216,6 @@ impl Report {
         }
         for file in &input.plan.skipped {
             items.push_str(&coverage_item(&file.path, &file.reason));
-        }
-        for chunk in input.cut_short {
-            items.push_str(&coverage_item(
-                &chunk.path,
-                &format!("investigation cut short: {}", chunk.reason),
-            ));
         }
         for path in &summary.unreviewed {
             items.push_str(&coverage_item(path, "not reviewed"));
@@ -301,20 +282,18 @@ fn coverage_bound(unavailable: &[String]) -> String {
 }
 
 fn finding_item(comment: &crate::domain::Comment, badge: Option<&str>) -> String {
-    let line = comment
-        .target
-        .line
-        .map(|line| format!(":{line}"))
-        .unwrap_or_default();
     format!(
-        "## [{} {}% / {} {}%]{} `{}{}`\n\n{}\n\nsuggestion:\n{}\n\n{}\n\n",
+        "## [{} {}% / {} {}%]{} `{}`\n\n{}\n\nsuggestion:\n{}\n\n{}\n\n",
         comment.severity,
         comment.severity_score,
         comment.confidence,
         comment.confidence_score,
         badge_suffix(badge),
-        comment.target.path,
-        line,
+        code_span(
+            &comment.target.path,
+            comment.target.start_line,
+            comment.target.end_line
+        ),
         comment.body,
         comment.suggestion,
         trace_line(&comment.trace_id)
@@ -354,7 +333,7 @@ mod tests {
         Comment {
             target: CommentTarget {
                 path: "src/parse.c".to_string(),
-                line: Some(11),
+                start_line: Some(11),
                 end_line: None,
             },
             body: "the index is a constant 5 while buf is char[3]".to_string(),
@@ -391,7 +370,6 @@ mod tests {
             merged,
             unreviewed: &[],
             stopped: None,
-            cut_short: &[],
             unavailable: &[],
         };
         let mut context = fixture.context();
@@ -427,7 +405,6 @@ mod tests {
             merged: &merged,
             unreviewed: &[],
             stopped: None,
-            cut_short: &[],
             unavailable: &[],
         };
         {
@@ -590,52 +567,31 @@ mod tests {
         assert!(!report.contains("none called"), "{report}");
     }
 
-    /// A file the loop stopped investigating is not a file that came back
-    /// clean, and the report is where the difference has to show: the run
-    /// that produced it saw two thirds of its chunks end this way and read
-    /// as a quiet review.
+    /// `CommentTarget` is a range. The heading used to print only the first
+    /// line, so a finding that covered 11-14 looked like it hung on 11.
     #[test]
-    fn a_chunk_the_loop_cut_short_is_named_in_the_report_and_the_summary() {
+    fn a_finding_that_covers_several_lines_is_headed_as_a_range() {
         let mut fixture = StageFixture::new(Vec::new());
+        let mut finding = comment("review-src_parse.c");
+        finding.target.end_line = Some(14);
         let merged = MergeOutput {
-            overall_score: Some(70),
+            comments: vec![finding],
+            overall_score: Some(54),
             ..MergeOutput::default()
         };
-        let plan = TriagePlan::default();
-        let cut_short = [CutShort {
-            path: "src/emit.c".to_string(),
-            reason: "the tool loop reached its ceiling of 12 rounds".to_string(),
-        }];
-        let input = ReportInput {
-            plan: &plan,
-            merged: &merged,
-            unreviewed: &[],
-            stopped: None,
-            cut_short: &cut_short,
-            unavailable: &[],
-        };
-        {
-            let mut context = fixture.context();
-            Report::run(&mut context, &input).expect("the report is written");
-        }
+        render(&mut fixture, &merged);
 
-        let report = fixture.report();
-        assert!(report.contains("## `src/emit.c`"), "{report}");
         assert!(
-            report.contains(
-                "investigation cut short: the tool loop reached its ceiling of 12 rounds"
-            ),
-            "{report}"
+            fixture
+                .report()
+                .contains("## [major 80% / certain 92%] `src/parse.c:11-14`"),
+            "{}",
+            fixture.report()
         );
-        let bytes = fixture
-            .recorder()
-            .read_artifact(layout::SUMMARY)
-            .expect("readable")
-            .expect("summary.json is always written");
-        let summary: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-        assert_eq!(
-            summary["cut_short"][0],
-            "src/emit.c: the tool loop reached its ceiling of 12 rounds"
+        assert!(
+            !fixture.report().contains("evidence.lines"),
+            "evidence stays out of the report: {}",
+            fixture.report()
         );
     }
 
@@ -661,7 +617,6 @@ mod tests {
             merged: &merged,
             unreviewed: &[],
             stopped: None,
-            cut_short: &[],
             unavailable: &unavailable,
         };
         {

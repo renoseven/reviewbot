@@ -117,7 +117,7 @@ struct RawDocument {
 #[serde(default)]
 struct RawComment {
     path: Option<String>,
-    line: Option<u32>,
+    start_line: Option<u32>,
     end_line: Option<u32>,
     body: Option<String>,
     suggestion: Option<String>,
@@ -131,7 +131,7 @@ struct RawComment {
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct RawEvidence {
-    diff_lines: Option<Vec<u32>>,
+    lines: Option<Vec<u32>>,
     external_files: Option<Vec<String>>,
     tool_quote: Option<RawQuote>,
 }
@@ -478,23 +478,20 @@ impl Merge {
         };
 
         let evidence = raw.evidence.unwrap_or_default();
-        let diff_lines = evidence.diff_lines.unwrap_or_default();
+        let lines = evidence.lines.unwrap_or_default();
         // Step 2, out of the change. The changed set, not the commentable
         // one: context lines are code nobody touched, and a comment that
         // leans only on those is about the code as it already was.
-        if !diff_lines
-            .iter()
-            .any(|line| file.changed_lines.contains(line))
-        {
-            return Err(match diff_lines.is_empty() {
-                true => "no evidence.diff_lines, so nothing ties it to this change".to_string(),
-                false => format!("evidence.diff_lines {diff_lines:?} touch none of this change"),
+        if !lines.iter().any(|line| file.changed_lines.contains(line)) {
+            return Err(match lines.is_empty() {
+                true => "no evidence.lines, so nothing ties it to this change".to_string(),
+                false => format!("evidence.lines {lines:?} touch none of this change"),
             });
         }
 
         // Step 3, alignment. It moves the line and nothing else: where a
         // comment hangs and whether it is right are different questions.
-        let alignment = Self::align(file.commentable_lines, raw.line, &diff_lines);
+        let alignment = Self::align(file.commentable_lines, raw.start_line, &lines);
         let end_line = end_line_of(&alignment, raw.end_line, file.commentable_lines);
         let mut notes = Vec::new();
         notes.extend(alignment.note);
@@ -539,7 +536,7 @@ impl Merge {
                 comment: Comment {
                     target: CommentTarget {
                         path: file.path.to_string(),
-                        line: alignment.line,
+                        start_line: alignment.line,
                         end_line,
                     },
                     body,
@@ -559,7 +556,7 @@ impl Merge {
 
     /// Step 3. The commentable set is the one that decides where a comment
     /// may hang; whether it may exist at all was step 2's question.
-    fn align(commentable: &BTreeSet<u32>, line: Option<u32>, diff_lines: &[u32]) -> Alignment {
+    fn align(commentable: &BTreeSet<u32>, line: Option<u32>, lines: &[u32]) -> Alignment {
         if let Some(line) = line {
             if commentable.contains(&line) {
                 return Alignment {
@@ -579,7 +576,7 @@ impl Merge {
         }
         // What the model said it read is usually closer to the truth than the
         // line it wrote down: the first it copied, the second it counted.
-        if let Some(fallback) = diff_lines
+        if let Some(fallback) = lines
             .iter()
             .copied()
             .find(|line| commentable.contains(line))
@@ -589,9 +586,9 @@ impl Merge {
                 note: Some(match line {
                     Some(line) => format!(
                         "line {line} is more than {ALIGN_WINDOW} lines from any commentable line; \
-                         used evidence.diff_lines {fallback} instead"
+                         used evidence.lines {fallback} instead"
                     ),
-                    None => format!("no line was given; used evidence.diff_lines {fallback}"),
+                    None => format!("no line was given; used evidence.lines {fallback}"),
                 }),
             };
         }
@@ -968,7 +965,7 @@ fn end_line_of(
 /// A file level comment sorts after the lines of the same file rather than
 /// in front of them: it is the vaguest of the bunch.
 fn sort_line(comment: &Comment) -> u32 {
-    comment.target.line.unwrap_or(u32::MAX)
+    comment.target.start_line.unwrap_or(u32::MAX)
 }
 
 /// Step 4, for one quotation. Two questions, both mechanical: is this text
@@ -1066,7 +1063,7 @@ fn ranges_intersect(left: &Comment, right: &Comment) -> bool {
     let span = |comment: &Comment| {
         comment
             .target
-            .line
+            .start_line
             .map(|line| (line, comment.target.end_line.unwrap_or(line)))
     };
     match (span(left), span(right)) {
@@ -1142,7 +1139,7 @@ fn findings_json(comments: &[Comment]) -> String {
         .map(|comment| {
             serde_json::json!({
                 "path": comment.target.path,
-                "line": comment.target.line,
+                "start_line": comment.target.start_line,
                 "severity": comment.severity.as_str(),
                 "severity_score": comment.severity_score,
                 "confidence": comment.confidence.as_str(),
@@ -1217,8 +1214,8 @@ mod tests {
     /// One entry with everything the contract wants, so each test can bend
     /// exactly the field it is about. Severity is fixed here because most
     /// tests are not about it; `graded` is for the ones that are.
-    fn entry(path: &str, line: u32, score: &str, diff_lines: &str, body: &str) -> String {
-        graded(path, line, "50", score, diff_lines, body)
+    fn entry(path: &str, line: u32, score: &str, lines: &str, body: &str) -> String {
+        graded(path, line, "50", score, lines, body)
     }
 
     fn graded(
@@ -1226,11 +1223,11 @@ mod tests {
         line: u32,
         severity: &str,
         score: &str,
-        diff_lines: &str,
+        lines: &str,
         body: &str,
     ) -> String {
         format!(
-            r#"{{"path":"{path}","line":{line},"body":"{body}","suggestion":"fix it","severity_score":{severity},"confidence_score":{score},"evidence":{{"diff_lines":{diff_lines}}}}}"#
+            r#"{{"path":"{path}","start_line":{line},"body":"{body}","suggestion":"fix it","severity_score":{severity},"confidence_score":{score},"evidence":{{"lines":{lines}}}}}"#
         )
     }
 
@@ -1327,7 +1324,7 @@ mod tests {
         let raw = document(&[
             entry("src/parse.c", 11, "80", "[11]", "on an added line"),
             entry("src/parse.c", 10, "80", "[10,13]", "only context lines"),
-            entry("src/parse.c", 11, "80", "[]", "no diff_lines at all"),
+            entry("src/parse.c", 11, "80", "[]", "no lines at all"),
         ]);
         let mut fixture = scoring(vec![r#"{"overall_score":42,"summary":"one finding"}"#]);
         write_trace(&fixture, "review-src_parse.c");
@@ -1351,7 +1348,7 @@ mod tests {
             checks
                 .iter()
                 .any(|check| check.contains("comment 2 dropped")
-                    && check.contains("no evidence.diff_lines")),
+                    && check.contains("no evidence.lines")),
             "{checks:?}"
         );
     }
@@ -1373,9 +1370,9 @@ mod tests {
         );
 
         let fallback = Merge::align(&commentable, Some(80), &[40, 12]);
-        assert_eq!(fallback.line, Some(12), "diff_lines is the third try");
+        assert_eq!(fallback.line, Some(12), "lines is the third try");
         assert!(
-            fallback.note.as_deref().unwrap().contains("diff_lines"),
+            fallback.note.as_deref().unwrap().contains("lines"),
             "{:?}",
             fallback.note
         );
@@ -1411,9 +1408,9 @@ mod tests {
 
         assert_eq!(output.comments.len(), 1);
         assert_eq!(
-            output.comments[0].target.line,
+            output.comments[0].target.start_line,
             Some(500),
-            "diff_lines carried it"
+            "lines carried it"
         );
         assert_eq!(
             output.comments[0].confidence_score, 63,
@@ -1675,8 +1672,8 @@ mod tests {
         let changeset = changeset(vec![file("src/parse.c", &[10, 11, 12], &[11, 12])]);
         let raw = format!(
             r#"{{"comments":[{},{},{}]}}"#,
-            r#"{"path":"src/parse.c","line":11,"body":"no score at all","severity_score":50,"evidence":{"diff_lines":[11]}}"#,
-            r#"{"path":"src/parse.c","line":12,"body":"a fractional score","severity_score":50,"confidence_score":82.5,"evidence":{"diff_lines":[12]}}"#,
+            r#"{"path":"src/parse.c","start_line":11,"body":"no score at all","severity_score":50,"evidence":{"lines":[11]}}"#,
+            r#"{"path":"src/parse.c","start_line":12,"body":"a fractional score","severity_score":50,"confidence_score":82.5,"evidence":{"lines":[12]}}"#,
             entry("src/parse.c", 11, "44", "[11]", "the neighbour"),
         );
         let mut fixture = scoring(vec![r#"{"overall_score":55,"summary":"s"}"#]);
@@ -1712,7 +1709,7 @@ mod tests {
         let changeset = changeset(vec![file("src/parse.c", &[10, 11, 12], &[11, 12])]);
         let raw = format!(
             r#"{{"comments":[{},{}]}}"#,
-            r#"{"path":"src/parse.c","line":11,"body":"a real problem","severity_score":50,"confidence_score":80,"evidence":{"diff_lines":[11]}}"#,
+            r#"{"path":"src/parse.c","start_line":11,"body":"a real problem","severity_score":50,"confidence_score":80,"evidence":{"lines":[11]}}"#,
             entry("src/parse.c", 12, "44", "[12]", "the neighbour"),
         );
         let mut fixture = scoring(vec![r#"{"overall_score":55,"summary":"s"}"#]);
@@ -1883,7 +1880,7 @@ mod tests {
         let comment = |line: Option<u32>, body: &str| Comment {
             target: CommentTarget {
                 path: "src/a.c".to_string(),
-                line,
+                start_line: line,
                 end_line: None,
             },
             body: body.to_string(),
@@ -2128,11 +2125,11 @@ mod tests {
     /// quotation and leave the rest of the contract alone.
     fn quoting(line: u32, score: u8, quote: &str, note: &str) -> String {
         format!(
-            r#"{{"path":"src/parse.c","line":{line},"body":"cppcheck found it",
+            r#"{{"path":"src/parse.c","start_line":{line},"body":"cppcheck found it",
                "suggestion":"fix it",
                "severity_score":50,
                "confidence_score":{score},
-               "evidence":{{"diff_lines":[{line}],
+               "evidence":{{"lines":[{line}],
                "tool_quote":{{"tool":"cppcheck","text":"{quote}","note":"{note}"}}}}}}"#
         )
     }
@@ -2240,8 +2237,8 @@ mod tests {
         let changeset = changeset(vec![file("src/parse.c", &[10, 11], &[11])]);
         let raw = format!(
             r#"{{"comments":[{}]}}"#,
-            r#"{"path":"src/parse.c","line":11,"body":"cppcheck found it","suggestion":"fix it","severity_score":70,"confidence_score":85,
-                "evidence":{"diff_lines":[11],"external_files":["src/parse.h"]}}"#
+            r#"{"path":"src/parse.c","start_line":11,"body":"cppcheck found it","suggestion":"fix it","severity_score":70,"confidence_score":85,
+                "evidence":{"lines":[11],"external_files":["src/parse.h"]}}"#
         );
         let mut fixture = scoring(vec![r#"{"overall_score":35,"summary":"s"}"#]);
         write_trace(&fixture, "review-src_parse.c");
@@ -2317,7 +2314,7 @@ mod tests {
             .map(|comment| {
                 (
                     comment.target.path.as_str(),
-                    comment.target.line,
+                    comment.target.start_line,
                     comment.confidence_score,
                 )
             })

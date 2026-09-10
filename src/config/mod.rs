@@ -1031,6 +1031,39 @@ api_token = "GITHUB_TOKEN"
         );
     }
 
+    /// The model picks a checker from `description` and `params.path`.
+    /// Those sentences name the language they take; they do not name one
+    /// language they refuse. The fixture is the live form of the same pair.
+    #[test]
+    fn shipped_checker_descriptions_name_the_language_not_an_exception() {
+        const VALID: &str = include_str!("../../tests/fixtures/valid.toml");
+        for text in [EXAMPLE_CONFIG, VALID] {
+            assert!(
+                text.contains(
+                    "The path must be a C or C++ file; do not call this for any other language."
+                ),
+                "cppcheck must say which language it takes"
+            );
+            assert!(
+                text.contains(
+                    "The path must be a C source or header; do not call this for any other language."
+                ),
+                "typecheck must say which language it takes"
+            );
+            for line in text.lines() {
+                let about_a_checker = line.contains("C or C++")
+                    || line.contains("C source")
+                    || line.contains("C file");
+                if about_a_checker {
+                    assert!(
+                        !line.contains("Rust") && !line.contains(".rs"),
+                        "do not single out Rust: {line}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn init_writes_the_example_and_refuses_to_overwrite() {
         let directory = tempfile::tempdir().expect("temp dir");

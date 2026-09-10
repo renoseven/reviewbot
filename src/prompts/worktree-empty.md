@@ -1,4 +1,4 @@
-This run's worktree is empty and has nothing behind it: the input was a plain diff with no platform to fetch from. Every ability above is still offered to you and every one of them will refuse, which is why they are marked. All you can see is this one file's diff.
+This run's worktree is empty and has nothing behind it: the input was a plain diff with no platform to fetch from. Every investigation ability above will refuse, which is why they are marked. Delivery still answers. All you can see is this one file's diff.
 
 Reviewing from the diff alone is a normal way to run this, not a broken one, so do the review: read the changed lines closely and file what you find in them. Two things follow from having no way to look further, and they pull in opposite directions.
 

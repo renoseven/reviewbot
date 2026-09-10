@@ -125,12 +125,6 @@ pub enum Event {
         /// run's own directory, opened empty and filled only as needed.
         worktree: Option<PathBuf>,
     },
-    /// The preamble both `triage` and `review` need is being assembled: the
-    /// list of files this change touches, and the digest of the repository's
-    /// layout — which is a tree fetch, and on a large project several seconds
-    /// of it. It belongs to neither stage, so the checklist has no row for it
-    /// and a watcher would otherwise have nothing to say for those seconds.
-    Preparing,
     /// A stage is about to run, or about to be skipped. Both are said, so a
     /// watcher can show all six without knowing which of them cost anything.
     StageStarted { stage: Stage },

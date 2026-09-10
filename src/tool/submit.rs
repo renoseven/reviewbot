@@ -44,15 +44,17 @@ impl SubmitComment {
                     "Repository-relative path of this file as it appears in the diff. Omit to use \
                      the file under review.",
                 ),
-                Parameter::optional(
-                    "line",
+                Parameter::required(
+                    "start_line",
                     Shape::line(),
-                    "First commentable line of the finding.",
+                    "First line of the hang span: where the comment is pinned in the report \
+                     and on the MR. Pair with end_line. Not evidence.lines.",
                 ),
                 Parameter::optional(
                     "end_line",
                     Shape::line(),
-                    "Last commentable line of the finding; omit if it is a single line.",
+                    "Last line of that same hang span. Pair with start_line. Omit if the hang \
+                     is one line. Not a second finding, and not the last evidence line.",
                 ),
                 Parameter::required(
                     "body",
@@ -81,9 +83,11 @@ impl SubmitComment {
                     "evidence",
                     Shape::Object(vec![
                         Parameter::required(
-                            "diff_lines",
+                            "lines",
                             Shape::Array(Box::new(Shape::line())),
-                            "At least one line from this file's diff that the finding rests on.",
+                            "File line numbers this finding rests on — integers, at least one \
+                             this change touched. Not the hang span, not the text of the line, \
+                             and not a +/- line copied from the diff.",
                         ),
                         Parameter::optional(
                             "external_files",
@@ -120,15 +124,17 @@ impl SubmitComment {
 
     pub fn description_text() -> &'static str {
         "Submit one finding for this file. Call once per finding; several \
-         calls in one round are fine. body is the problem; suggestion is \
-         the fix. severity_score and confidence_score are separate \
-         judgements and are meant to disagree: a defect that would corrupt \
-         memory is severe whether or not you are sure of it. path may be \
-         omitted (this file). Stop after this round; do not wait for \
-         confirmation. If you have no locatable defect, do not call this \
-         tool at all: call finish_review instead. A filed \"no problems \
-         found\" is published as a finding and counts towards the score, so \
-         it is worse than nothing."
+         calls in one round are fine. start_line and end_line are one hang \
+         span (where the comment is pinned: the report heading and the MR \
+         thread). evidence.lines is the evidence, not that span. body \
+         is the problem; suggestion is the fix. severity_score and \
+         confidence_score are separate judgements and are meant to disagree: \
+         a defect that would corrupt memory is severe whether or not you \
+         are sure of it. path may be omitted (this file). A review of this \
+         file ends with finish_review, not with this tool. If you have no \
+         locatable defect, do not call this tool at all: call finish_review \
+         instead. A filed \"no problems found\" is published as a finding \
+         and counts towards the score, so it is worse than nothing."
     }
 
     /// The chunk already knows which file this is. An omitted or empty path
@@ -177,17 +183,24 @@ impl Tool for SubmitComment {
     }
 
     fn execute(&self, arguments: &Value) -> Result<ToolOutput, ToolError> {
-        // Before the signature check, because an empty call is not a badly
-        // formed finding: it is the model saying it has none, and the prompt
-        // tells it to reply with a short message instead. Refusing here would
-        // buy a round trip and the same empty call back.
+        // Before the signature check: no problem and no fix is not a badly
+        // formed finding, and it is not an ending. The only end signal is
+        // finish_review. Accepting this used to close the file; refusing it
+        // sends the model to that call.
         if is_blank_finding(arguments) {
-            return Ok(ToolOutput::new(
-                "nothing filed for this file. A call with no problem and no fix is not a finding; \
-                 call finish_review when you have none."
+            return Err(ToolError::InvalidArguments {
+                tool: Self::NAME.to_string(),
+                reason: "submit_comment files a finding. A call with no problem and no fix is not \
+                         a finding. Nothing was filed: call finish_review when you have none. Do \
+                         not call submit_comment again without a defect."
                     .to_string(),
-            )
-            .finishing());
+            });
+        }
+        if let Some(reason) = diff_line_written_as_text(arguments) {
+            return Err(resend(ToolError::InvalidArguments {
+                tool: Self::NAME.to_string(),
+                reason,
+            }));
         }
         let checked = self
             .signature
@@ -195,14 +208,14 @@ impl Tool for SubmitComment {
             .map_err(resend)?;
         let lines = checked
             .get("evidence")
-            .and_then(|evidence| evidence.get("diff_lines"))
+            .and_then(|evidence| evidence.get("lines"))
             .and_then(Value::as_array)
             .map(Vec::as_slice)
             .unwrap_or_default();
         if lines.is_empty() {
             return Err(resend(ToolError::InvalidArguments {
                 tool: Self::NAME.to_string(),
-                reason: "evidence.diff_lines must name at least one line".to_string(),
+                reason: "evidence.lines must name at least one line".to_string(),
             }));
         }
         Ok(ToolOutput::new("recorded".to_string()).with_submission(arguments.clone()))
@@ -248,12 +261,12 @@ impl FinishReview {
     }
 
     pub fn description_text() -> &'static str {
-        "End your review of this file with nothing to file. Call this instead \
-         of submit_comment when you found no locatable defect, or when the \
-         only things you could say are not defects in this change. It takes no \
-         arguments and produces no comment. Say why in your reply if you like. \
-         Do not use it to leave early while you still have a finding to file, \
-         and do not file a placeholder finding to end the round."
+        "End your review of this file. A review ends with this call. Call \
+         submit_comment when you find a defect; do not use that tool to say \
+         there is nothing wrong. This call takes no arguments and produces \
+         no comment. Say why in your reply if you like. Do not use it to \
+         leave early while you still have a finding to file, and do not \
+         file a placeholder finding to end the round."
     }
 }
 
@@ -444,10 +457,11 @@ mod resend_tests {
     fn a_rejected_finding_says_it_was_not_filed_and_must_be_sent_again() {
         let error = SubmitComment::new()
             .execute(&serde_json::json!({
+                "start_line": 12,
                 "body": "the reference is leaked on the error path",
                 "suggestion": "call fput before returning",
                 "severity_score": 70,
-                "evidence": {"diff_lines": [12]},
+                "evidence": {"lines": [12]},
             }))
             .expect_err("no confidence_score");
         let said = error.to_string();
@@ -465,11 +479,12 @@ mod resend_tests {
     fn a_complete_finding_is_recorded_without_a_lecture() {
         let output = SubmitComment::new()
             .execute(&serde_json::json!({
+                "start_line": 12,
                 "body": "the reference is leaked on the error path",
                 "suggestion": "call fput before returning",
                 "severity_score": 70,
                 "confidence_score": 55,
-                "evidence": {"diff_lines": [12]},
+                "evidence": {"lines": [12]},
             }))
             .expect("a complete finding");
         assert_eq!(output.text, "recorded");
@@ -484,8 +499,7 @@ fn summary_invalid(reason: &str) -> ToolError {
     })
 }
 
-/// No problem and no fix is the model saying it found nothing, whatever else
-/// the call carries.
+/// No problem and no fix is not a finding, whatever else the call carries.
 fn is_blank_finding(arguments: &Value) -> bool {
     let Some(object) = arguments.as_object() else {
         return false;
@@ -497,6 +511,28 @@ fn blank(value: Option<&Value>) -> bool {
     !matches!(value.and_then(Value::as_str), Some(text) if !text.trim().is_empty())
 }
 
+/// `lines` used to be named like the text of a hunk. A model that speaks
+/// function calls then pastes the `+` line. The schema already wants an
+/// integer; this names the slip so the retry is a line number, not another
+/// wording of the same string. A quoted `"169"` still goes through the
+/// signature, which reads it as 169.
+fn diff_line_written_as_text(arguments: &Value) -> Option<String> {
+    let items = arguments.get("evidence")?.get("lines")?.as_array()?;
+    for (index, item) in items.iter().enumerate() {
+        let Value::String(text) = item else {
+            continue;
+        };
+        if text.trim().parse::<u64>().is_ok() {
+            continue;
+        }
+        return Some(format!(
+            "evidence.lines[{index}] has to be a file line number (an integer), not the text \
+             of the line"
+        ));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -506,12 +542,12 @@ mod tests {
     fn ok_args() -> Value {
         json!({
             "path": "src/parse.c",
-            "line": 11,
+            "start_line": 11,
             "body": "the index is a constant 5",
             "suggestion": "bound the index",
             "severity_score": 80,
             "confidence_score": 92,
-            "evidence": { "diff_lines": [11] }
+            "evidence": { "lines": [11] }
         })
     }
 
@@ -567,24 +603,60 @@ mod tests {
     }
 
     #[test]
-    fn a_finding_that_rests_on_no_diff_line_is_refused() {
+    fn a_finding_without_a_hang_point_is_refused() {
         let mut args = ok_args();
-        args["evidence"]["diff_lines"] = json!([]);
+        args.as_object_mut().unwrap().remove("start_line");
         let error = SubmitComment::new().execute(&args).expect_err("refused");
-        assert!(error.to_string().contains("diff_lines"), "{error}");
+        assert!(error.to_string().contains("start_line"), "{error}");
     }
 
     #[test]
-    fn a_blank_call_is_no_finding_not_an_error() {
-        let output = SubmitComment::new()
-            .execute(&json!({"path": "src/main.rs"}))
-            .expect("empty call is not a defect");
-        assert!(output.submission.is_none());
-        assert!(output.text.contains("nothing filed"), "{}", output.text);
+    fn a_finding_that_rests_on_no_diff_line_is_refused() {
+        let mut args = ok_args();
+        args["evidence"]["lines"] = json!([]);
+        let error = SubmitComment::new().execute(&args).expect_err("refused");
+        assert!(error.to_string().contains("lines"), "{error}");
+    }
+
+    /// The field used to be named like hunk text. The model pasted the `+`
+    /// line. The schema has to say integers, and a pasted string has to be
+    /// refused as that slip.
+    #[test]
+    fn a_diff_line_pasted_as_text_is_refused_as_a_line_number() {
+        let schema = SubmitComment::new().signature().schema();
+        let said = schema["properties"]["evidence"]["properties"]["lines"]["description"]
+            .as_str()
+            .expect("described");
         assert!(
-            output.finished,
-            "a blank call is the model saying it has none"
+            said.contains("integers")
+                && said.contains("not the text of the line")
+                && said.contains("Not the hang span"),
+            "{said}"
         );
+
+        let mut args = ok_args();
+        args["evidence"]["lines"] =
+            json!([r#"+                "Kpatch: Failed to get patch status, {}","#]);
+        let error = SubmitComment::new().execute(&args).expect_err("refused");
+        let said = error.to_string();
+        assert!(said.contains("file line number"), "{said}");
+        assert!(said.contains("not the text of the line"), "{said}");
+        assert!(said.contains("still unsubmitted"), "{said}");
+
+        args["evidence"]["lines"] = json!(["169"]);
+        SubmitComment::new()
+            .execute(&args)
+            .expect("a quoted line number is still a line number");
+    }
+
+    #[test]
+    fn a_blank_call_is_refused() {
+        let error = SubmitComment::new()
+            .execute(&json!({"path": "src/main.rs"}))
+            .expect_err("empty call is not a finding");
+        let said = error.to_string();
+        assert!(said.contains("finish_review"), "{said}");
+        assert!(said.contains("not a finding"), "{said}");
     }
 
     #[test]

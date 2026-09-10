@@ -25,10 +25,10 @@ pub struct Comment {
     pub trace_id: String,
 }
 
-/// File plus line range. `line` is `None` for a file-level comment.
+/// File plus line range. `start_line` is `None` for a file-level comment.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct CommentTarget {
     pub path: String,
-    pub line: Option<u32>,
+    pub start_line: Option<u32>,
     pub end_line: Option<u32>,
 }

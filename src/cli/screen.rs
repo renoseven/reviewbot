@@ -412,14 +412,9 @@ fn path_line(state: &State, width: usize, color: bool) -> Line<'static> {
 /// and — for the waits, where how long is the whole question — a clock. A stage
 /// working needs no clock here; the checklist above it keeps one.
 fn activity_line(state: &State, tick: usize, color: bool, now: Instant) -> Line<'static> {
-    let (what, since) = match (
-        &state.tool,
-        state.waiting_since,
-        state.preparing,
-        state.opening,
-    ) {
-        (Some((tool, since)), _, _, _) => (format!("waiting for {tool}"), Some(*since)),
-        (None, Some(since), _, _) => (
+    let (what, since) = match (&state.tool, state.waiting_since, state.opening) {
+        (Some((tool, since)), _, _) => (format!("waiting for {tool}"), Some(*since)),
+        (None, Some(since), _) => (
             // The conclusion is one more thing to wait for, said the same way.
             match state.concluding {
                 true => "waiting for conclusion".to_string(),
@@ -427,14 +422,13 @@ fn activity_line(state: &State, tick: usize, color: bool, now: Instant) -> Line<
             },
             Some(since),
         ),
-        (None, None, Some(since), _) => ("reading the repository layout".to_string(), Some(since)),
-        (None, None, None, Some(since)) => ("starting".to_string(), Some(since)),
+        (None, None, Some(since)) => ("starting".to_string(), Some(since)),
         // Nothing is being waited on, so the row says what the stage that is
         // running is doing. With every stage finished there is nothing left to
         // be doing, and the final summary is about to take this block's place —
         // so it goes quiet rather than spending its last tenth of a second
         // saying `done`, which the summary underneath says better.
-        (None, None, None, None) => match state
+        (None, None, None) => match state
             .stages
             .iter()
             .find(|row| matches!(row.step, Step::Running { .. }))
@@ -834,40 +828,31 @@ mod tests {
         );
     }
 
-    /// The seconds between `input` finishing and `triage` starting are a tree
-    /// fetch that belongs to neither, and the row that moves has to account for
-    /// them: the checklist has no line to mark, so it looked like a run that had
-    /// stopped with one stage done.
+    /// The concluding wait is that file's. The next file's first model call
+    /// is an ordinary round again.
     #[test]
-    fn the_work_between_two_stages_is_still_on_screen() {
+    fn a_later_file_waits_for_the_model_again() {
         let now = Instant::now();
         let mut state = crate::cli::status::tests::mid_review(now);
-        // The moment it happens in a real run: a stage has just finished, so
-        // nothing is in flight, and the next one has not started.
         state.apply(
-            reviewbot::progress::Event::StageFinished {
-                stage: reviewbot::domain::Stage::Input,
-                outcome: reviewbot::progress::Outcome::Input { files: 9 },
-                from_checkpoint: false,
+            reviewbot::progress::Event::Concluding {
+                why: "the tool loop reached its ceiling of 6 rounds".to_string(),
             },
             now,
         );
-        state.apply(reviewbot::progress::Event::Preparing, now);
-        assert_eq!(
-            last(&rows(&state, 0, now)),
-            "⠋ reading the repository layout... (0.0s)"
+        state.apply(
+            reviewbot::progress::Event::Chunk {
+                index: 4,
+                of: 7,
+                path: "src/baz.c".to_string(),
+                piece: 1,
+                pieces: 1,
+            },
+            now,
         );
+        state.apply(reviewbot::progress::Event::Round { round: 1, of: 6 }, now);
 
-        state.apply(
-            reviewbot::progress::Event::StageStarted {
-                stage: reviewbot::domain::Stage::Triage,
-            },
-            now,
-        );
-        assert!(
-            !last(&rows(&state, 0, now)).contains("layout"),
-            "and it stops saying so the moment a stage does start"
-        );
+        assert_eq!(last(&rows(&state, 0, now)), "⠋ waiting for model... (0.0s)");
     }
 
     /// A run that is over says nothing here: the summary that replaces this

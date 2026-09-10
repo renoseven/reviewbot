@@ -105,23 +105,6 @@ pub(crate) fn no_whole_tree(worktree: &Worktree) -> Option<&'static str> {
     (!worktree.is_checkout()).then_some(NO_WHOLE_TREE_REFUSAL)
 }
 
-/// What every local tool's description says first: what the local side is,
-/// which is the one thing the names no longer vary by run to carry.
-pub(crate) fn local_side(worktree: &Worktree) -> &'static str {
-    if worktree.is_checkout() {
-        "The local side is the checkout under review, standing on the reviewed commit, so it \
-         holds the whole project."
-    } else if worktree.is_cache() {
-        "The local side is a directory of this run's own, which started empty and holds the \
-         files that have been fetched into it from the platform API at the reviewed commit. \
-         It is not a checkout: only what has been asked for is on disk."
-    } else {
-        // Reached only by a caller that did not check `no_files` first; every
-        // description here does, and says more than this.
-        "Nothing can be read this whole run, and that says nothing about whether the \
-         repository has the file."
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -258,6 +241,16 @@ mod tests {
         assert!(no_keyword_search(&whole).is_none());
         assert!(no_whole_tree(&whole).is_none());
         assert!(whole.went_without().is_empty());
+
+        // A checkout without a platform can still search itself. The tools
+        // that talk to the platform stay marked unavailable; that is not a
+        // coverage line. A cache with no search is the real hole: the disk
+        // is a handful of fetched files and nothing can look past them.
+        assert!(
+            local(None).went_without().is_empty(),
+            "local search covers the checkout: {:?}",
+            local(None).went_without()
+        );
     }
 
     /// A report line has to read as a bound on coverage, never as a finding

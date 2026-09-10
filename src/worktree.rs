@@ -224,7 +224,10 @@ impl Worktree {
                 true => vec![NO_WHOLE_TREE_REPORTED, NO_REPO_SEARCH_REPORTED],
                 false => vec![NO_WHOLE_TREE_REPORTED],
             },
-            Worktree::Local { repo: None, .. } => vec![NO_REPO_SEARCH_REPORTED],
+            // A checkout can search itself. Missing a platform search is
+            // not a coverage hole here — local regex walks the tree. The
+            // real hole is a cache with no search: the disk holds only
+            // what was fetched, and the platform cannot fill the rest.
             Worktree::Local { .. } => Vec::new(),
         }
     }
@@ -988,9 +991,10 @@ mod tests {
         let (_directory, checkout) = checkout();
         assert!(checkout.is_checkout());
         assert!(checkout.repo().is_none());
-        assert_eq!(
-            checkout.went_without(),
-            vec!["could not search the repository"]
+        assert!(
+            checkout.went_without().is_empty(),
+            "local search covers the checkout: {:?}",
+            checkout.went_without()
         );
         let listing = checkout
             .list_project()

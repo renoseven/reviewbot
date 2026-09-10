@@ -330,17 +330,25 @@ fn reply_as_calls(text: &str, request: &Request) -> Option<Vec<OutputItem>> {
         return None;
     }
     let comments = value.get("comments")?.as_array()?;
-    Some(
-        comments
-            .iter()
-            .enumerate()
-            .map(|(index, comment)| OutputItem::FunctionCall {
-                call_id: format!("submit-{index}"),
-                name: SubmitComment::NAME.to_string(),
-                arguments: comment.to_string(),
-            })
-            .collect(),
-    )
+    let mut calls: Vec<OutputItem> = comments
+        .iter()
+        .enumerate()
+        .map(|(index, comment)| OutputItem::FunctionCall {
+            call_id: format!("submit-{index}"),
+            name: SubmitComment::NAME.to_string(),
+            arguments: comment.to_string(),
+        })
+        .collect();
+    // A comments document is the whole answer for that file. Filing is not
+    // the end signal; the fake has to send it, or the loop asks again.
+    if advertised(crate::tool::FinishReview::NAME) {
+        calls.push(OutputItem::FunctionCall {
+            call_id: "finish-review".to_string(),
+            name: crate::tool::FinishReview::NAME.to_string(),
+            arguments: "{}".to_string(),
+        });
+    }
+    Some(calls)
 }
 
 /// The half of the adapters a run has before it has a directory. The
@@ -1401,10 +1409,10 @@ fn instructions_are_byte_identical_across_two_chunks() {
 }
 
 /// One chunk's worth of answer, on a line the fixture diff really added.
-const FINDING: &str = r#"{"comments":[{"path":"src/parse.c","line":11,
+const FINDING: &str = r#"{"comments":[{"path":"src/parse.c","start_line":11,
     "body":"`added` is declared twice once the removed line comes back",
     "suggestion":"keep only one declaration of `added`",
-    "severity_score":74,"confidence_score":91,"evidence":{"diff_lines":[11,12]}}]}"#;
+    "severity_score":74,"confidence_score":91,"evidence":{"lines":[11,12]}}]}"#;
 
 const SCORE: &str = r#"{"overall_score":54,"summary":"one certain finding; read it first"}"#;
 
@@ -1782,8 +1790,7 @@ fn a_full_run_announces_every_stage_and_numbers_the_chunks() {
 }
 
 /// A tool call brackets the same work recorded in the trace. Delivering a
-/// finding is a tool call like any other, which is why an ordinary run has
-/// one complete pair.
+/// finding is a tool call like any other; ending the file is a second one.
 #[test]
 fn a_tool_the_model_calls_is_named_as_it_goes_out_and_returns() {
     let workspace = Workspace::with_config(
@@ -1813,6 +1820,8 @@ fn a_tool_the_model_calls_is_named_as_it_goes_out_and_returns() {
         vec![
             ("started", "submit_comment".to_string()),
             ("finished", "submit_comment".to_string()),
+            ("started", "finish_review".to_string()),
+            ("finished", "finish_review".to_string()),
         ]
     );
 }

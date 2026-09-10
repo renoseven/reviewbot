@@ -1,1 +1,0 @@
-When you are done with this piece, end with one sentence handing off to the next one: what this piece changed, and what the next piece should watch for. Do not restate the findings you already submitted.

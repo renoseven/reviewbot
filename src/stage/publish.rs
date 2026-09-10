@@ -111,7 +111,7 @@ impl Publish {
             }
             outgoing.push(OutgoingComment {
                 paths: paths_for(input.changeset, &comment.target.path),
-                line: comment.target.line,
+                line: comment.target.start_line,
                 end_line: comment.target.end_line,
                 body: Self::comment_body(comment, input.merged.badge(index), &marker, &run_id),
                 marker,
@@ -375,7 +375,7 @@ mod tests {
         Comment {
             target: CommentTarget {
                 path: "src/parse.c".to_string(),
-                line: Some(11),
+                start_line: Some(11),
                 end_line: None,
             },
             body: "the index is a constant 5 while buf is char[3]".to_string(),
@@ -419,7 +419,6 @@ mod tests {
             unreviewed: Vec::new(),
             stopped: None,
             unproduced: Vec::new(),
-            cut_short: Vec::new(),
             unavailable: Vec::new(),
             spent: 0.0,
             budget: Some(10.0),
@@ -636,7 +635,7 @@ mod tests {
                 Comment {
                     target: CommentTarget {
                         path: "src/other.c".to_string(),
-                        line: Some(3),
+                        start_line: Some(3),
                         end_line: None,
                     },
                     body: "another finding".to_string(),

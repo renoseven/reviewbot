@@ -129,9 +129,6 @@ pub(super) struct State {
     /// Since when the run has been working out which change this is. Cleared by
     /// the first stage, which is the moment there is something better to say.
     pub(super) opening: Option<Instant>,
-    /// Since when the prompt both `triage` and `review` need has been being
-    /// assembled. Cleared by the next stage to start, for the same reason.
-    pub(super) preparing: Option<Instant>,
     input_files: Option<usize>,
 }
 
@@ -165,7 +162,6 @@ impl Default for State {
             // otherwise show a checklist of six things not started — and then
             // take it away again when the run finally speaks.
             opening: Some(Instant::now()),
-            preparing: None,
             input_files: None,
         }
     }
@@ -218,12 +214,6 @@ impl State {
                 self.opening = Some(now);
                 None
             }
-            // Work that belongs to no stage, so the row that moves says what
-            // it is instead of going quiet.
-            Event::Preparing => {
-                self.preparing = Some(now);
-                None
-            }
             Event::StageStarted { stage } => {
                 self.begin(stage, now);
                 None
@@ -269,15 +259,16 @@ impl State {
                 piece,
                 pieces,
             } => {
+                // A concluding turn belongs to the file that hit the ceiling
+                // or the prose re-ask, not to the next one. Leaving the flag
+                // set is how every later wait said "waiting for conclusion".
+                self.forget_chunk();
                 self.piece = Some((piece, pieces));
                 // The plan's place, not how many paths this process has
                 // seen: a re-entered run skips finished files and would
                 // otherwise look like it started at file 1 again.
                 self.files_seen = index;
                 self.path = Some(path.clone());
-                self.exchange = None;
-                self.waiting_since = None;
-                self.tool = None;
                 Some(format!(
                     "[{}/{}] {:<9} file {}/{}  {path}{}{}\n",
                     Stage::Review.number(),
@@ -296,6 +287,7 @@ impl State {
                 ))
             }
             Event::Round { round, of } => {
+                self.concluding = false;
                 self.exchange = Some((round, of));
                 self.waiting_since = Some(now);
                 self.tool = None;
@@ -335,7 +327,6 @@ impl State {
 
     fn begin(&mut self, stage: Stage, now: Instant) {
         self.opening = None;
-        self.preparing = None;
         if let Some(row) = self.row_mut(stage) {
             row.step = Step::Running { since: now };
         }
@@ -620,6 +611,41 @@ run  change.diff  model deepseek-v4-flash  worktree /repo
             state.files_seen, 4,
             "the same file split in two is one file"
         );
+    }
+
+    /// A concluding turn is about that file. The next file starts a new
+    /// conversation; leaving the flag set made every later wait say
+    /// "waiting for conclusion" while the loop was still investigating.
+    #[test]
+    fn a_later_file_is_not_still_the_conclusion() {
+        let now = Instant::now();
+        let mut state = mid_review(now);
+        state.apply(
+            Event::Concluding {
+                why: "the tool loop reached its ceiling of 6 rounds".to_string(),
+            },
+            now,
+        );
+        assert!(state.concluding);
+
+        state.apply(
+            Event::Chunk {
+                index: 4,
+                of: 7,
+                path: "src/baz.c".to_string(),
+                piece: 1,
+                pieces: 1,
+            },
+            now,
+        );
+        assert!(
+            !state.concluding,
+            "the next file is not the concluding turn"
+        );
+
+        state.apply(Event::Round { round: 1, of: 6 }, now);
+        assert!(!state.concluding);
+        assert_eq!(state.exchange, Some((1, 6)));
     }
 
     /// A re-entered run emits only the files it still has to do. The number

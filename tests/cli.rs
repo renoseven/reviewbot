@@ -411,9 +411,9 @@ fn config_info_text_has_every_section_and_the_file_field_names() {
             "missing column {heading}: {stdout}"
         );
     }
-    assert!(stdout.contains("3.00 CNY"), "{stdout}");
-    assert!(stdout.contains("0.10 CNY"), "{stdout}");
-    assert!(stdout.contains("9.00 CNY"), "{stdout}");
+    assert!(stdout.contains("2.00 CNY"), "{stdout}");
+    assert!(stdout.contains("0.04 CNY"), "{stdout}");
+    assert!(stdout.contains("8.00 CNY"), "{stdout}");
     assert!(
         !stdout.contains("BASE URL"),
         "a multi-word title is joined with _: {stdout}"

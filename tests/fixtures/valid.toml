@@ -17,9 +17,9 @@ budget_per_run = 10.0
 name = "deepseek-v4-flash"
 default = true
 provider = "deepseek"
-input_per_1m_tokens = 3.0
-cached_input_per_1m_tokens = 0.10
-output_per_1m_tokens = 9.0
+input_per_1m_tokens = 2.0
+cached_input_per_1m_tokens = 0.04
+output_per_1m_tokens = 8.0
 context_window_tokens = 1000000
 max_output_tokens = 384000
 
@@ -57,20 +57,20 @@ allow_extensions = [
 
 [[tool]]
 name = "cppcheck"
-description = "static analysis for one C/C++ file: memory, bounds, uninitialized values (no compile)"
+description = "static analysis for one C/C++ file: memory, bounds, uninitialized values (no compile). The path must be a C or C++ file; do not call this for any other language."
 bin = "/usr/bin/cppcheck"
 args = ["--enable=warning,style", "--template=gcc", "--quiet", "--", "{path}"]
-params.path = { type = "path" }
+params.path = { type = "path", description = "a C or C++ file; do not pass a path in any other language" }
 requires_checkout = false
 requires_build = false
 timeout_ms = 60000
 
 [[tool]]
 name = "typecheck"
-description = "type-check one C file with gcc -fsyntax-only (no object file)"
+description = "type-check one C file with gcc -fsyntax-only (no object file). The path must be a C source or header; do not call this for any other language."
 bin = "/usr/bin/gcc"
 args = ["-Wall", "-Wextra", "-fsyntax-only", "--", "{path}"]
-params.path = { type = "path" }
+params.path = { type = "path", description = "a C source or header; do not pass a path in any other language" }
 requires_checkout = true
 requires_build = false
 timeout_ms = 60000

@@ -30,16 +30,16 @@ budget_per_run = -1                    # -1 unlimited | 0 spend nothing | > 0 ca
 # Models `--model` can select.
 # Prices and limits travel with the entry.
 [[model]]
-name = "deepseek-v4-flash"         # vendor model name, as the API expects it
-# alias = "flash"                  # optional short name for --model
+name = "deepseek-flash"            # vendor model name, as the API expects it
+alias = "deepseek-v4-flash"        # optional; --model accepts name or alias
 default = true                     # true | false. At most one model may set true
 provider = "deepseek"              # must match a [[provider]].name
-input_per_1m_tokens = 3.0          # price of 1e6 input tokens, in [[provider]].currency
-cached_input_per_1m_tokens = 0.10  # optional; omit when unused
-output_per_1m_tokens = 9.0         # price of 1e6 output tokens, same currency
+input_per_1m_tokens = 2.0          # price of 1e6 input tokens, in [[provider]].currency
+cached_input_per_1m_tokens = 0.04  # optional; omit when unused
+output_per_1m_tokens = 8.0         # price of 1e6 output tokens, same currency
 context_window_tokens = 1000000    # must be > max_output_tokens + 4096
 max_output_tokens = 384000         # most tokens one completion may emit
-reasoning_effort = "none"          # none | minimal | low | medium | high | xhigh | max
+reasoning_effort = "low"           # none | minimal | low | medium | high | xhigh | max
                                    # omit to leave the vendor default
 
 [[model]]
@@ -50,6 +50,7 @@ cached_input_per_1m_tokens = 0.30
 output_per_1m_tokens = 27.0
 context_window_tokens = 1000000
 max_output_tokens = 384000
+reasoning_effort = "low"
 
 # Which files to skip, and the size of one review turn.
 # Skipped files are named in the report.
@@ -107,10 +108,10 @@ allow_build_tools = false                  # true | false. `requires_build` tool
 # Single-file C/C++ static analysis.
 # [[tool]]
 # name = "cppcheck"
-# description = "static analysis for one C/C++ file: memory, bounds, uninitialized values"
+# description = "static analysis for one C/C++ file: memory, bounds, uninitialized values. The path must be a C or C++ file; do not call this for any other language."
 # bin = "/usr/bin/cppcheck"
 # args = ["--enable=warning,style", "--template=gcc", "--quiet", "--", "{path}"]
-# params.path = { type = "path", description = "C or C++ file to check" }
+# params.path = { type = "path", description = "a C or C++ file; do not pass a path in any other language" }
 # requires_checkout = false
 # requires_build = false
 # timeout_ms = 60000
@@ -118,10 +119,10 @@ allow_build_tools = false                  # true | false. `requires_build` tool
 # Type-check one C file; needs the whole project.
 # [[tool]]
 # name = "typecheck"
-# description = "type-check one C file with gcc -fsyntax-only"
+# description = "type-check one C file with gcc -fsyntax-only. The path must be a C source or header; do not call this for any other language."
 # bin = "/usr/bin/gcc"
 # args = ["-Wall", "-Wextra", "-fsyntax-only", "--", "{path}"]
-# params.path = { type = "path", description = "C file to type-check" }
+# params.path = { type = "path", description = "a C source or header; do not pass a path in any other language" }
 # requires_checkout = true
 # requires_build = false
 # timeout_ms = 60000
