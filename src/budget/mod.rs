@@ -3,7 +3,7 @@
 pub mod estimate;
 pub mod price;
 
-pub use estimate::{estimate_ascii_tokens, estimate_tokens};
+pub use estimate::{bytes_for_ascii_tokens, estimate_ascii_tokens, estimate_tokens};
 pub use price::{Price, TokenUsage};
 
 use crate::config::Selection;

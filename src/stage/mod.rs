@@ -333,7 +333,6 @@ mod tests {
 
     const CONFIG: &str = r#"
 [review]
-max_tool_rounds = 12
 max_files_per_listing = 200
 max_hits_per_search = 50
 max_file_bytes = 262144

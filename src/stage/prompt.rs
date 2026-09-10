@@ -117,6 +117,16 @@ impl Prompts {
         include_str!("../prompts/after-truncate.md"),
     );
 
+    /// Where the model stands in its round budget, said after every round it
+    /// spends. A budget nobody can see the balance of cannot be rationed, and
+    /// the prompt asks it to ration this one.
+    pub const ROUNDS_LEFT: Template =
+        Template::new("rounds-left", include_str!("../prompts/rounds-left.md"));
+
+    /// Added to the count when the next round is the last.
+    pub const ROUNDS_LAST: Template =
+        Template::new("rounds-last", include_str!("../prompts/rounds-last.md"));
+
     /// The one re-ask when a scoring call carried no verdict.
     pub const RESCORE: Template = Template::new("rescore", include_str!("../prompts/rescore.md"));
 }
@@ -454,6 +464,7 @@ mod tests {
             Prompts::WORKTREE_CHECKOUT,
             Prompts::WORKTREE_FETCHED,
             Prompts::WORKTREE_EMPTY,
+            Prompts::ROUNDS_LAST,
         ] {
             assert!(
                 template.slots().is_empty(),
@@ -468,6 +479,7 @@ mod tests {
             Prompts::NARRATIVE,
             Prompts::SPLIT,
             Prompts::SPLIT_FINDINGS,
+            Prompts::ROUNDS_LEFT,
             Prompts::SPLIT_NOTE,
             Prompts::RESCORE,
         ] {

@@ -140,13 +140,12 @@ pub enum ConfigError {
         skeleton: u32,
     },
     #[error(
-        "model {model:?} has context_window_tokens {context_window_tokens}, and holding {allowance} tokens back for {rounds} rounds of tool output leaves {left} for the diff; lower [review].max_tool_rounds or [review].max_tool_output_bytes"
+        "model {model:?} has context_window_tokens {context_window_tokens}, and what it must always carry takes {reserved} of that, leaving {left} — not enough to review anything; raise the window by choosing another [[model]], or lower that model's max_output_tokens"
     )]
-    ToolAllowanceTooLarge {
+    WindowTooSmall {
         model: String,
         context_window_tokens: u32,
-        rounds: u32,
-        allowance: u32,
+        reserved: u32,
         left: u32,
     },
     #[error(
@@ -508,19 +507,19 @@ impl Config {
         Ok(())
     }
 
-    /// Every sizing number is required. None of them has an answer that holds
-    /// across models and repositories — the round ceiling and the per-round
-    /// output cap are bounded by the model's window, the chunk size and the
-    /// read ceiling by how big this project's files get, the two listing caps
-    /// by how many paths a listing is worth. A builtin default would make
-    /// that call silently, and the wrong call is quiet: reviews that stop
-    /// half way, or a window that has no room left for the diff.
+    /// Every sizing number here is required, and none of them has an answer
+    /// that holds across projects: the chunk size and the read ceiling depend
+    /// on how big this project's files get, the listing caps on how many paths
+    /// a listing is worth reading, the per-answer cap on how much diagnostic
+    /// output is worth carrying. A builtin default would make those calls
+    /// silently, and the wrong call is quiet.
+    ///
+    /// The round ceiling used to be here and is not any more: it is not a
+    /// project fact but whatever the model's window can afford once the diff
+    /// has its share, so it is worked out per run rather than guessed by hand
+    /// (see `stage::triage::Window`).
     fn check_sizes(&self) -> Result<(), ConfigError> {
         let required = [
-            (
-                "[review].max_tool_rounds",
-                u64::from(self.review.max_tool_rounds),
-            ),
             (
                 "[review].max_files_per_listing",
                 u64::from(self.review.max_files_per_listing),
@@ -701,7 +700,6 @@ mod tests {
 
     const MINIMAL: &str = r#"
 [review]
-max_tool_rounds = 12
 max_files_per_listing = 200
 max_hits_per_search = 50
 max_file_bytes = 262144
@@ -902,7 +900,6 @@ api_token = "GITHUB_TOKEN"
     #[test]
     fn every_sizing_number_is_required_rather_than_defaulted() {
         for (field, line) in [
-            ("[review].max_tool_rounds", "max_tool_rounds = 12"),
             (
                 "[review].max_files_per_listing",
                 "max_files_per_listing = 200",

@@ -71,13 +71,6 @@ pub enum LogLevel {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewSettings {
-    /// Rounds, not calls: one round carries however many `function_call`s the
-    /// model emitted together, so a dozen rounds is far more than a dozen
-    /// reads. Costs context: `triage` reserves this times
-    /// `max_tool_output_bytes` out of the window.
-    ///
-    #[serde(default)]
-    pub max_tool_rounds: u32,
     /// How many paths one listing may show before it says how many remain.
     #[serde(default)]
     pub max_files_per_listing: u32,
@@ -90,9 +83,12 @@ pub struct ReviewSettings {
     /// past this cannot be read at all, in whole or in part.
     #[serde(default)]
     pub max_file_bytes: u64,
-    /// What one tool answer may hand back, and what all the tool output of
-    /// one round may add up to. Paired with `max_tool_rounds`: the two
-    /// multiplied together are held back from the context window.
+    /// What one tool answer may hand back. A fact about tools rather than
+    /// about the window: how much diagnostic output is worth reading is the
+    /// same question whatever model is asked, and the registry needs the
+    /// number before there is a window to divide. **How much a whole round
+    /// may add up to is not this**: that is what the window can afford after
+    /// the diff has taken its share, worked out per run.
     #[serde(default)]
     pub max_tool_output_bytes: u64,
 }
@@ -103,7 +99,6 @@ impl ReviewSettings {
     /// reads a file needs them. Kept in one place rather than per test.
     pub fn for_tests() -> Self {
         Self {
-            max_tool_rounds: 12,
             max_files_per_listing: 200,
             max_hits_per_search: 50,
             max_file_bytes: 262_144,

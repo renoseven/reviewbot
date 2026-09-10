@@ -30,6 +30,13 @@ pub fn estimate_ascii_tokens(bytes: u64) -> u32 {
     (raw * SAFETY_FACTOR).ceil().min(u32::MAX as f64) as u32
 }
 
+/// The other direction: how many bytes of tool output a token allowance can
+/// hold. Rounding down, so the bytes handed out never estimate back to more
+/// tokens than were set aside for them.
+pub fn bytes_for_ascii_tokens(tokens: u32) -> u64 {
+    (tokens as f64 * ASCII_CHARS_PER_TOKEN / SAFETY_FACTOR).floor() as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

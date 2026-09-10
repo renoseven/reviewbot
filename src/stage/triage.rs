@@ -7,7 +7,7 @@
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 
-use crate::budget::{estimate_ascii_tokens, estimate_tokens};
+use crate::budget::{bytes_for_ascii_tokens, estimate_tokens};
 use crate::config::{Config, ConfigError, Model, PROMPT_SKELETON_TOKENS, TriageSettings};
 use crate::domain::{ChangeSet, DEV_NULL, FileChange, Stage};
 use crate::security::PathPolicy;
@@ -69,24 +69,47 @@ pub struct SkippedFile {
 pub struct TriagePlan {
     pub chunks: Vec<Chunk>,
     pub skipped: Vec<SkippedFile>,
+    /// How the window was divided. Carried rather than recomputed: `review`
+    /// has to spend exactly what `triage` set aside, and a checkpoint keeps
+    /// the two agreeing across a re-entered run.
+    #[serde(default)]
+    pub window: Window,
 }
 
-/// How many tokens of diff one chunk may carry.
+/// How the model's context window is divided for one review: how much diff a
+/// chunk may carry, how many rounds the tool loop gets, and how much output one
+/// round may append.
 ///
-/// The hard ceiling is whatever still fits in the window:
+/// Only the first of those is asked for. The window, less the output the model
+/// may write and the prompt it always carries, is what there is; the diff takes
+/// what `[triage].max_chunk_tokens` asks for, and **every token left buys
+/// rounds**. One round may append as much as a whole chunk may be, so the
+/// number of rounds is simply how many chunk-sized answers still fit.
 ///
-/// `context_window_tokens − max_output_tokens − prompt skeleton − tool allowance − headroom`
-///
-/// The working size is `[triage].max_chunk_tokens`, clamped down to that
-/// ceiling. It has no builtin default: the leftover window is not itself a
-/// useful review turn, and how much diff is worth one call depends on the
-/// model and the project.
-#[derive(Clone, Copy, Debug)]
-pub struct ChunkLimit {
-    tokens: u32,
+/// Rounds used to be configured, alongside the bytes one round may return, and
+/// the pair was the worst kind of knob: they multiply into a reservation taken
+/// out of the same window the diff comes from, so nobody could say what either
+/// number cost without doing that arithmetic by hand — and the failure people
+/// actually hit was a ceiling far too low, silently ending an investigation
+/// half way. Deriving them says what the window can actually afford. **A round
+/// ceiling is a guard against a model that never concludes, not a cost
+/// control**: what a run may spend is `budget_per_run`, checked before every
+/// call, so there is nothing left for a small round count to protect.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default = "Window::least")]
+pub struct Window {
+    chunk_tokens: u32,
+    rounds: u32,
+    round_bytes: u64,
 }
 
-impl ChunkLimit {
+impl Default for Window {
+    fn default() -> Self {
+        Self::least()
+    }
+}
+
+impl Window {
     /// `prompt_tokens` is measured from the assembled instructions and the
     /// tool schemas, not guessed: `PROMPT_SKELETON_TOKENS` is only the floor
     /// the startup check uses, before there is a registry to measure. It
@@ -99,52 +122,81 @@ impl ChunkLimit {
         tools: &Registry,
         prompt_tokens: u32,
     ) -> Result<Self, ConfigError> {
-        let allowance = Self::tool_allowance(config, tools);
         let reserved = model
             .max_output_tokens
             .saturating_add(prompt_tokens.max(PROMPT_SKELETON_TOKENS))
-            .saturating_add(allowance)
             .saturating_add(HEADROOM_TOKENS);
-        let fit = model.context_window_tokens.saturating_sub(reserved);
-        // The allowance is the one term a config can raise without noticing
-        // what it costs: rounds times output bytes grows fast enough to eat a
-        // small window whole. Say so here, where the registry is known, rather
-        // than letting every file fail as too large.
-        if allowance > 0 && fit < MIN_CHUNK_TOKENS {
-            return Err(ConfigError::ToolAllowanceTooLarge {
+        let available = model.context_window_tokens.saturating_sub(reserved);
+        if available < MIN_CHUNK_TOKENS {
+            return Err(ConfigError::WindowTooSmall {
                 model: model.name.clone(),
                 context_window_tokens: model.context_window_tokens,
-                rounds: config.review.max_tool_rounds,
-                allowance,
-                left: fit,
+                reserved,
+                left: available,
             });
         }
+        let chunk_tokens = available.min(config.triage.max_chunk_tokens);
+        // Rounds only mean something when something can be investigated.
+        // Delivery-only tools do not grow the conversation, and neither does
+        // one this run's worktree cannot answer: it is offered to the model
+        // like the rest, but all it can ever return is a one-line refusal.
+        let rounds = match Self::investigates(tools) {
+            false => 1,
+            true => (available / chunk_tokens.max(1)).saturating_sub(1).max(1),
+        };
         Ok(Self {
-            tokens: fit.min(config.triage.max_chunk_tokens),
+            chunk_tokens,
+            rounds,
+            round_bytes: bytes_for_ascii_tokens(chunk_tokens),
         })
     }
 
-    pub fn tokens(self) -> u32 {
-        self.tokens
+    /// How many tokens of diff one chunk may carry.
+    pub fn chunk_tokens(self) -> u32 {
+        self.chunk_tokens
     }
 
-    /// What the tool loop may append to `input` before the last round.
-    /// Delivery-only tools do not grow the conversation with bulk output, so
-    /// they do not reserve this. Neither does one this run's worktree cannot
-    /// answer: it is offered to the model like the rest, but all it can ever
-    /// return is a one-line refusal.
-    fn tool_allowance(config: &Config, tools: &Registry) -> u32 {
-        let investigates = tools
+    /// How many times the model may ask for something before it is asked to
+    /// conclude with what it has.
+    pub fn rounds(self) -> u32 {
+        self.rounds
+    }
+
+    /// What all of one round's tool output may add up to.
+    pub fn round_bytes(self) -> u64 {
+        self.round_bytes
+    }
+
+    /// One round over the smallest diff worth reviewing: what a `TriagePlan`
+    /// says before anything has divided a real window. Tests build plans this
+    /// way, and a review handed this one gets a single round rather than a
+    /// generous number nobody worked out.
+    pub fn least() -> Self {
+        Self {
+            chunk_tokens: MIN_CHUNK_TOKENS,
+            rounds: 1,
+            round_bytes: bytes_for_ascii_tokens(MIN_CHUNK_TOKENS),
+        }
+    }
+
+    /// A division a test dictates rather than derives, for reaching the round
+    /// ceiling or the per-round clip without scripting a real window.
+    #[cfg(test)]
+    pub fn dictated(chunk_tokens: u32, rounds: u32, round_bytes: u64) -> Self {
+        Self {
+            chunk_tokens,
+            rounds,
+            round_bytes,
+        }
+    }
+
+    fn investigates(tools: &Registry) -> bool {
+        tools
             .offered_on(crate::tool::Round::Investigation)
             .iter()
             .any(|tool| {
                 tool.purpose() != crate::tool::Purpose::Delivery && tool.unavailable().is_none()
-            });
-        if !investigates {
-            return 0;
-        }
-        estimate_ascii_tokens(config.review.max_tool_output_bytes)
-            .saturating_mul(config.review.max_tool_rounds)
+            })
     }
 }
 
@@ -315,14 +367,14 @@ impl Triage {
         prompt_tokens: u32,
     ) -> Result<TriagePlan, StageError> {
         let model = context.settings.selection()?.model;
-        let limit = ChunkLimit::new(
+        let window = Window::new(
             model,
             &context.settings.config,
             &context.adapters.tools,
             prompt_tokens,
         )?;
         let filter = FileFilter::new(&context.settings.config.triage)?;
-        let plan = Self::plan(changeset, &filter, context.paths, limit);
+        let plan = Self::plan(changeset, &filter, context.paths, window);
 
         for file in &plan.skipped {
             tracing::debug!(path = %file.path, reason = %file.reason, "file skipped");
@@ -330,7 +382,9 @@ impl Triage {
         tracing::info!(
             chunks = plan.chunks.len(),
             skipped = plan.skipped.len(),
-            chunk_limit = limit.tokens(),
+            chunk_limit = window.chunk_tokens(),
+            rounds = window.rounds(),
+            round_bytes = window.round_bytes(),
             prompt_tokens,
             "triage done"
         );
@@ -344,7 +398,7 @@ impl Triage {
         changeset: &ChangeSet,
         filter: &FileFilter,
         paths: &PathPolicy,
-        limit: ChunkLimit,
+        window: Window,
     ) -> TriagePlan {
         let mut skipped = Vec::new();
         let mut reviewable: Vec<&FileChange> = Vec::new();
@@ -371,7 +425,7 @@ impl Triage {
 
         let mut chunks = Vec::new();
         for file in reviewable {
-            let cut = FileDiff::new(file).pieces(limit.tokens());
+            let cut = FileDiff::new(file).pieces(window.chunk_tokens());
             let pieces = cut.len();
             for (piece, diff) in cut.into_iter().enumerate() {
                 chunks.push(Chunk {
@@ -383,7 +437,11 @@ impl Triage {
                 });
             }
         }
-        TriagePlan { chunks, skipped }
+        TriagePlan {
+            chunks,
+            skipped,
+            window,
+        }
     }
 }
 
@@ -417,7 +475,6 @@ mod tests {
 
     const CONFIG: &str = r#"
 [review]
-max_tool_rounds = 12
 max_files_per_listing = 200
 max_hits_per_search = 50
 max_file_bytes = 262144
@@ -559,7 +616,11 @@ max_output_tokens = 4096
             &changeset(files),
             &FileFilter::new(&settings).expect("valid globs"),
             &policy(&[]),
-            ChunkLimit { tokens: limit },
+            Window {
+                chunk_tokens: limit,
+                rounds: 1,
+                round_bytes: 0,
+            },
         )
     }
 
@@ -651,7 +712,11 @@ max_output_tokens = 4096
             &changeset(files),
             &FileFilter::new(&settings).expect("valid globs"),
             &policy(&["secrets/**"]),
-            ChunkLimit { tokens: 10_000 },
+            Window {
+                chunk_tokens: 10_000,
+                rounds: 1,
+                round_bytes: 0,
+            },
         );
 
         let reasons: Vec<(&str, &str)> = plan
@@ -693,8 +758,8 @@ max_output_tokens = 4096
         assert_eq!(plan.chunks[0].path, "src/kept.c");
     }
 
-    fn limit(model: &Model, config: &Config, tools: &Registry) -> ChunkLimit {
-        ChunkLimit::new(model, config, tools, PROMPT_SKELETON_TOKENS)
+    fn limit(model: &Model, config: &Config, tools: &Registry) -> Window {
+        Window::new(model, config, tools, PROMPT_SKELETON_TOKENS)
             .expect("the window has room for the diff")
     }
 
@@ -705,8 +770,8 @@ max_output_tokens = 4096
         let config = config(CONFIG);
         let small = limit(model(&config, "small"), &config, &registry(false));
         let large = limit(model(&config, "large"), &config, &registry(false));
-        assert_eq!(small.tokens(), WORKING_SIZE);
-        assert_eq!(large.tokens(), WORKING_SIZE);
+        assert_eq!(small.chunk_tokens(), WORKING_SIZE);
+        assert_eq!(large.chunk_tokens(), WORKING_SIZE);
     }
 
     #[test]
@@ -716,13 +781,13 @@ max_output_tokens = 4096
         let small = limit(model(&config, "small"), &config, &registry(false));
         let large = limit(model(&config, "large"), &config, &registry(false));
         assert!(
-            large.tokens() > small.tokens(),
+            large.chunk_tokens() > small.chunk_tokens(),
             "{} vs {}",
-            large.tokens(),
-            small.tokens()
+            large.chunk_tokens(),
+            small.chunk_tokens()
         );
         assert_eq!(
-            small.tokens(),
+            small.chunk_tokens(),
             32_768 - 4_096 - PROMPT_SKELETON_TOKENS - HEADROOM_TOKENS
         );
     }
@@ -739,20 +804,20 @@ max_output_tokens = 4096
         let model = model(&config, "small");
         let tools = registry(false);
 
-        let floor = ChunkLimit::new(model, &config, &tools, PROMPT_SKELETON_TOKENS)
-            .expect("room for the diff");
-        let measured = ChunkLimit::new(model, &config, &tools, PROMPT_SKELETON_TOKENS + 8_000)
+        let floor =
+            Window::new(model, &config, &tools, PROMPT_SKELETON_TOKENS).expect("room for the diff");
+        let measured = Window::new(model, &config, &tools, PROMPT_SKELETON_TOKENS + 8_000)
             .expect("room for the diff");
         assert_eq!(
-            measured.tokens(),
-            floor.tokens() - 8_000,
+            measured.chunk_tokens(),
+            floor.chunk_tokens() - 8_000,
             "a prompt 8000 tokens bigger takes 8000 tokens off the diff"
         );
 
-        let understated = ChunkLimit::new(model, &config, &tools, 1).expect("room for the diff");
+        let understated = Window::new(model, &config, &tools, 1).expect("room for the diff");
         assert_eq!(
-            understated.tokens(),
-            floor.tokens(),
+            understated.chunk_tokens(),
+            floor.chunk_tokens(),
             "measuring under the floor does not buy back window the startup check spent"
         );
     }
@@ -767,67 +832,75 @@ max_output_tokens = 4096
         let tight = limit(model(&config, "small"), &config, &registry(false));
         let fit = 20_000 - 4_096 - PROMPT_SKELETON_TOKENS - HEADROOM_TOKENS;
         assert!(fit < WORKING_SIZE, "{fit}");
-        assert_eq!(tight.tokens(), fit);
+        assert_eq!(tight.chunk_tokens(), fit);
     }
 
+    /// The diff no longer pays for the tool loop. It takes what it asked for
+    /// and the loop gets what is left, so registering a tool changes how many
+    /// rounds there are rather than how much diff each one sees — which is the
+    /// whole point of deriving the count instead of configuring it.
     #[test]
-    fn registered_tools_and_more_rounds_shrink_the_limit() {
-        // A small per-round cap and a working size out of the way, so the
-        // round count can be varied over a wide range and still be what the
-        // arithmetic turns on. The shape of the formula is the subject here,
-        // not the shipped numbers.
-        let roomy = CONFIG
-            .replace("max_chunk_tokens = 20000", "max_chunk_tokens = 1000000")
-            .replace(
-                "max_tool_output_bytes = 32768",
-                "max_tool_output_bytes = 4096",
-            );
-        let plain = config(&roomy);
-        let large = model(&plain, "large");
-        let without = limit(large, &plain, &registry(false));
-        let with = limit(large, &plain, &registry(true));
-        assert!(
-            with.tokens() < without.tokens(),
-            "a registered tool reserves room in the loop"
-        );
+    fn a_registered_tool_buys_rounds_rather_than_shrinking_the_diff() {
+        let written = config(CONFIG);
+        let large = model(&written, "large");
 
-        let busier = config(&roomy.replace("max_tool_rounds = 12", "max_tool_rounds = 40"));
-        let busier_limit = limit(model(&busier, "large"), &busier, &registry(true));
-        assert!(
-            busier_limit.tokens() < with.tokens(),
-            "more rounds reserve more"
-        );
+        let without = limit(large, &written, &registry(false));
+        let with = limit(large, &written, &registry(true));
 
-        let no_tools = limit(model(&busier, "large"), &busier, &registry(false));
         assert_eq!(
-            no_tools.tokens(),
-            without.tokens(),
-            "with no tool registered the rounds cost nothing"
+            with.chunk_tokens(),
+            without.chunk_tokens(),
+            "the diff is not charged for the loop"
+        );
+        assert_eq!(without.rounds(), 1, "nothing to investigate, one turn");
+        assert!(
+            with.rounds() > 1,
+            "something to investigate, room to do it: {}",
+            with.rounds()
         );
     }
 
-    /// The reserve is the one term a config can inflate without seeing the
-    /// bill. Left alone it turns every file into `ChunkTooLarge` one model
-    /// call at a time; the run should refuse to start instead.
+    /// Rounds are what the window can afford once the diff has its share, so
+    /// a bigger window buys rounds and a bigger chunk spends them. Nobody
+    /// configures either number any more, which is the point: the pair that
+    /// used to be configured multiplied into a reservation taken out of this
+    /// same window, and the ceiling people ended up with was far too low.
     #[test]
-    fn a_reserve_that_eats_the_window_is_refused_rather_than_paid_for() {
-        let greedy = config(&CONFIG.replace("max_tool_rounds = 12", "max_tool_rounds = 400"));
-        let error = ChunkLimit::new(
-            model(&greedy, "large"),
-            &greedy,
-            &registry(true),
-            PROMPT_SKELETON_TOKENS,
-        )
-        .expect_err("the reserve does not fit");
+    fn rounds_are_what_is_left_of_the_window_after_the_diff() {
+        let written = config(CONFIG);
+        let tools = registry(true);
+        let small = limit(model(&written, "small"), &written, &tools);
+        let large = limit(model(&written, "large"), &written, &tools);
         assert!(
-            matches!(
-                error,
-                ConfigError::ToolAllowanceTooLarge { rounds: 400, .. }
-            ),
-            "{error:?}"
+            large.rounds() > small.rounds(),
+            "a wider window is more rounds: {} vs {}",
+            large.rounds(),
+            small.rounds()
         );
-        // With nothing to spend the rounds on, the same config is fine.
-        limit(model(&greedy, "large"), &greedy, &registry(false));
+
+        let finer = config(&CONFIG.replace("max_chunk_tokens = 20000", "max_chunk_tokens = 4000"));
+        let cut_finer = limit(model(&finer, "large"), &finer, &tools);
+        assert!(
+            cut_finer.rounds() > large.rounds(),
+            "smaller chunks leave more room for rounds: {} vs {}",
+            cut_finer.rounds(),
+            large.rounds()
+        );
+        assert_eq!(
+            cut_finer.round_bytes(),
+            crate::budget::bytes_for_ascii_tokens(cut_finer.chunk_tokens()),
+            "one round may add as much as a chunk may be"
+        );
+    }
+
+    /// With nothing to investigate there is nothing to spend rounds on, so the
+    /// model gets the one turn it needs to submit and the whole window goes to
+    /// the diff.
+    #[test]
+    fn a_run_with_no_investigation_tools_gets_one_round() {
+        let written = config(CONFIG);
+        let window = limit(model(&written, "large"), &written, &registry(false));
+        assert_eq!(window.rounds(), 1);
     }
 
     #[test]
@@ -835,13 +908,13 @@ max_output_tokens = 4096
         let smaller =
             config(&CONFIG.replace("max_chunk_tokens = 20000", "max_chunk_tokens = 1000"));
         let clamped = limit(model(&smaller, "large"), &smaller, &registry(false));
-        assert_eq!(clamped.tokens(), 1_000);
+        assert_eq!(clamped.chunk_tokens(), 1_000);
 
         let bigger =
             config(&CONFIG.replace("max_chunk_tokens = 20000", "max_chunk_tokens = 1000000"));
         let raised = limit(model(&bigger, "large"), &bigger, &registry(false));
         assert_eq!(
-            raised.tokens(),
+            raised.chunk_tokens(),
             131_072 - 4_096 - PROMPT_SKELETON_TOKENS - HEADROOM_TOKENS,
             "it can exceed the 24k default but not the window leftover"
         );

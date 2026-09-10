@@ -21,7 +21,6 @@ use super::{Adapters, StageContext};
 
 const CONFIG: &str = r#"
 [review]
-max_tool_rounds = 12
 max_files_per_listing = 200
 max_hits_per_search = 50
 max_file_bytes = 262144
@@ -300,18 +299,6 @@ impl StageFixture {
             .open_in(&self.settings.options.runs_dir.join("test-run"))
             .expect("worktree directory");
         self.adapters.worktree = worktree;
-        self
-    }
-
-    /// Turns the review loop's own ceiling down, so a test does not have to
-    /// script the default number of rounds to reach it.
-    pub fn with_max_tool_rounds(mut self, rounds: u32) -> Self {
-        self.settings.config.review.max_tool_rounds = rounds;
-        self
-    }
-
-    pub fn with_max_tool_output_bytes(mut self, bytes: u64) -> Self {
-        self.settings.config.review.max_tool_output_bytes = bytes;
         self
     }
 

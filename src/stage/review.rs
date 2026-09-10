@@ -183,7 +183,7 @@ impl Review {
             match Self::run_chunk(
                 context,
                 chunk,
-                of,
+                plan,
                 instructions,
                 narrative,
                 carried.as_ref(),
@@ -217,11 +217,13 @@ impl Review {
     fn run_chunk(
         context: &mut StageContext<'_>,
         chunk: &super::triage::Chunk,
-        of: usize,
+        plan: &TriagePlan,
         instructions: &str,
         narrative: Option<&str>,
         carried: Option<&Handoff>,
     ) -> Result<ChunkRun, StageError> {
+        let window = plan.window;
+        let of = plan.chunks.len();
         let path = chunk.path.as_str();
         let diff = chunk.diff.as_str();
         let selection = context.settings.selection()?;
@@ -229,8 +231,8 @@ impl Review {
         let max_output_tokens = selection.model.max_output_tokens;
         let reasoning_effort = selection.model.reasoning_effort.clone();
         let context_window_tokens = selection.model.context_window_tokens;
-        let max_rounds = context.settings.config.review.max_tool_rounds;
-        let round_bytes = context.settings.config.review.max_tool_output_bytes as usize;
+        let max_rounds = window.rounds();
+        let round_bytes = window.round_bytes() as usize;
         let schemas = tool_schemas(&context.adapters.tools);
         let concluding_schemas = concluding_tool_schemas(&context.adapters.tools);
 
@@ -389,11 +391,14 @@ impl Review {
                 break comments_json(&chat.submissions);
             }
 
-            if chat.rounds >= max_rounds {
-                chat.conclude(
+            match chat.rounds >= max_rounds {
+                true => chat.conclude(
                     context.redactor,
                     format!("the tool loop reached its ceiling of {max_rounds} rounds"),
-                )?;
+                )?,
+                // Said every round, because the prompt asks the model to spend
+                // this budget wisely and until now never told it the balance.
+                false => chat.say_rounds_left(context.redactor, max_rounds)?,
             }
         };
 
@@ -504,6 +509,27 @@ impl Conversation {
         self.input.push(InputItem::Message {
             role: Role::User,
             content: redactor.redact(&Prompts::CONCLUDE.text()?),
+        });
+        Ok(())
+    }
+
+    /// Where the count stands, and a word when the next round is the last one
+    /// there is: a model that has been asked to ration its rounds can only do
+    /// that if it knows how many are left.
+    fn say_rounds_left(&mut self, redactor: &Redactor, total: u32) -> Result<(), StageError> {
+        let warning = match self.rounds + 1 >= total {
+            true => Some(Prompts::ROUNDS_LAST.text()?),
+            false => None,
+        };
+        let content = Prompts::ROUNDS_LEFT
+            .fill()
+            .set("used", self.rounds.to_string())
+            .set("total", total.to_string())
+            .maybe("warning", warning)
+            .render()?;
+        self.input.push(InputItem::Message {
+            role: Role::User,
+            content: redactor.redact(&content),
         });
         Ok(())
     }
@@ -1248,6 +1274,18 @@ mod tests {
         }
     }
 
+    /// The same plan with the window dictated: how many rounds the loop gets,
+    /// and how much all of one round's output may add up to. Derived from the
+    /// model's window in a real run, which is not a thing a test can reach the
+    /// ceiling of without scripting a megabyte of answers.
+    fn plan_with(path: &str, rounds: u32, round_bytes: u64) -> TriagePlan {
+        TriagePlan {
+            chunks: vec![piece(path, 0, 1)],
+            skipped: Vec::new(),
+            window: crate::stage::triage::Window::dictated(20_000, rounds, round_bytes),
+        }
+    }
+
     /// One chunk of a file cut into `pieces`, with a hunk whose line numbers
     /// move along so the pieces do not look like the same diff twice.
     fn piece(path: &str, index: usize, pieces: usize) -> Chunk {
@@ -1262,9 +1300,12 @@ mod tests {
     }
 
     fn review(fixture: &mut StageFixture) -> ReviewOutput {
+        review_over(fixture, &plan("src/parse.c"))
+    }
+
+    fn review_over(fixture: &mut StageFixture, plan: &TriagePlan) -> ReviewOutput {
         let mut context = fixture.context();
-        Review::run(&mut context, &plan("src/parse.c"), &instructions(), None)
-            .expect("the review stage finishes")
+        Review::run(&mut context, plan, &instructions(), None).expect("the review stage finishes")
     }
 
     /// The clip note is appended once the allowance is already spent, so a
@@ -1411,11 +1452,57 @@ mod tests {
         );
     }
 
+    /// The prompt asks the model to ration its rounds, which it can only do if
+    /// it is told the balance. Said after every round it spends, with a word
+    /// when the next one is the last.
+    #[test]
+    fn every_round_says_how_many_have_been_used() {
+        let (tools, _) = counted("clean");
+        let mut fixture = StageFixture::scripted(
+            vec![
+                Reply::calls(&[("cppcheck", r#"{"path":"a"}"#)]),
+                Reply::calls(&[("cppcheck", r#"{"path":"b"}"#)]),
+                Reply::calls(&[("submit_comment", COMMENT)]),
+            ],
+            Limit::Amount(10.0),
+        )
+        .with_tools(with_submit(tools));
+
+        review_over(&mut fixture, &plan_with("src/parse.c", 3, 32_768));
+
+        let sent = fixture.sent();
+        let counts: Vec<&str> = sent
+            .iter()
+            .flat_map(|request| request.input.iter())
+            .filter_map(|item| match item {
+                InputItem::Message { content, .. } if content.contains("rounds used") => {
+                    Some(content.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            counts.first().map(|said| said.trim()),
+            Some("1 of 3 rounds used."),
+            "{counts:?}"
+        );
+        assert!(
+            counts
+                .last()
+                .is_some_and(|said| said.contains("2 of 3 rounds used.")
+                    && said.contains("This is the last one")),
+            "the round before the ceiling says so: {counts:?}"
+        );
+    }
+
     /// A model that only ever calls tools would loop forever. At the ceiling
     /// the tools are withdrawn and the conclusion is asked for once.
     #[test]
     fn a_model_that_only_calls_tools_is_asked_to_conclude_at_the_ceiling() {
         let (tools, calls) = counted("clean");
+        // Two rounds, so the ceiling is reached without scripting a window
+        // wide enough to derive one.
+        let plan = plan_with("src/parse.c", 2, 32_768);
         let mut fixture = StageFixture::scripted(
             vec![
                 Reply::calls(&[("cppcheck", r#"{"path":"a"}"#)]),
@@ -1425,10 +1512,9 @@ mod tests {
             ],
             Limit::Amount(10.0),
         )
-        .with_tools(with_submit(tools))
-        .with_max_tool_rounds(2);
+        .with_tools(with_submit(tools));
 
-        let output = review(&mut fixture);
+        let output = review_over(&mut fixture, &plan);
 
         let sent = fixture.sent();
         assert_eq!(sent.len(), 3, "two rounds of tools, then the conclusion");
@@ -1549,8 +1635,7 @@ mod tests {
             vec![Reply::calls(&[("submit_comment", COMMENT)])],
             Limit::Amount(10.0),
         )
-        .with_tools(with_submit(Registry::new()))
-        .with_max_tool_rounds(6);
+        .with_tools(with_submit(Registry::new()));
 
         let output = review(&mut fixture);
 
@@ -1742,10 +1827,9 @@ mod tests {
             ],
             Limit::Amount(10.0),
         )
-        .with_tools(with_submit(tools))
-        .with_max_tool_output_bytes(600);
+        .with_tools(with_submit(tools));
 
-        review(&mut fixture);
+        review_over(&mut fixture, &plan_with("src/parse.c", 12, 600));
 
         let sent = fixture.sent();
         let returned: usize = sent[1]
@@ -1781,11 +1865,12 @@ mod tests {
             Limit::Amount(10.0),
         )
         .with_tools(with_submit(tools))
-        .with_context_window(8_192)
-        .with_max_tool_rounds(turns as u32 + 1)
-        .with_max_tool_output_bytes(16_384);
+        .with_context_window(8_192);
 
-        let output = review(&mut fixture);
+        let output = review_over(
+            &mut fixture,
+            &plan_with("src/parse.c", turns as u32 + 1, 16_384),
+        );
 
         let sent = fixture.sent();
         assert!(

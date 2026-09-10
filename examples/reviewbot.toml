@@ -67,14 +67,11 @@ max_chunk_tokens = 24000
 skip_files_over_bytes = 262144
 skip_paths = ["**/*.lock", "vendor/**"]
 
-# Tool loop for the review stage: how many turns it gets, and how much content
-# it may pull into the model's window. Which model to use is on [[model]].
+# What the review stage's tools may hand back. How many rounds the tool loop
+# gets is not here: that is whatever the model's window affords once the diff
+# has taken its share, worked out per run rather than guessed by hand. Which
+# model to use is on [[model]].
 [review]
-# Rounds, not calls: one round carries as many function calls as the model
-# emitted together. triage reserves rounds * max_tool_output_bytes out of the
-# window, so raising this without lowering that shrinks the diff each turn
-# sees -- and reviewbot refuses to start once nothing is left for the diff.
-max_tool_rounds = 12
 # How much one listing or one search may hand back. Both numbers appear in
 # the tool descriptions the model reads, so they cannot drift apart from
 # what the code enforces.
@@ -85,9 +82,9 @@ max_hits_per_search = 50
 # means downloading all of it, and a file past this cannot be read at all.
 # Not a permission -- whether a path may be read at all is [security].
 max_file_bytes = 262144
-# What one tool answer may hand back, and what all the tool output of one
-# round may add up to. Paired with max_tool_rounds above: the two multiplied
-# together are held back from the context window. A file read that does not
+# What one tool answer may hand back. A fact about tools rather than about
+# the window: how much diagnostic output is worth reading does not change with
+# the model. What a whole round may add up to is derived. A file read that does not
 # fit is refused with its size rather than truncated, so the model can ask
 # for a line range instead of judging half a file without knowing.
 max_tool_output_bytes = 32768
