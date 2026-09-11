@@ -465,7 +465,7 @@ fn run_list_text_aligns_spent_with_currency_and_utc() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Runs dir"), "{stdout}");
     let header = stdout.lines().nth(1).expect("table header");
-    assert!(header.contains("RUN ID"), "{header}");
+    assert!(header.contains("RUN_ID"), "{header}");
     assert!(header.contains("SPENT"), "{header}");
     assert!(header.contains("UPDATED"), "{header}");
     assert!(stdout.contains("0.0316 CNY"), "{stdout}");

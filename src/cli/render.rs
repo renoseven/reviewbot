@@ -323,7 +323,7 @@ pub fn run_list(runs_dir: &Path, format: Format) -> Result<String, Error> {
                 })
                 .collect();
             out.push_str(&pad_table(
-                &["RUN ID", "INPUT", "STAGES", "SPENT", "UPDATED"],
+                &["RUN_ID", "INPUT", "STAGES", "SPENT", "UPDATED"],
                 &rows,
             ));
             out
