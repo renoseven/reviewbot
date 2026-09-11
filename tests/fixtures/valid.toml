@@ -60,7 +60,7 @@ allow_extensions = [
 name = "cppcheck"
 description = "static analysis for one C/C++ file: memory, bounds, uninitialized values (no compile). The path must be a C or C++ file; do not call this for any other language."
 bin = "/usr/bin/cppcheck"
-args = ["--enable=warning,style", "--template=gcc", "--quiet", "--", "{path}"]
+args = ["--enable=warning,style", "--template=gcc", "--quiet", "{path}"]
 params.path = { type = "path", description = "a C or C++ file; do not pass a path in any other language" }
 requires_checkout = false
 requires_build = false
@@ -70,7 +70,7 @@ timeout_ms = 60000
 name = "typecheck"
 description = "type-check one C file with gcc -fsyntax-only (no object file). The path must be a C source or header; do not call this for any other language."
 bin = "/usr/bin/gcc"
-args = ["-Wall", "-Wextra", "-fsyntax-only", "--", "{path}"]
+args = ["-Wall", "-Wextra", "-fsyntax-only", "{path}"]
 params.path = { type = "path", description = "a C source or header; do not pass a path in any other language" }
 requires_checkout = true
 requires_build = false

@@ -962,6 +962,30 @@ api_token = "GITHUB_TOKEN"
         }
     }
 
+    /// cppcheck and this gcc treat `--` as an unknown option, not as
+    /// "the file follows". `{path}` is already an absolute worktree path,
+    /// so it is safe as the last positional argument.
+    #[test]
+    fn shipped_checker_args_pass_the_path_as_a_positional_file() {
+        const VALID: &str = include_str!("../../tests/fixtures/valid.toml");
+        for text in [EXAMPLE_CONFIG, VALID] {
+            assert!(
+                text.contains(
+                    r#"args = ["--enable=warning,style", "--template=gcc", "--quiet", "{path}"]"#
+                ),
+                "cppcheck takes the file as a positional argument"
+            );
+            assert!(
+                text.contains(r#"args = ["-Wall", "-Wextra", "-fsyntax-only", "{path}"]"#),
+                "typecheck takes the file as a positional argument"
+            );
+            assert!(
+                !text.contains(r#""--", "{path}""#),
+                "neither shipped checker accepts -- as an option terminator"
+            );
+        }
+    }
+
     #[test]
     fn init_writes_the_example_and_refuses_to_overwrite() {
         let directory = tempfile::tempdir().expect("temp dir");
