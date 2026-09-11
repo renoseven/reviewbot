@@ -15,8 +15,8 @@ use crate::domain::{Confidence, Severity, Stage};
 use crate::record::layout;
 
 use super::merge::MergeOutput;
-use super::prompt::code_span;
 use super::plan::PlanOutput;
+use super::prompt::code_span;
 use super::{StageContext, StageError};
 
 /// Everything the report is rendered from, gathered by the caller so the
@@ -117,16 +117,19 @@ pub struct CountBySeverity {
     pub count: usize,
 }
 
-pub struct Report;
+pub struct Report<'c, 'a> {
+    context: &'c mut StageContext<'a>,
+}
 
-impl Report {
-    pub fn run(
-        context: &mut StageContext<'_>,
-        input: &ReportInput<'_>,
-    ) -> Result<Summary, StageError> {
-        let summary = Self::summary(context, input);
-        Self::write_artifacts(context, input, &summary)?;
-        context.complete(Stage::Report, &summary)?;
+impl<'c, 'a> Report<'c, 'a> {
+    pub fn new(context: &'c mut StageContext<'a>) -> Self {
+        Self { context }
+    }
+
+    pub fn run(&mut self, input: &ReportInput<'_>) -> Result<Summary, StageError> {
+        let summary = Self::summary(self.context, input);
+        Self::write_artifacts(self.context, input, &summary)?;
+        self.context.complete(Stage::Report, &summary)?;
         Ok(summary)
     }
 
@@ -235,7 +238,7 @@ impl Report {
         report: &str,
         summary_bytes: &[u8],
     ) -> Result<(), StageError> {
-        let Some(output_dir) = &context.settings.options.output_dir else {
+        let Some(output_dir) = &context.settings.options().output_dir else {
             return Ok(());
         };
         let run_id = &context.recorder.meta().run_id;
@@ -350,11 +353,13 @@ mod tests {
     /// file that was pulled in as context.
     fn internal_trace(trace_id: &str) -> Trace {
         let mut trace = Trace::new(trace_id);
-        trace.diff = "@@ -10,2 +10,3 @@\n+buf[5] = 0;\n".to_string();
-        trace.prompt = format!("instructions\n\ncontext of src/parse.h:\n{SECRET_BODY}\n");
-        trace.model_output = r#"{"comments":[{"path":"src/parse.c"}]}"#.to_string();
+        trace.set_diff("@@ -10,2 +10,3 @@\n+buf[5] = 0;\n");
+        trace.set_prompt(format!(
+            "instructions\n\ncontext of src/parse.h:\n{SECRET_BODY}\n"
+        ));
+        trace.set_model_output(r#"{"comments":[{"path":"src/parse.c"}]}"#);
         trace.note(Stage::Merge, "line 12 is not commentable; moved -1 to 11");
-        trace.context_files.push(ContextFile {
+        trace.add_context_file(ContextFile {
             path: "src/parse.h".to_string(),
             first_line: 1,
             last_line: 1,
@@ -373,7 +378,9 @@ mod tests {
             unavailable: &[],
         };
         let mut context = fixture.context();
-        Report::run(&mut context, &input).expect("the report is written");
+        Report::new(&mut context)
+            .run(&input)
+            .expect("the report is written");
     }
 
     #[test]
@@ -409,7 +416,9 @@ mod tests {
         };
         {
             let mut context = fixture.context();
-            Report::run(&mut context, &input).expect("the report is written");
+            Report::new(&mut context)
+                .run(&input)
+                .expect("the report is written");
         }
         let report = fixture.report();
 
@@ -477,7 +486,7 @@ mod tests {
             .expect("readable")
             .expect("the trace is on disk");
         assert!(
-            stored.context_files[0].body.contains(SECRET_BODY),
+            stored.context_files()[0].body.contains(SECRET_BODY),
             "the internal view still has the file body"
         );
         let published = fixture.recorder().published_trace(&stored);
@@ -621,7 +630,9 @@ mod tests {
         };
         {
             let mut context = fixture.context();
-            Report::run(&mut context, &input).expect("the report is written");
+            Report::new(&mut context)
+                .run(&input)
+                .expect("the report is written");
         }
 
         let report = fixture.report();

@@ -31,6 +31,18 @@ const WALK_CEILING: usize = 32;
 /// `head_sha`, so the number of reads a single search can trigger is bounded.
 const SEARCH_CANDIDATES: usize = 20;
 
+fn locked<'a, T>(
+    mutex: &'a Mutex<T>,
+    host: &str,
+    what: &'static str,
+) -> Result<std::sync::MutexGuard<'a, T>, PlatformError> {
+    mutex.lock().map_err(|_| PlatformError::Request {
+        operation: "using cached platform state",
+        host: host.to_string(),
+        reason: format!("the {what} lock was poisoned"),
+    })
+}
+
 pub struct GitHub {
     entry: PlatformEntry,
     token: Secret,
@@ -39,14 +51,26 @@ pub struct GitHub {
 }
 
 impl GitHub {
-    pub fn new(entry: PlatformEntry, token: Secret, backoff: Backoff) -> Self {
+    pub fn for_host(
+        entry: PlatformEntry,
+        token: Secret,
+        backoff: Backoff,
+    ) -> Result<Self, PlatformError> {
+        Self::new(entry, token, backoff)
+    }
+
+    pub fn new(
+        entry: PlatformEntry,
+        token: Secret,
+        backoff: Backoff,
+    ) -> Result<Self, PlatformError> {
         let host = entry.host().unwrap_or("github.com").to_string();
         let http = Arc::new(HttpClient::new(
             entry.base_url.clone(),
             host.clone(),
             token.expose(),
             backoff,
-        ));
+        )?);
         let repo = Arc::new(GitHubRepo {
             host,
             http: Arc::clone(&http),
@@ -56,12 +80,12 @@ impl GitHub {
             trees: Mutex::new(BTreeMap::new()),
             files: Mutex::new(BTreeMap::new()),
         });
-        Self {
+        Ok(Self {
             entry,
             token,
             http,
             repo,
-        }
+        })
     }
 
     /// `owner/repo` split, which the REST paths need separately.
@@ -280,7 +304,12 @@ impl Platform for GitHub {
             // The title and body came free with the pull object. Only the
             // commit subjects cost a request, and a run that cannot have
             // them still reviews the diff.
-            narrative: Narrative::new(pull.title, pull.body, self.commit_messages(change)),
+            narrative: Narrative {
+                title: pull.title,
+                description: pull.body,
+                commits: self.commit_messages(change),
+                more_commits: false,
+            },
         })
     }
 
@@ -346,10 +375,11 @@ impl Platform for GitHub {
         Ok(posted)
     }
 
-    fn bind_repo(&self, change: &ChangeRef, head_sha: &str) {
+    fn bind_repo(&self, change: &ChangeRef, head_sha: &str) -> Result<(), PlatformError> {
         if let Some((owner, repo)) = Self::owner_and_repo(change) {
-            self.repo.bind(owner, repo, head_sha);
+            self.repo.bind(owner, repo, head_sha)?;
         }
+        Ok(())
     }
 }
 
@@ -395,18 +425,17 @@ struct GitHubRepo {
 }
 
 impl GitHubRepo {
-    fn bind(&self, owner: &str, repo: &str, sha: &str) {
-        *self.commit.lock().expect("commit") = Some(Commit {
+    fn bind(&self, owner: &str, repo: &str, sha: &str) -> Result<(), PlatformError> {
+        *locked(&self.commit, &self.host, "commit")? = Some(Commit {
             owner: owner.to_string(),
             repo: repo.to_string(),
             sha: sha.to_string(),
         });
+        Ok(())
     }
 
     fn commit(&self) -> Result<Commit, PlatformError> {
-        self.commit
-            .lock()
-            .expect("commit")
+        locked(&self.commit, &self.host, "commit")?
             .clone()
             .ok_or_else(|| PlatformError::Request {
                 operation: "reading the repository",
@@ -431,7 +460,7 @@ impl GitHubRepo {
             true => format!("{sha}:recursive"),
             false => sha.to_string(),
         };
-        if let Some(cached) = self.trees.lock().expect("trees").get(&key) {
+        if let Some(cached) = locked(&self.trees, &self.host, "trees")?.get(&key) {
             return Ok(cached.clone());
         }
         let commit = self.commit()?;
@@ -461,7 +490,7 @@ impl GitHubRepo {
                 .collect(),
             truncated: payload.truncated,
         };
-        self.trees.lock().expect("trees").insert(key, tree.clone());
+        locked(&self.trees, &self.host, "trees")?.insert(key, tree.clone());
         Ok(tree)
     }
 
@@ -507,7 +536,7 @@ impl GitHubRepo {
     }
 
     fn body(&self, path: &str) -> Result<String, PlatformError> {
-        if let Some(cached) = self.files.lock().expect("files").get(path) {
+        if let Some(cached) = locked(&self.files, &self.host, "files")?.get(path) {
             return Ok(cached.clone());
         }
         let commit = self.commit()?;
@@ -523,24 +552,22 @@ impl GitHubRepo {
         let response = self.http.send("reading a repository file", || {
             self.get(url.clone(), ACCEPT_RAW)
         })?;
-        self.files
-            .lock()
-            .expect("files")
-            .insert(path.to_string(), response.body.clone());
+        locked(&self.files, &self.host, "files")?.insert(path.to_string(), response.body.clone());
         Ok(response.body)
     }
 
     fn cached_body(&self, path: &str) -> Option<String> {
-        self.files.lock().expect("files").get(path).cloned()
+        locked(&self.files, &self.host, "files")
+            .ok()
+            .and_then(|files| files.get(path).cloned())
     }
 
     /// Size from the cached recursive tree when it carried the whole thing.
     /// A missing tree, or a truncated one, is not guessed at: the contents
     /// API answers that path alone.
     fn size_from_tree(&self, path: &str) -> Option<u64> {
-        self.whole_tree
-            .lock()
-            .expect("whole tree")
+        locked(&self.whole_tree, &self.host, "whole tree")
+            .ok()?
             .as_ref()?
             .iter()
             .find(|file| file.path == path)?
@@ -614,7 +641,7 @@ impl RepoSource for GitHubRepo {
     /// shape cannot carry it, so the walk takes over.
     fn list_files(&self, glob: &str) -> Result<Listing, PlatformError> {
         let matcher = self.matcher(glob)?;
-        if let Some(cached) = self.whole_tree.lock().expect("whole tree").clone() {
+        if let Some(cached) = locked(&self.whole_tree, &self.host, "whole tree")?.clone() {
             return Ok(Listing {
                 files: cached
                     .into_iter()
@@ -636,7 +663,7 @@ impl RepoSource for GitHubRepo {
                 })
                 .collect();
             all.sort_by(|left, right| left.path.cmp(&right.path));
-            *self.whole_tree.lock().expect("whole tree") = Some(all.clone());
+            *locked(&self.whole_tree, &self.host, "whole tree")? = Some(all.clone());
             return Ok(Listing {
                 files: all
                     .into_iter()
@@ -828,6 +855,7 @@ mod tests {
             Secret::from("test-github-token".to_string()),
             Backoff::new(2),
         )
+        .expect("client")
     }
 
     fn pull_json() -> serde_json::Value {
@@ -993,7 +1021,10 @@ diff --git a/src/parse.c b/src/parse.c
         );
         assert_eq!(
             fetched.narrative.commits,
-            vec!["bound the index", "add a test for it"]
+            vec![
+                "bound the index\n\nthe loop ran one past the end".to_string(),
+                "add a test for it".to_string(),
+            ]
         );
         assert!(!fetched.narrative.more_commits);
     }
@@ -1117,7 +1148,7 @@ diff --git a/src/parse.c b/src/parse.c
 
     fn bound(uri: String) -> GitHub {
         let github = github(uri);
-        github.bind_repo(&change(), HEAD);
+        github.bind_repo(&change(), HEAD).expect("bound");
         github
     }
 

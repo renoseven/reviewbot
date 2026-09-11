@@ -12,5 +12,5 @@ pub mod subprocess;
 
 pub use crate::common::{Truncated, truncate};
 pub use path::{PathPolicy, PathRejection};
-pub use redact::Redactor;
+pub use redact::{PatternError, Redactor};
 pub use subprocess::{EnvPolicy, Limits};

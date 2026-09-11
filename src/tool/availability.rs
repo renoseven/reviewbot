@@ -105,7 +105,6 @@ pub(crate) fn no_whole_tree(worktree: &Worktree) -> Option<&'static str> {
     (!worktree.is_checkout()).then_some(NO_WHOLE_TREE_REFUSAL)
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;

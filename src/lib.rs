@@ -33,18 +33,19 @@ use domain::{Comment, Confidence, Severity, Stage};
 use platform::PlatformError;
 use progress::{Event, Outcome, Progress};
 use protocol::ProtocolError;
+use record::Runs;
 use record::{
     DirLock, LocalStorage, Meta, RecordError, Recorder, Reentry, RunIdentity, Storage, layout,
 };
-use stage::input::Input;
+use security::{PathPolicy, PatternError};
+use stage::input::{Input, Opening};
 use stage::merge::{Merge, MergeOutput};
-use stage::orient::Orientation;
 use stage::plan::{Plan, PlanOutput, SkippedFile};
 use stage::publish::{Publish, PublishInput, PublishedComment};
 use stage::report::{Report, ReportInput};
-use stage::review::{Review, ReviewOutput};
+use stage::review::{Preamble, Review, ReviewOutput};
 use stage::{Adapters, Equipment, StageContext, StageError};
-use worktree::WorktreeError;
+use worktree::{Checkout, WorktreeError};
 
 pub use config::{RunOptions, Settings as Configuration};
 pub use stage::input::Source;
@@ -122,6 +123,8 @@ pub enum Error {
     Platform(#[from] PlatformError),
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
+    #[error(transparent)]
+    Redact(#[from] PatternError),
     /// The directory named by `--run-id` belongs to something else. A
     /// changed config is not this: that re-enters the run and drops the
     /// stages it reaches.
@@ -242,27 +245,34 @@ pub(crate) fn review_with(
     adapters: &Adapters,
     progress: &dyn Progress,
 ) -> Result<RunResult, Error> {
-    if settings.options.publish && !matches!(source, Source::Url(_)) {
+    if settings.options().publish && !matches!(source, Source::Url(_)) {
         return Err(Error::PublishNeedsPlatform);
     }
     // Everything from here to `RunStarted` is one wait with nothing to show for
     // it: a URL has its change fetched before anything can be named.
     progress.emit(Event::Opening);
-    // The checkout is read by path here, because there is no worktree yet:
-    // the run is named after this sha, and the worktree opens inside the
-    // directory the name picks out.
-    let input = Input::identify(adapters, source, settings.options.worktree.as_deref())?;
+    // The checkout is read here, because there is no worktree yet: the run
+    // is named after this sha, and the worktree opens inside the directory
+    // the name picks out.
+    let checkout = settings
+        .options()
+        .worktree
+        .as_ref()
+        .map(Checkout::open)
+        .transpose()
+        .map_err(StageError::from)?;
+    let input = Opening::new(adapters, source, checkout).identify()?;
     // The head sha is settled now, and repository reads are always by it.
-    adapters.bind_repo(&input);
+    adapters.bind(&input)?;
     // The settings are not in the id: the same change at the same commit is
     // always the same directory, and a config edit re-enters it.
     let run_id = settings
-        .options
+        .options()
         .run_id
         .clone()
-        .unwrap_or_else(|| record::run_id(&input.identity, &input.head_sha));
+        .unwrap_or_else(|| input.run_id());
 
-    let run_dir = settings.options.runs_dir.join(&run_id);
+    let run_dir = settings.options().runs_dir.join(&run_id);
     // Nothing below may run without the lock, which is why it is taken with
     // the directory rather than later on with the recorder.
     let run = LockedRun::create(run_dir.clone())?;
@@ -271,7 +281,7 @@ pub(crate) fn review_with(
     let identity = RunIdentity {
         run_id: run_id.clone(),
         input,
-        fingerprint: settings.fingerprint(),
+        fingerprint: settings.fingerprint()?,
     };
 
     // Walking into a directory that already holds a run: it has to be this
@@ -300,15 +310,14 @@ pub(crate) fn review_with(
             &selection.model.name,
             &selection.provider.name,
             &frozen,
-            settings.options.publish,
+            settings.options().publish,
         ),
     };
 
-    let mut recorder = open_recorder(settings, run, meta)?;
+    let recorder = open_recorder(settings, run, meta)?;
     if let Some(from) = invalidated_from {
         recorder.discard_from(from)?;
     }
-    recorder.set_publish_intent(settings.options.publish)?;
     // Said once the directory, the id and the model are settled and the
     // config has been agreed with, so nothing that has already announced
     // itself can still turn out to be the wrong run.
@@ -318,12 +327,12 @@ pub(crate) fn review_with(
         run_dir: recorder.run_dir().to_path_buf(),
         model: started.model.clone(),
         input: started.input.describe(),
-        worktree: settings.options.worktree.clone(),
+        worktree: settings.options().worktree.clone(),
     });
     let result = finish(settings, adapters, recorder, source, progress)
         .map_err(|error| error.in_run(&run_id));
     if result.is_ok() {
-        warn_if_too_many_runs(&settings.options.runs_dir);
+        warn_if_too_many_runs(&settings.options().runs_dir);
     }
     result
 }
@@ -351,8 +360,13 @@ impl LockedRun {
 }
 
 fn open_recorder(settings: &Settings, run: LockedRun, meta: Meta) -> Result<Recorder, Error> {
-    Ok(Recorder::open(run.storage, run.lock, meta)?
-        .with_max_tool_output_bytes(settings.config.review.max_tool_output_bytes as usize))
+    Ok(Recorder::open(
+        run.storage,
+        run.lock,
+        meta,
+        settings.config().review.max_tool_output_bytes as usize,
+        settings.options().publish,
+    )?)
 }
 
 fn restore_budget(meta: &Meta) -> Result<Budget, Error> {
@@ -376,7 +390,7 @@ fn finish(
     source: &Source,
     progress: &dyn Progress,
 ) -> Result<RunResult, Error> {
-    let paths = stage::path_policy(settings)?;
+    let paths = PathPolicy::for_settings(settings)?;
     // The worktree and the tools over it, assembled here because here is the
     // first moment they can be: the lock is held, the directory the cache
     // goes in exists, and no stage has run.
@@ -387,11 +401,11 @@ fn finish(
         let mut context = StageContext {
             settings,
             adapters,
-            worktree: equipment.worktree.as_ref(),
-            tools: &equipment.tools,
+            worktree: equipment.worktree(),
+            tools: equipment.tools(),
             recorder: &mut recorder,
             budget: &mut budget,
-            redactor: &adapters.redactor,
+            redactor: adapters.redactor(),
             paths: &paths,
             progress,
         };
@@ -401,15 +415,6 @@ fn finish(
     result
 }
 
-/// Everything a request carries before the diff, assembled once for the run.
-/// `tokens` is its measured size, which `plan` reserves before it cuts the
-/// first chunk.
-struct Preamble {
-    instructions: String,
-    narrative: Option<String>,
-    tokens: u32,
-}
-
 /// The whole of the ordering. The first four stages are skipped when their
 /// checkpoint is already on disk; the last two are finishing work and run
 /// every time. Every stage writes one checkpoint.
@@ -417,7 +422,7 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
     context.stage_started(Stage::Input);
     let (changeset, from_checkpoint) = match context.completed(Stage::Input)? {
         Some(done) => (done, true),
-        None => (Input::run(context, source)?, false),
+        None => (Input::new(context).run(source)?, false),
     };
     context.stage_finished(
         Stage::Input,
@@ -434,37 +439,16 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
     // agree. Assembled only when one of them is going to run. The change
     // list comes from the changeset already in hand — a run re-entered with
     // only the report and the posting left has no business building either.
-    let preamble = match planned.is_none() || reviewed_before.is_none() {
-        true => {
-            let orientation = Orientation::build(&changeset);
-            let instructions = stage::review::assemble_instructions(
-                context.tools,
-                context.worktree,
-                context.redactor,
-                &orientation,
-            )?;
-            // The author's own account of the change, fenced as material.
-            // Not part of `instructions`: it rides in `input` beside the
-            // diff, because it is prose whoever wrote the change wrote.
-            let narrative =
-                stage::review::narrative_preface(&changeset.narrative, context.redactor)?;
-            let tokens =
-                stage::review::prompt_tokens(&instructions, narrative.as_deref(), context.tools);
-            Some(Preamble {
-                instructions,
-                narrative,
-                tokens,
-            })
-        }
-        false => None,
-    };
+    let mut preamble = None;
     context.stage_started(Stage::Plan);
     let from_checkpoint = planned.is_some();
     let plan: PlanOutput = match planned {
         Some(done) => done,
         None => {
-            let preamble = preamble.as_ref().expect("assembled for plan");
-            Plan::run(context, &changeset, preamble.tokens)?
+            let assembled = Preamble::assemble(context, &changeset)?;
+            let plan = Plan::new(context).run(&changeset, &assembled)?;
+            preamble = Some(assembled);
+            plan
         }
     };
     context.stage_finished(
@@ -481,13 +465,11 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
     let reviewed: ReviewOutput = match reviewed_before {
         Some(done) => done,
         None => {
-            let preamble = preamble.as_ref().expect("assembled for review");
-            Review::run(
-                context,
-                &plan,
-                &preamble.instructions,
-                preamble.narrative.as_deref(),
-            )?
+            let assembled = match preamble {
+                Some(assembled) => assembled,
+                None => Preamble::assemble(context, &changeset)?,
+            };
+            Review::new(context).run(&plan, &assembled)?
         }
     };
     context.stage_finished(
@@ -502,7 +484,7 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
     context.stage_started(Stage::Merge);
     let (merged, from_checkpoint): (MergeOutput, bool) = match context.completed(Stage::Merge)? {
         Some(done) => (done, true),
-        None => (Merge::run(context, &changeset, &reviewed)?, false),
+        None => (Merge::new(context).run(&changeset, &reviewed)?, false),
     };
     context.stage_finished(
         Stage::Merge,
@@ -520,29 +502,23 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
     // both of those away. They still write their checkpoints and mark
     // themselves complete: `run show` and the run's terminal state read those.
     context.stage_started(Stage::Report);
-    let summary = Report::run(
-        context,
-        &ReportInput {
-            plan: &plan,
-            merged: &merged,
-            unreviewed: &reviewed.unreviewed,
-            stopped: reviewed.stopped.as_deref(),
-            unavailable: &reviewed.unavailable,
-        },
-    )?;
+    let summary = Report::new(context).run(&ReportInput {
+        plan: &plan,
+        merged: &merged,
+        unreviewed: &reviewed.unreviewed,
+        stopped: reviewed.stopped.as_deref(),
+        unavailable: &reviewed.unavailable,
+    })?;
     // No checkpoint to have been read back: these two run every time, so
     // what they say is always what this process just did.
     context.stage_finished(Stage::Report, Outcome::Report, false);
 
     context.stage_started(Stage::Publish);
-    let published = Publish::run(
-        context,
-        &PublishInput {
-            changeset: &changeset,
-            merged: &merged,
-            summary: &summary,
-        },
-    )?;
+    let published = Publish::new(context).run(&PublishInput {
+        changeset: &changeset,
+        merged: &merged,
+        summary: &summary,
+    })?;
     context.stage_finished(
         Stage::Publish,
         Outcome::Publish {
@@ -603,7 +579,7 @@ impl Finished<'_> {
 /// After a review, name the prune command once if the directory grew past
 /// the warning threshold. Warning is not deletion.
 fn warn_if_too_many_runs(runs_dir: &Path) {
-    let Ok(count) = record::count_runs(runs_dir) else {
+    let Ok(count) = Runs::open(runs_dir).count() else {
         return;
     };
     if count <= record::WARN_AFTER_RUNS {

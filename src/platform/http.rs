@@ -25,15 +25,29 @@ pub struct HttpResponse {
 }
 
 impl HttpClient {
-    pub fn new(base_url: String, host: String, token: &str, backoff: Backoff) -> Self {
-        let mut redactor = Redactor::new();
-        redactor.hide_value(token);
-        Self {
-            http: Client::new(REQUEST_TIMEOUT, backoff),
+    pub fn new(
+        base_url: String,
+        host: String,
+        token: &str,
+        backoff: Backoff,
+    ) -> Result<Self, PlatformError> {
+        let redactor = Redactor::with_secrets([token]).map_err(|error| PlatformError::Request {
+            operation: "building a redactor",
+            host: host.clone(),
+            reason: error.to_string(),
+        })?;
+        Ok(Self {
+            http: Client::new(REQUEST_TIMEOUT, backoff).map_err(|error| {
+                PlatformError::Request {
+                    operation: "building an HTTP client",
+                    host: host.clone(),
+                    reason: error.to_string(),
+                }
+            })?,
             base_url: base_url.trim_end_matches('/').to_string(),
             host,
             redactor,
-        }
+        })
     }
 
     pub fn host(&self) -> &str {

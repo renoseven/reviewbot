@@ -209,10 +209,11 @@ pub struct FileFilter {
     skip_paths: GlobSet,
     skip_generated: bool,
     skip_files_over_bytes: u64,
+    paths: PathPolicy,
 }
 
 impl FileFilter {
-    pub fn new(plan: &PlanSettings) -> Result<Self, ConfigError> {
+    pub fn new(plan: &PlanSettings, paths: PathPolicy) -> Result<Self, ConfigError> {
         let mut builder = GlobSetBuilder::new();
         for pattern in &plan.skip_paths {
             builder.add(
@@ -231,6 +232,7 @@ impl FileFilter {
             })?,
             skip_generated: plan.skip_generated,
             skip_files_over_bytes: plan.skip_files_over_bytes,
+            paths,
         })
     }
 
@@ -240,12 +242,12 @@ impl FileFilter {
     /// `allow_extensions` looks at `new_path` only — that is the file as it
     /// exists after the change — and not at a deletion, whose `new_path` is
     /// `/dev/null` and whose reason is "deleted", not "no extension".
-    pub fn reason(&self, file: &FileChange, paths: &PathPolicy) -> Option<String> {
+    pub fn reason(&self, file: &FileChange) -> Option<String> {
         let diff = FileDiff::new(file);
-        if paths.is_denied(&file.new_path) || paths.is_denied(&file.old_path) {
+        if self.paths.is_denied(&file.new_path) || self.paths.is_denied(&file.old_path) {
             return Some("denied by deny_paths".to_string());
         }
-        if file.new_path != DEV_NULL && !paths.allows_extension(&file.new_path) {
+        if file.new_path != DEV_NULL && !self.paths.allows_extension(&file.new_path) {
             return Some("extension is not in allow_extensions".to_string());
         }
         if self.skip_paths.is_match(&file.new_path) {
@@ -367,23 +369,33 @@ impl<'a> FileDiff<'a> {
     }
 }
 
-pub struct Plan;
+pub struct Plan<'c, 'a> {
+    context: &'c mut StageContext<'a>,
+}
 
-impl Plan {
+impl<'c, 'a> Plan<'c, 'a> {
+    pub fn new(context: &'c mut StageContext<'a>) -> Self {
+        Self { context }
+    }
+
     pub fn run(
-        context: &mut StageContext<'_>,
+        &mut self,
         changeset: &ChangeSet,
-        prompt_tokens: u32,
+        preamble: &super::review::Preamble,
     ) -> Result<PlanOutput, StageError> {
-        let model = context.settings.selection()?.model;
+        let prompt_tokens = preamble.tokens();
+        let model = self.context.settings.selection()?.model;
         let window = Window::new(
             model,
-            &context.settings.config,
-            context.tools,
+            self.context.settings.config(),
+            self.context.tools,
             prompt_tokens,
         )?;
-        let filter = FileFilter::new(&context.settings.config.plan)?;
-        let plan = Self::plan(changeset, &filter, context.paths, window);
+        let filter = FileFilter::new(
+            &self.context.settings.config().plan,
+            self.context.paths.clone(),
+        )?;
+        let plan = Self::plan(changeset, &filter, window);
 
         for file in &plan.skipped {
             tracing::debug!(path = %file.path, reason = %file.reason, "file skipped");
@@ -392,27 +404,22 @@ impl Plan {
             chunks = plan.chunks.len(),
             skipped = plan.skipped.len(),
             chunk_limit = window.chunk_tokens(),
-            max_rounds = context.settings.config.review.max_rounds,
+            max_rounds = self.context.settings.config().review.max_rounds,
             round_bytes = window.round_bytes(),
             prompt_tokens,
             "plan done"
         );
-        context.complete(Stage::Plan, &plan)?;
+        self.context.complete(Stage::Plan, &plan)?;
         Ok(plan)
     }
 
     /// Filter, sort, cut. Everything it needs is in the arguments, so the
     /// algorithm is testable without a run directory or a model.
-    fn plan(
-        changeset: &ChangeSet,
-        filter: &FileFilter,
-        paths: &PathPolicy,
-        window: Window,
-    ) -> PlanOutput {
+    fn plan(changeset: &ChangeSet, filter: &FileFilter, window: Window) -> PlanOutput {
         let mut skipped = Vec::new();
         let mut reviewable: Vec<&FileChange> = Vec::new();
         for file in &changeset.files {
-            match filter.reason(file, paths) {
+            match filter.reason(file) {
                 Some(reason) => skipped.push(SkippedFile {
                     path: FileDiff::new(file).display_path(),
                     reason,
@@ -630,8 +637,7 @@ max_output_tokens = 4096
         let settings = PlanSettings::for_tests();
         Plan::plan(
             &changeset(files),
-            &FileFilter::new(&settings).expect("valid globs"),
-            &policy(&[]),
+            &FileFilter::new(&settings, policy(&[])).expect("valid globs"),
             Window {
                 chunk_tokens: limit,
                 rounds: 1,
@@ -726,8 +732,7 @@ max_output_tokens = 4096
         ];
         let plan = Plan::plan(
             &changeset(files),
-            &FileFilter::new(&settings).expect("valid globs"),
-            &policy(&["secrets/**"]),
+            &FileFilter::new(&settings, policy(&["secrets/**"])).expect("valid globs"),
             Window {
                 chunk_tokens: 10_000,
                 rounds: 1,
@@ -794,8 +799,7 @@ max_output_tokens = 4096
                 deleted,
                 file("src/kept.c", 1, 1),
             ]),
-            &FileFilter::new(&settings).expect("valid globs"),
-            &policy_with(&[], &["c", "h", "rs"]),
+            &FileFilter::new(&settings, policy_with(&[], &["c", "h", "rs"])).expect("valid globs"),
             Window {
                 chunk_tokens: 10_000,
                 rounds: 1,

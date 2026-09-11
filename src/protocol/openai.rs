@@ -30,15 +30,31 @@ pub struct OpenAi {
 impl OpenAi {
     pub const NAME: &'static str = "openai";
 
-    pub fn new(base_url: String, api_key: Secret, backoff: Backoff) -> Self {
-        let mut redactor = Redactor::new();
-        redactor.hide_value(api_key.expose());
-        Self {
-            http: Client::new(REQUEST_TIMEOUT, backoff),
+    pub fn connect(
+        base_url: String,
+        api_key: Secret,
+        backoff: Backoff,
+    ) -> Result<Self, ProtocolError> {
+        Self::new(base_url, api_key, backoff)
+    }
+
+    pub fn new(base_url: String, api_key: Secret, backoff: Backoff) -> Result<Self, ProtocolError> {
+        Ok(Self {
+            http: Client::new(REQUEST_TIMEOUT, backoff).map_err(|error| ProtocolError::Fatal {
+                protocol: PROTOCOL,
+                reason: error.to_string(),
+                status: None,
+            })?,
             base_url,
-            api_key,
-            redactor,
-        }
+            api_key: api_key.clone(),
+            redactor: Redactor::with_secrets([api_key.expose()]).map_err(|error| {
+                ProtocolError::Fatal {
+                    protocol: PROTOCOL,
+                    reason: error.to_string(),
+                    status: None,
+                }
+            })?,
+        })
     }
 
     pub fn endpoint(&self) -> String {
@@ -185,11 +201,11 @@ struct VendorTool<'a> {
 impl<'a> From<&'a Request> for VendorRequest<'a> {
     fn from(request: &'a Request) -> Self {
         Self {
-            model: &request.model,
-            instructions: &request.instructions,
-            input: request.input.iter().map(VendorInput::from).collect(),
+            model: request.model(),
+            instructions: request.instructions(),
+            input: request.input().iter().map(VendorInput::from).collect(),
             tools: request
-                .tools
+                .tools()
                 .iter()
                 .map(|tool| VendorTool {
                     kind: "function",
@@ -198,10 +214,9 @@ impl<'a> From<&'a Request> for VendorRequest<'a> {
                     parameters: &tool.parameters,
                 })
                 .collect(),
-            max_output_tokens: request.max_output_tokens,
+            max_output_tokens: request.max_output_tokens(),
             reasoning: request
-                .reasoning_effort
-                .as_deref()
+                .reasoning_effort()
                 .map(|effort| VendorReasoning { effort }),
         }
     }
@@ -392,11 +407,11 @@ impl VendorResponse {
                 ),
             });
         }
-        let usage = usage_from(self.usage.as_ref());
+        let usage = usage_from(self.usage.as_ref())?;
         let incomplete = self.incomplete_reason();
         let mut output = Vec::new();
         for item in self.output.iter().flatten() {
-            if let Some(mapped) = item.to_output_item() {
+            if let Some(mapped) = item.to_output_item()? {
                 output.push(mapped);
             }
         }
@@ -427,35 +442,54 @@ impl VendorResponse {
 }
 
 impl VendorOutput {
-    fn to_output_item(&self) -> Option<OutputItem> {
+    fn to_output_item(&self) -> Result<Option<OutputItem>, ProtocolError> {
         match self.kind.as_str() {
             "message" | "output_text" => {
                 let text = self.message_text();
                 if text.is_empty() {
-                    None
+                    Ok(None)
                 } else {
-                    Some(OutputItem::Message { text })
+                    Ok(Some(OutputItem::Message { text }))
                 }
             }
-            "function_call" => Some(OutputItem::FunctionCall {
-                call_id: self.call_id.clone().unwrap_or_default(),
-                name: self.name.clone().unwrap_or_default(),
-                arguments: self
+            "function_call" => {
+                let missing = |field: &str| ProtocolError::Malformed {
+                    protocol: PROTOCOL,
+                    reason: format!("function_call is missing {field}"),
+                };
+                let call_id = self
+                    .call_id
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| missing("call_id"))?
+                    .to_string();
+                let name = self
+                    .name
+                    .as_deref()
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| missing("name"))?
+                    .to_string();
+                let arguments = self
                     .arguments
                     .clone()
                     .map(WireArguments::into_string)
                     .filter(|text| !text.trim().is_empty())
-                    .unwrap_or_else(|| "{}".to_string()),
-            }),
+                    .ok_or_else(|| missing("arguments"))?;
+                Ok(Some(OutputItem::FunctionCall {
+                    call_id,
+                    name,
+                    arguments,
+                }))
+            }
             "reasoning" => {
                 let text = self.reasoning_text();
                 if text.is_empty() {
-                    None
+                    Ok(None)
                 } else {
-                    Some(OutputItem::Reasoning { text })
+                    Ok(Some(OutputItem::Reasoning { text }))
                 }
             }
-            _ => None,
+            _ => Ok(None),
         }
     }
 
@@ -508,10 +542,23 @@ impl VendorOutput {
     }
 }
 
-fn usage_from(usage: Option<&VendorUsage>) -> TokenUsage {
+fn usage_from(usage: Option<&VendorUsage>) -> Result<TokenUsage, ProtocolError> {
     let Some(usage) = usage else {
-        return TokenUsage::default();
+        return Err(ProtocolError::Malformed {
+            protocol: PROTOCOL,
+            reason: "response has no usage".to_string(),
+        });
     };
+    let input_tokens = usage.input_tokens.ok_or_else(|| ProtocolError::Malformed {
+        protocol: PROTOCOL,
+        reason: "usage is missing input_tokens".to_string(),
+    })?;
+    let output_tokens = usage
+        .output_tokens
+        .ok_or_else(|| ProtocolError::Malformed {
+            protocol: PROTOCOL,
+            reason: "usage is missing output_tokens".to_string(),
+        })?;
     let cached = usage
         .input_tokens_details
         .as_ref()
@@ -521,11 +568,11 @@ fn usage_from(usage: Option<&VendorUsage>) -> TokenUsage {
         .unwrap_or(0);
     // `output_tokens` already includes reasoning tokens. Adding
     // `output_tokens_details.reasoning_tokens` would bill thinking twice.
-    TokenUsage {
-        input_tokens: usage.input_tokens.unwrap_or(0),
+    Ok(TokenUsage {
+        input_tokens,
         cached_input_tokens: cached,
-        output_tokens: usage.output_tokens.unwrap_or(0),
-    }
+        output_tokens,
+    })
 }
 
 #[cfg(test)]
@@ -538,21 +585,20 @@ mod tests {
     }
 
     fn protocol(base_url: String) -> OpenAi {
-        OpenAi::new(base_url, key(), Backoff::new(2))
+        OpenAi::new(base_url, key(), Backoff::new(2)).expect("client")
     }
 
     fn sample_request() -> Request {
-        Request {
-            model: "deepseek-v4-flash".to_string(),
-            instructions: "review this".to_string(),
-            input: vec![InputItem::Message {
+        Request::compose(
+            "deepseek-v4-flash",
+            "review this",
+            vec![InputItem::Message {
                 role: Role::User,
                 content: "--- a/x\n+++ b/x\n".to_string(),
             }],
-            tools: Vec::new(),
-            max_output_tokens: 4096,
-            reasoning_effort: None,
-        }
+            Vec::new(),
+            4096,
+        )
     }
 
     fn responses_json() -> serde_json::Value {
@@ -610,14 +656,14 @@ mod tests {
     #[test]
     fn reasoning_effort_is_sent_when_the_model_entry_sets_it() {
         let mut request = sample_request();
-        request.reasoning_effort = Some("low".to_string());
+        request.set_reasoning_effort(Some("low".to_string()));
         let body = serde_json::to_value(VendorRequest::from(&request)).unwrap();
         assert_eq!(body["reasoning"]["effort"], "low");
     }
 
     #[test]
     fn message_text_comes_from_content_and_usage_keeps_cached_tokens() {
-        let redactor = Redactor::new();
+        let redactor = Redactor::new().expect("patterns");
         let body = serde_json::to_string(&responses_json()).unwrap();
         let response = parse_responses_body(&body, &redactor).expect("parsed");
         assert_eq!(response.output_text(), r#"{"comments":[]}"#);
@@ -641,14 +687,15 @@ mod tests {
 
     #[test]
     fn function_call_arguments_may_be_an_object() {
-        let redactor = Redactor::new();
+        let redactor = Redactor::new().expect("patterns");
         let body = serde_json::json!({
             "output": [{
                 "type": "function_call",
                 "call_id": "c1",
                 "name": "submit_comment",
                 "arguments": {"path": "src/main.rs", "body": "problem"}
-            }]
+            }],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
         })
         .to_string();
         let response = parse_responses_body(&body, &redactor).expect("parsed");
@@ -661,8 +708,27 @@ mod tests {
     }
 
     #[test]
+    fn a_function_call_missing_a_field_is_malformed_not_an_empty_call() {
+        let redactor = Redactor::new().expect("patterns");
+        let body = serde_json::json!({
+            "output": [{
+                "type": "function_call",
+                "name": "submit_comment",
+                "arguments": {"path": "src/main.rs"}
+            }],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        })
+        .to_string();
+        let error = parse_responses_body(&body, &redactor).expect_err("call_id is required");
+        assert!(
+            matches!(error, ProtocolError::Malformed { ref reason, .. } if reason.contains("call_id")),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn incomplete_status_is_kept_when_the_message_is_missing() {
-        let redactor = Redactor::new();
+        let redactor = Redactor::new().expect("patterns");
         let body = r#"{
             "status": "incomplete",
             "incomplete_details": {"reason": "max_output_tokens"},
@@ -678,15 +744,15 @@ mod tests {
 
     #[test]
     fn output_text_is_used_when_message_content_is_missing() {
-        let redactor = Redactor::new();
-        let body = r#"{"output":[],"output_text":"{\"comments\":[]}"}"#;
+        let redactor = Redactor::new().expect("patterns");
+        let body = r#"{"output":[],"output_text":"{\"comments\":[]}","usage":{"input_tokens":1,"output_tokens":1}}"#;
         let response = parse_responses_body(body, &redactor).expect("parsed");
         assert_eq!(response.output_text(), r#"{"comments":[]}"#);
     }
 
     #[test]
     fn empty_body_and_cut_off_json_are_transient() {
-        let redactor = Redactor::new();
+        let redactor = Redactor::new().expect("patterns");
         let empty = parse_responses_body("", &redactor).expect_err("empty");
         assert!(empty.is_transient());
         let cut = parse_responses_body("{\"output\":[", &redactor).expect_err("cut off");
@@ -695,15 +761,30 @@ mod tests {
 
     #[test]
     fn a_complete_wrong_schema_is_malformed_not_transient() {
-        let redactor = Redactor::new();
+        let redactor = Redactor::new().expect("patterns");
         let error = parse_responses_body("{\"not\":\"responses\"}", &redactor).expect_err("wrong");
         assert!(matches!(error, ProtocolError::Malformed { .. }));
         assert!(!error.is_transient());
     }
 
     #[test]
+    fn a_response_with_no_usage_is_malformed_not_free() {
+        let redactor = Redactor::new().expect("patterns");
+        let error = parse_responses_body(
+            r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}"#,
+            &redactor,
+        )
+        .expect_err("usage is required");
+        assert!(
+            matches!(error, ProtocolError::Malformed { ref reason, .. } if reason.contains("usage")),
+            "{error}"
+        );
+        assert!(!error.is_transient());
+    }
+
+    #[test]
     fn a_complete_non_json_body_is_fatal_not_transient() {
-        let redactor = Redactor::new();
+        let redactor = Redactor::new().expect("patterns");
         let error = parse_responses_body("not json", &redactor).expect_err("plain");
         assert!(!error.is_transient());
         assert!(matches!(error, ProtocolError::Fatal { .. }));
@@ -711,8 +792,7 @@ mod tests {
 
     #[test]
     fn error_snippets_are_redacted() {
-        let mut redactor = Redactor::new();
-        redactor.hide_value("sk-testkey12xxxxxxxx");
+        let redactor = Redactor::with_secrets(["sk-testkey12xxxxxxxx"]).expect("patterns");
         let shown =
             http::snippet(&redactor.redact("Authorization: Bearer sk-testkey12xxxxxxxx leaked"));
         assert!(!shown.contains("sk-testkey12xxxxxxxx"), "{shown}");

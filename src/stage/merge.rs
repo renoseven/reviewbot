@@ -278,18 +278,24 @@ impl From<crate::protocol::ProtocolError> for ChunkError {
     }
 }
 
-pub struct Merge;
+pub struct Merge<'c, 'a> {
+    context: &'c mut StageContext<'a>,
+}
 
-impl Merge {
+impl<'c, 'a> Merge<'c, 'a> {
+    pub fn new(context: &'c mut StageContext<'a>) -> Self {
+        Self { context }
+    }
+
     pub fn run(
-        context: &mut StageContext<'_>,
+        &mut self,
         changeset: &ChangeSet,
         review: &ReviewOutput,
     ) -> Result<MergeOutput, StageError> {
         let mut findings = Vec::new();
         let mut unproduced = Vec::new();
         for chunk in &review.chunks {
-            match Self::run_chunk(context, changeset, chunk) {
+            match self.run_chunk(changeset, chunk) {
                 Ok(found) => findings.extend(found),
                 Err(ChunkError::Stage(error)) => return Err(error),
                 Err(ChunkError::Unproduced(reason)) => {
@@ -306,7 +312,7 @@ impl Merge {
         // twice when one file was cut into two of them.
         let merged = Self::deduplicate(&mut findings);
         for (trace_id, note) in merged {
-            Self::note_on_trace(context, &trace_id, note)?;
+            Self::note_on_trace(self.context, &trace_id, note)?;
         }
 
         Self::sort(&mut findings);
@@ -322,7 +328,7 @@ impl Merge {
         // produced a readable answer and left nothing else to judge.
         let scoring = match nothing_to_score(review, &unproduced, comments.is_empty()) {
             Some(reason) => Err(reason),
-            None => Self::score(context, &comments)?,
+            None => Self::score(self.context, &comments)?,
         };
         let output = MergeOutput {
             comments,
@@ -339,14 +345,14 @@ impl Merge {
             unproduced = output.unproduced.len(),
             "merge done"
         );
-        context.complete(Stage::Merge, &output)?;
+        self.context.complete(Stage::Merge, &output)?;
         Ok(output)
     }
 
     /// One chunk, steps 1 to 4. The trace it wrote in `review` is where the
     /// notes go.
     fn run_chunk(
-        context: &mut StageContext<'_>,
+        &mut self,
         changeset: &ChangeSet,
         chunk: &ChunkOutput,
     ) -> Result<Vec<Finding>, ChunkError> {
@@ -356,7 +362,8 @@ impl Merge {
                 chunk.path
             )));
         };
-        let mut trace = context
+        let mut trace = self
+            .context
             .recorder
             .read_trace(&chunk.trace_id)?
             .unwrap_or_else(|| Trace::new(chunk.trace_id.clone()));
@@ -378,7 +385,7 @@ impl Merge {
                     Stage::Merge,
                     format!("the chunk document would not parse ({reason})"),
                 );
-                context.recorder.write_trace(&trace)?;
+                self.context.recorder.write_trace(&trace)?;
                 return Err(ChunkError::Unproduced(format!(
                     "the submitted comments would not parse: {reason}"
                 )));
@@ -387,14 +394,14 @@ impl Merge {
 
         // Cloned out of the trace because the notes go back into the same
         // trace while these are being read.
-        let tool_calls = trace.tool_calls.clone();
+        let tool_calls = trace.tool_calls().to_vec();
         let fetched: Vec<String> = trace
-            .context_files
+            .context_files()
             .iter()
             .map(|file| file.path.clone())
             .collect();
         let mut notes: Vec<String> = Vec::new();
-        let findings = Self::findings_from(
+        let findings = self.findings_from(
             &entries,
             &ChunkFile {
                 path: &chunk.path,
@@ -403,14 +410,14 @@ impl Merge {
                 changed_lines: &file.changed_lines,
                 tool_calls: &tool_calls,
                 fetched: &fetched,
-                root: context.settings.options.worktree.as_deref(),
+                root: self.context.settings.options().worktree.as_deref(),
             },
             &mut notes,
         );
         for note in notes {
             trace.note(Stage::Merge, note);
         }
-        context.recorder.write_trace(&trace)?;
+        self.context.recorder.write_trace(&trace)?;
         Ok(findings)
     }
 
@@ -433,13 +440,14 @@ impl Merge {
     /// Steps 1 to 4 for the entries of one document, with no model and no
     /// disk in the way. Every drop is recorded; none of them is a downgrade.
     fn findings_from(
+        &self,
         entries: &[serde_json::Value],
         file: &ChunkFile<'_>,
         checks: &mut Vec<String>,
     ) -> Vec<Finding> {
         let mut findings = Vec::new();
         for (index, entry) in entries.iter().enumerate() {
-            match Self::finding_from(entry, file) {
+            match self.finding_from(entry, file) {
                 Ok(produced) => {
                     for note in produced.notes {
                         checks.push(format!("comment {index}: {note}"));
@@ -453,7 +461,11 @@ impl Merge {
     }
 
     /// One entry, or the reason it cannot be published.
-    fn finding_from(entry: &serde_json::Value, file: &ChunkFile<'_>) -> Result<Produced, String> {
+    fn finding_from(
+        &self,
+        entry: &serde_json::Value,
+        file: &ChunkFile<'_>,
+    ) -> Result<Produced, String> {
         let raw: RawComment = serde_json::from_value(entry.clone())
             .map_err(|error| format!("the entry will not read as a comment: {error}"))?;
 
@@ -491,7 +503,7 @@ impl Merge {
 
         // Step 3, alignment. It moves the line and nothing else: where a
         // comment hangs and whether it is right are different questions.
-        let alignment = Self::align(file.commentable_lines, raw.start_line, &lines);
+        let alignment = self.align(file.commentable_lines, raw.start_line, &lines);
         let end_line = end_line_of(&alignment, raw.end_line, file.commentable_lines);
         let mut notes = Vec::new();
         notes.extend(alignment.note);
@@ -556,7 +568,7 @@ impl Merge {
 
     /// Step 3. The commentable set is the one that decides where a comment
     /// may hang; whether it may exist at all was step 2's question.
-    fn align(commentable: &BTreeSet<u32>, line: Option<u32>, lines: &[u32]) -> Alignment {
+    fn align(&self, commentable: &BTreeSet<u32>, line: Option<u32>, lines: &[u32]) -> Alignment {
         if let Some(line) = line {
             if commentable.contains(&line) {
                 return Alignment {
@@ -676,20 +688,20 @@ impl Merge {
         let selection = context.settings.selection()?;
         let instructions = context.redactor.redact(&Prompts::SUMMARY.text()?);
         let findings = context.redactor.redact(&findings_json(comments));
-        let mut request = Request {
-            model: selection.model.name.clone(),
+        // Tools come from the registry on the scoring round: this stage does
+        // not write out a schema of its own, and the round is what keeps
+        // `submit_comment` and the content tools off this turn.
+        let mut request = Request::compose(
+            selection.model.name.clone(),
             instructions,
-            input: vec![InputItem::Message {
+            vec![InputItem::Message {
                 role: Role::User,
                 content: findings,
             }],
-            // From the registry, on the scoring round: this stage does not
-            // write out a schema of its own, and the round is what keeps
-            // `submit_comment` and the content tools off this turn.
-            tools: context.tools.request_schemas(Round::Scoring),
-            max_output_tokens: selection.model.max_output_tokens,
-            reasoning_effort: selection.model.reasoning_effort.clone(),
-        };
+            context.tools.request_schemas(Round::Scoring),
+            selection.model.max_output_tokens,
+        )
+        .with_reasoning_effort(selection.model.reasoning_effort.clone());
 
         // Skipping the score is not the same as failing the run: the comments
         // are already final and they still go out. The exit code is the
@@ -700,7 +712,7 @@ impl Merge {
         }
 
         let mut trace = Trace::new(SUMMARY_TRACE_ID);
-        trace.prompt = request.instructions.clone();
+        trace.set_prompt(request.instructions());
         let outcome = Self::ask_for_score(context, &request, &mut trace);
         context.recorder.write_trace(&trace)?;
         outcome
@@ -727,17 +739,17 @@ impl Merge {
         // its refusal: the protocol is stateless, so an unanswered call left
         // in the history is one the vendor cannot match up.
         if let Some(answer) = rejected.answer {
-            retry.input.push(InputItem::FunctionCall {
+            retry.push_input(InputItem::FunctionCall {
                 call_id: answer.call_id.clone(),
                 name: SubmitSummary::NAME.to_string(),
                 arguments: answer.arguments,
             });
-            retry.input.push(InputItem::FunctionCallOutput {
+            retry.push_input(InputItem::FunctionCallOutput {
                 call_id: answer.call_id,
                 output: context.redactor.redact(&answer.refusal),
             });
         }
-        retry.input.push(InputItem::Message {
+        retry.push_input(InputItem::Message {
             role: Role::User,
             content: context.redactor.redact(&note),
         });
@@ -780,11 +792,8 @@ impl Merge {
             }
         };
         let reply = response.output_text();
-        if !trace.model_output.is_empty() {
-            trace.model_output.push_str("\n\n--- re-ask ---\n\n");
-        }
-        trace.model_output.push_str(&reply);
-        trace.usage.add(&response.usage);
+        trace.append_reask(&reply);
+        trace.add_usage(&response.usage);
 
         // The verdict arrives as a function call, so there is no JSON to
         // pick out of prose and no fence to strip. A model that answers in
@@ -800,7 +809,7 @@ impl Merge {
             )));
         };
         let outcome = read_summary(&arguments);
-        trace.tool_calls.push(ToolCall {
+        trace.record_tool_call(ToolCall {
             name: SubmitSummary::NAME.to_string(),
             input: arguments.clone(),
             output: match &outcome {
@@ -1282,9 +1291,10 @@ mod tests {
     /// writes its own notes.
     fn write_trace(fixture: &StageFixture, trace_id: &str) {
         let mut trace = Trace::new(trace_id);
-        trace.prompt = "the review instructions, byte for byte".to_string();
-        trace.diff = "--- a/src/parse.c\n+++ b/src/parse.c\n@@ -10,2 +10,3 @@\n+int added(void);\n"
-            .to_string();
+        trace.set_prompt("the review instructions, byte for byte");
+        trace.set_diff(
+            "--- a/src/parse.c\n+++ b/src/parse.c\n@@ -10,2 +10,3 @@\n+int added(void);\n",
+        );
         fixture
             .recorder()
             .write_trace(&trace)
@@ -1315,7 +1325,15 @@ mod tests {
         review: &ReviewOutput,
     ) -> MergeOutput {
         let mut context = fixture.context();
-        Merge::run(&mut context, changeset, review).expect("merge finishes")
+        Merge::new(&mut context)
+            .run(changeset, review)
+            .expect("merge finishes")
+    }
+
+    fn aligned(commentable: &BTreeSet<u32>, line: Option<u32>, lines: &[u32]) -> Alignment {
+        let mut fixture = StageFixture::new(Vec::new());
+        let mut context = fixture.context();
+        Merge::new(&mut context).align(commentable, line, lines)
     }
 
     #[test]
@@ -1357,11 +1375,11 @@ mod tests {
     fn alignment_walks_the_four_steps_and_never_touches_the_score() {
         let commentable: BTreeSet<u32> = [10, 11, 12, 13].into_iter().collect();
 
-        let exact = Merge::align(&commentable, Some(11), &[11]);
+        let exact = aligned(&commentable, Some(11), &[11]);
         assert_eq!(exact.line, Some(11));
         assert!(exact.note.is_none(), "an exact hit says nothing");
 
-        let near = Merge::align(&commentable, Some(9), &[11]);
+        let near = aligned(&commentable, Some(9), &[11]);
         assert_eq!(near.line, Some(10), "the window reaches three lines");
         assert!(
             near.note.as_deref().unwrap().contains("+1"),
@@ -1369,7 +1387,7 @@ mod tests {
             near.note
         );
 
-        let fallback = Merge::align(&commentable, Some(80), &[40, 12]);
+        let fallback = aligned(&commentable, Some(80), &[40, 12]);
         assert_eq!(fallback.line, Some(12), "lines is the third try");
         assert!(
             fallback.note.as_deref().unwrap().contains("lines"),
@@ -1377,14 +1395,14 @@ mod tests {
             fallback.note
         );
 
-        let missing = Merge::align(&commentable, Some(80), &[40, 41]);
+        let missing = aligned(&commentable, Some(80), &[40, 41]);
         assert_eq!(missing.line, None, "the fourth step is file level");
         assert!(missing.note.as_deref().unwrap().contains("file level"));
 
         // A pure deletion file keeps its adjacent context line in the
         // commentable set, so a deletion still has somewhere to hang; a file
         // with nothing commentable at all degrades instead of vanishing.
-        assert_eq!(Merge::align(&BTreeSet::new(), Some(11), &[11]).line, None);
+        assert_eq!(aligned(&BTreeSet::new(), Some(11), &[11]).line, None);
     }
 
     #[test]
@@ -1473,11 +1491,11 @@ mod tests {
         let sent = fixture.sent();
         assert!(
             sent[0]
-                .tools
+                .tools()
                 .iter()
                 .any(|tool| tool.name == SubmitSummary::NAME),
             "the schema goes out with the request: {:?}",
-            sent[0].tools
+            sent[0].tools()
         );
         // The call is in the trace the same way a checker call is, so a
         // reader can see what the score was computed from.
@@ -1486,9 +1504,9 @@ mod tests {
             .read_trace("merge-summary")
             .expect("readable")
             .expect("the trace is on disk");
-        assert_eq!(trace.tool_calls.len(), 1);
-        assert_eq!(trace.tool_calls[0].name, SubmitSummary::NAME);
-        assert!(trace.tool_calls[0].succeeded);
+        assert_eq!(trace.tool_calls().len(), 1);
+        assert_eq!(trace.tool_calls()[0].name, SubmitSummary::NAME);
+        assert!(trace.tool_calls()[0].succeeded);
     }
 
     /// A reply that talks instead of calling has not answered. The re-ask
@@ -1545,7 +1563,8 @@ mod tests {
         );
 
         assert_eq!(output.overall_score, Some(25));
-        let second = &fixture.sent()[1].input;
+        let sent = fixture.sent();
+        let second = sent[1].input();
         assert!(
             second.iter().any(|item| matches!(item,
                 InputItem::FunctionCall { name, .. } if name == SubmitSummary::NAME)),
@@ -1860,10 +1879,10 @@ mod tests {
 
         let sent = fixture.sent();
         let scoring_call = sent.last().expect("the scoring call");
-        let InputItem::Message { content, .. } = &scoring_call.input[0] else {
+        let InputItem::Message { content, .. } = &scoring_call.input()[0] else {
             panic!(
                 "the findings ride in a message: {:?}",
-                scoring_call.input[0]
+                scoring_call.input()[0]
             );
         };
         assert!(content.contains(r#""severity":"critical""#), "{content}");
@@ -1931,7 +1950,7 @@ mod tests {
 
         let sent = fixture.sent();
         assert_eq!(sent.len(), 1);
-        let content = match &sent[0].input[0] {
+        let content = match &sent[0].input()[0] {
             InputItem::Message { content, .. } => content.clone(),
             other => panic!("expected a user message, got {other:?}"),
         };
@@ -1947,8 +1966,8 @@ mod tests {
         );
         // The one tool this round advertises is the way back: nothing that
         // reads a file or runs a checker, because the list is already final.
-        assert_eq!(sent[0].tools.len(), 1, "{:?}", sent[0].tools);
-        assert_eq!(sent[0].tools[0].name, SubmitSummary::NAME);
+        assert_eq!(sent[0].tools().len(), 1, "{:?}", sent[0].tools());
+        assert_eq!(sent[0].tools()[0].name, SubmitSummary::NAME);
     }
 
     #[test]
@@ -1968,7 +1987,7 @@ mod tests {
         assert_eq!(output.summary.as_deref(), Some("nothing found"));
         assert!(output.unscored_reason.is_none());
         assert_eq!(fixture.sent().len(), 1);
-        let content = match &fixture.sent()[0].input[0] {
+        let content = match &fixture.sent()[0].input()[0] {
             InputItem::Message { content, .. } => content.clone(),
             other => panic!("expected a user message, got {other:?}"),
         };
@@ -2105,10 +2124,11 @@ mod tests {
     /// exactly as it went into `function_call_output`.
     fn write_trace_with_tool_output(fixture: &StageFixture, trace_id: &str, output: &str) {
         let mut trace = Trace::new(trace_id);
-        trace.prompt = "the review instructions, byte for byte".to_string();
-        trace.diff = "--- a/src/parse.c\n+++ b/src/parse.c\n@@ -10,2 +10,3 @@\n+int added(void);\n"
-            .to_string();
-        trace.tool_calls.push(ToolCall {
+        trace.set_prompt("the review instructions, byte for byte");
+        trace.set_diff(
+            "--- a/src/parse.c\n+++ b/src/parse.c\n@@ -10,2 +10,3 @@\n+int added(void);\n",
+        );
+        trace.record_tool_call(ToolCall {
             name: "cppcheck".to_string(),
             input: r#"{"path":"src/parse.c"}"#.to_string(),
             output: output.to_string(),

@@ -10,7 +10,6 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use regex::Regex;
@@ -328,7 +327,10 @@ impl CommandTool {
     }
 
     fn names_a_denied_path(&self, line: &str, root: &str) -> bool {
-        fragment_pattern().find_iter(line).any(|fragment| {
+        let Ok(pattern) = fragment_pattern() else {
+            return true;
+        };
+        pattern.find_iter(line).any(|fragment| {
             let text = fragment.as_str();
             if !text.contains('/') && !text.contains('.') {
                 return false;
@@ -351,9 +353,8 @@ impl CommandTool {
 
 /// Anything that looks like a path: at least one dot or slash, and none of
 /// the punctuation a diagnostic wraps its paths in.
-fn fragment_pattern() -> &'static Regex {
-    static PATTERN: OnceLock<Regex> = OnceLock::new();
-    PATTERN.get_or_init(|| Regex::new(r"[A-Za-z0-9_.+/-]+").expect("a valid pattern"))
+fn fragment_pattern() -> Result<Regex, regex::Error> {
+    Regex::new(r"[A-Za-z0-9_.+/-]+")
 }
 
 fn resolved(path: &Path) -> PathBuf {

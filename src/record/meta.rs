@@ -36,6 +36,10 @@ impl InputRecord {
     /// one run and read as one line. A diff has no locator of its own, so it
     /// is named by where its bytes came from — which is all `source` ever is
     /// for a diff.
+    pub fn run_id(&self) -> String {
+        self.identity.run_id(&self.head_sha)
+    }
+
     pub fn describe(&self) -> String {
         match &self.identity {
             InputIdentity::Platform {

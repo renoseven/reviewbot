@@ -71,9 +71,44 @@ pub struct PruneReport {
     pub deleted: Vec<String>,
 }
 
+/// The runs directory as an object: list, show, prune, remove.
+pub struct Runs {
+    dir: PathBuf,
+}
+
+impl Runs {
+    pub fn open(dir: impl Into<PathBuf>) -> Self {
+        Self { dir: dir.into() }
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn list(&self) -> Result<Vec<RunRow>, RecordError> {
+        list_runs(&self.dir)
+    }
+
+    pub fn show(&self, run_id: &str) -> Result<RunShow, RecordError> {
+        show_run(&self.dir, run_id)
+    }
+
+    pub fn prune(&self, keep: usize, dry_run: bool) -> Result<PruneReport, RecordError> {
+        prune_runs(&self.dir, keep, dry_run)
+    }
+
+    pub fn remove(&self, run_id: &str) -> Result<(), RecordError> {
+        remove_run(&self.dir, run_id)
+    }
+
+    pub fn count(&self) -> Result<usize, RecordError> {
+        count_runs(&self.dir)
+    }
+}
+
 /// Immediate child directories of `runs_dir`. A missing directory is empty,
 /// not an error: `run list` on a fresh machine still names the path.
-pub fn list_run_dirs(runs_dir: &Path) -> Result<Vec<PathBuf>, RecordError> {
+fn list_run_dirs(runs_dir: &Path) -> Result<Vec<PathBuf>, RecordError> {
     let entries = match fs::read_dir(runs_dir) {
         Ok(entries) => entries,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -104,18 +139,18 @@ pub fn list_run_dirs(runs_dir: &Path) -> Result<Vec<PathBuf>, RecordError> {
     Ok(dirs)
 }
 
-pub fn count_runs(runs_dir: &Path) -> Result<usize, RecordError> {
+fn count_runs(runs_dir: &Path) -> Result<usize, RecordError> {
     Ok(list_run_dirs(runs_dir)?.len())
 }
 
 /// Newest first by directory mtime. Success and failure sit in one queue.
-pub fn runs_by_mtime(runs_dir: &Path) -> Result<Vec<PathBuf>, RecordError> {
+fn runs_by_mtime(runs_dir: &Path) -> Result<Vec<PathBuf>, RecordError> {
     let mut dirs = list_run_dirs(runs_dir)?;
     dirs.sort_by_key(|directory| std::cmp::Reverse(mtime(directory)));
     Ok(dirs)
 }
 
-pub fn list_runs(runs_dir: &Path) -> Result<Vec<RunRow>, RecordError> {
+fn list_runs(runs_dir: &Path) -> Result<Vec<RunRow>, RecordError> {
     let mut rows = Vec::new();
     for directory in runs_by_mtime(runs_dir)? {
         rows.push(row_from_dir(&directory)?);
@@ -124,7 +159,7 @@ pub fn list_runs(runs_dir: &Path) -> Result<Vec<RunRow>, RecordError> {
 }
 
 /// Delete one run directory. A missing id is an error, not a no-op.
-pub fn remove_run(runs_dir: &Path, run_id: &str) -> Result<(), RecordError> {
+fn remove_run(runs_dir: &Path, run_id: &str) -> Result<(), RecordError> {
     if !is_run_id(run_id) {
         return Err(RecordError::RunNotFound {
             run_id: run_id.to_string(),
@@ -154,7 +189,7 @@ fn is_run_id(run_id: &str) -> bool {
         && !run_id.contains('\\')
 }
 
-pub fn show_run(runs_dir: &Path, run_id: &str) -> Result<RunShow, RecordError> {
+fn show_run(runs_dir: &Path, run_id: &str) -> Result<RunShow, RecordError> {
     let directory = runs_dir.join(run_id);
     if !directory.is_dir() {
         return Err(RecordError::RunNotFound {
@@ -201,7 +236,7 @@ pub fn show_run(runs_dir: &Path, run_id: &str) -> Result<RunShow, RecordError> {
 
 /// Keep the newest `keep` run directories; delete the rest, report.md
 /// included. `--dry-run` only names what would go.
-pub fn prune_runs(runs_dir: &Path, keep: usize, dry_run: bool) -> Result<PruneReport, RecordError> {
+fn prune_runs(runs_dir: &Path, keep: usize, dry_run: bool) -> Result<PruneReport, RecordError> {
     let ranked = runs_by_mtime(runs_dir)?;
     let kept: Vec<String> = ranked
         .iter()
@@ -318,13 +353,13 @@ mod tests {
         touch_dir(&runs.join("mid"), 200);
         touch_dir(&runs.join("new"), 300);
 
-        let dry = prune_runs(&runs, 2, true).expect("dry-run");
+        let dry = Runs::open(&runs).prune(2, true).expect("dry-run");
         assert!(dry.dry_run);
         assert_eq!(dry.kept, vec!["new", "mid"]);
         assert_eq!(dry.deleted, vec!["old"]);
         assert!(runs.join("old").join(layout::REPORT).is_file());
 
-        let done = prune_runs(&runs, 2, false).expect("prune");
+        let done = Runs::open(&runs).prune(2, false).expect("prune");
         assert!(!done.dry_run);
         assert!(!runs.join("old").exists());
         assert!(runs.join("new").is_dir());
@@ -340,7 +375,7 @@ mod tests {
         touch_dir(&runs.join("old"), 100);
         touch_dir(&runs.join("new"), 200);
 
-        let done = prune_runs(&runs, DEFAULT_KEEP, false).expect("prune");
+        let done = Runs::open(&runs).prune(DEFAULT_KEEP, false).expect("prune");
         assert_eq!(done.keep, 0);
         assert!(done.kept.is_empty());
         assert_eq!(done.deleted.len(), 2);
@@ -356,26 +391,25 @@ mod tests {
         fs::create_dir_all(runs.join("gone")).expect("gone");
         fs::write(runs.join("gone").join(layout::REPORT), b"gone").expect("report");
 
-        remove_run(&runs, "gone").expect("removed");
+        let catalog = Runs::open(&runs);
+        catalog.remove("gone").expect("removed");
         assert!(!runs.join("gone").exists());
         assert!(runs.join("keep").is_dir());
         assert!(matches!(
-            remove_run(&runs, "gone"),
+            catalog.remove("gone"),
             Err(RecordError::RunNotFound { .. })
         ));
         assert!(matches!(
-            remove_run(&runs, "../keep"),
+            catalog.remove("../keep"),
             Err(RecordError::RunNotFound { .. })
         ));
     }
 
     #[test]
     fn a_missing_runs_directory_lists_as_empty() {
-        let rows = list_runs(Path::new("/nonexistent/reviewbot-runs")).expect("empty");
+        let catalog = Runs::open("/nonexistent/reviewbot-runs");
+        let rows = catalog.list().expect("empty");
         assert!(rows.is_empty());
-        assert_eq!(
-            count_runs(Path::new("/nonexistent/reviewbot-runs")).unwrap(),
-            0
-        );
+        assert_eq!(catalog.count().unwrap(), 0);
     }
 }

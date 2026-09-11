@@ -13,7 +13,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::PlatformKind;
-use crate::domain::{ChangeSet, Stage};
+use crate::domain::{ChangeSet, Locator, Stage};
 use crate::platform::{ChangeRef, DiffPaths, DiffRefs, OutgoingComment};
 use crate::record::layout;
 
@@ -50,16 +50,19 @@ pub struct PublishOutput {
     pub posted_to_platform: bool,
 }
 
-pub struct Publish;
+pub struct Publish<'c, 'a> {
+    context: &'c mut StageContext<'a>,
+}
 
-impl Publish {
-    pub fn run(
-        context: &mut StageContext<'_>,
-        input: &PublishInput<'_>,
-    ) -> Result<PublishOutput, StageError> {
-        let output = Self::post(context, input)?;
-        Self::persist_published(context, &output.published)?;
-        context.complete(Stage::Publish, &output)?;
+impl<'c, 'a> Publish<'c, 'a> {
+    pub fn new(context: &'c mut StageContext<'a>) -> Self {
+        Self { context }
+    }
+
+    pub fn run(&mut self, input: &PublishInput<'_>) -> Result<PublishOutput, StageError> {
+        let output = Self::post(self.context, input)?;
+        Self::persist_published(self.context, &output.published)?;
+        self.context.complete(Stage::Publish, &output)?;
         Ok(output)
     }
 
@@ -73,21 +76,12 @@ impl Publish {
         if !context.recorder.meta().publish {
             return Ok(PublishOutput::default());
         }
-        let Some(platform) = context.adapters.platform.as_ref() else {
+        let Some(platform) = context.adapters.platform() else {
             return Err(StageError::UnreadableInput {
                 reason: "--publish needs a platform URL as input".to_string(),
             });
         };
-        let change = ChangeRef {
-            host: input.changeset.locator.host.clone().unwrap_or_default(),
-            project: input.changeset.locator.project.clone().unwrap_or_default(),
-            number: input.changeset.locator.number.unwrap_or_default(),
-        };
-        let refs = DiffRefs {
-            head_sha: input.changeset.locator.head_sha.clone().unwrap_or_default(),
-            base_sha: input.changeset.locator.base_sha.clone(),
-            start_sha: input.changeset.locator.start_sha.clone(),
-        };
+        let (change, refs) = Self::publish_target(&input.changeset.locator)?;
         let run_id = context.recorder.meta().run_id.clone();
 
         // A marker already on the MR, or already listed in published.json,
@@ -136,7 +130,7 @@ impl Publish {
                 for comment in &outgoing {
                     Self::dispatch(
                         context,
-                        platform.as_ref(),
+                        platform,
                         &change,
                         &refs,
                         std::slice::from_ref(comment),
@@ -149,19 +143,12 @@ impl Publish {
                     .into_iter()
                     .partition(|comment| comment.is_summary());
                 if !rest.is_empty() {
-                    Self::dispatch(
-                        context,
-                        platform.as_ref(),
-                        &change,
-                        &refs,
-                        &rest,
-                        &mut published,
-                    )?;
+                    Self::dispatch(context, platform, &change, &refs, &rest, &mut published)?;
                 }
                 if !summaries.is_empty() {
                     Self::dispatch(
                         context,
-                        platform.as_ref(),
+                        platform,
                         &change,
                         &refs,
                         &summaries,
@@ -176,6 +163,27 @@ impl Publish {
             skipped_as_duplicate: skipped,
             posted_to_platform: true,
         })
+    }
+
+    fn publish_target(locator: &Locator) -> Result<(ChangeRef, DiffRefs), StageError> {
+        let missing = |field: &str| StageError::UnreadableInput {
+            reason: format!("--publish needs the change {field}"),
+        };
+        Ok((
+            ChangeRef {
+                host: locator.host.clone().ok_or_else(|| missing("host"))?,
+                project: locator.project.clone().ok_or_else(|| missing("project"))?,
+                number: locator.number.ok_or_else(|| missing("number"))?,
+            },
+            DiffRefs {
+                head_sha: locator
+                    .head_sha
+                    .clone()
+                    .ok_or_else(|| missing("head_sha"))?,
+                base_sha: locator.base_sha.clone(),
+                start_sha: locator.start_sha.clone(),
+            },
+        ))
     }
 
     fn dispatch(
@@ -228,7 +236,13 @@ impl Publish {
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
-        Ok(serde_json::from_slice(&bytes).unwrap_or_default())
+        serde_json::from_slice(&bytes).map_err(|source| {
+            crate::record::RecordError::Serialize {
+                file: layout::PUBLISHED.to_string(),
+                source,
+            }
+            .into()
+        })
     }
 
     fn persist_published(
@@ -392,10 +406,12 @@ mod tests {
     /// file that was pulled in as context.
     fn internal_trace(trace_id: &str) -> Trace {
         let mut trace = Trace::new(trace_id);
-        trace.diff = "@@ -10,2 +10,3 @@\n+buf[5] = 0;\n".to_string();
-        trace.prompt = format!("instructions\n\ncontext of src/parse.h:\n{SECRET_BODY}\n");
-        trace.model_output = r#"{"comments":[{"path":"src/parse.c"}]}"#.to_string();
-        trace.context_files.push(ContextFile {
+        trace.set_diff("@@ -10,2 +10,3 @@\n+buf[5] = 0;\n");
+        trace.set_prompt(format!(
+            "instructions\n\ncontext of src/parse.h:\n{SECRET_BODY}\n"
+        ));
+        trace.set_model_output(r#"{"comments":[{"path":"src/parse.c"}]}"#);
+        trace.add_context_file(ContextFile {
             path: "src/parse.h".to_string(),
             first_line: 1,
             last_line: 1,
@@ -480,7 +496,7 @@ mod tests {
             summary: &summary,
         };
         let mut context = fixture.context();
-        Publish::run(&mut context, &input).expect("posted");
+        Publish::new(&mut context).run(&input).expect("posted");
 
         let posted = posts.lock().expect("posts");
         let body = posted
@@ -529,6 +545,34 @@ mod tests {
     }
 
     #[test]
+    fn publish_fails_when_the_locator_is_missing() {
+        let mut fixture =
+            StageFixture::new(Vec::new()).with_platform(Box::new(RecordingPlatform {
+                existing: Vec::new(),
+                posts: Arc::new(Mutex::new(Vec::new())),
+                fail_after: usize::MAX,
+                kind: PlatformKind::Gitlab,
+            }));
+        fixture.enable_publish();
+        let changeset = ChangeSet::default();
+        let merged = MergeOutput::default();
+        let summary = summary();
+        let input = PublishInput {
+            changeset: &changeset,
+            merged: &merged,
+            summary: &summary,
+        };
+        let mut context = fixture.context();
+        let error = Publish::new(&mut context)
+            .run(&input)
+            .expect_err("a missing locator cannot be invented");
+        assert!(
+            matches!(error, StageError::UnreadableInput { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn an_existing_marker_is_not_posted_again() {
         let marker = marker("test-run", "review-src_parse.c");
         let posts = Arc::new(Mutex::new(Vec::new()));
@@ -563,7 +607,7 @@ mod tests {
             summary: &summary,
         };
         let mut context = fixture.context();
-        let output = Publish::run(&mut context, &input).expect("publish");
+        let output = Publish::new(&mut context).run(&input).expect("publish");
 
         assert_eq!(output.skipped_as_duplicate, 1);
         let posted = posts.lock().expect("posts");
@@ -592,7 +636,9 @@ mod tests {
         };
         let output = {
             let mut context = fixture.context();
-            Publish::run(&mut context, &input).expect("the stage still finishes")
+            Publish::new(&mut context)
+                .run(&input)
+                .expect("the stage still finishes")
         };
 
         assert!(!output.posted_to_platform);
@@ -658,7 +704,9 @@ mod tests {
             summary: &summary,
         };
         let mut context = fixture.context();
-        let error = Publish::run(&mut context, &input).expect_err("second post fails");
+        let error = Publish::new(&mut context)
+            .run(&input)
+            .expect_err("second post fails");
         assert!(
             matches!(
                 error,
@@ -773,7 +821,13 @@ mod tests {
             Ok(posted)
         }
 
-        fn bind_repo(&self, _change: &ChangeRef, _head_sha: &str) {}
+        fn bind_repo(
+            &self,
+            _change: &ChangeRef,
+            _head_sha: &str,
+        ) -> Result<(), crate::platform::PlatformError> {
+            Ok(())
+        }
     }
 
     /// A platform every call to which is a test failure. The only assertion
@@ -827,7 +881,13 @@ mod tests {
             panic!("the platform was reached")
         }
 
-        fn bind_repo(&self, _change: &ChangeRef, _head_sha: &str) {}
+        fn bind_repo(
+            &self,
+            _change: &ChangeRef,
+            _head_sha: &str,
+        ) -> Result<(), crate::platform::PlatformError> {
+            Ok(())
+        }
     }
 
     struct NullRepo;

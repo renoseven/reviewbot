@@ -43,13 +43,13 @@ impl InputIdentity {
             InputIdentity::Diff { content_sha256 } => format!("diff:{content_sha256}"),
         }
     }
-}
 
-/// `head_sha` is empty for diff input without `--worktree`.
-pub fn run_id(identity: &InputIdentity, head_sha: &str) -> String {
-    const LENGTH: usize = 16;
-    let digest = Sha256::digest(format!("{}\n{head_sha}", identity.key()).as_bytes());
-    format!("{digest:x}")[..LENGTH].to_string()
+    /// `head_sha` is empty for diff input without `--worktree`.
+    pub fn run_id(&self, head_sha: &str) -> String {
+        const LENGTH: usize = 16;
+        let digest = Sha256::digest(format!("{}\n{head_sha}", self.key()).as_bytes());
+        format!("{digest:x}")[..LENGTH].to_string()
+    }
 }
 
 #[cfg(test)]
@@ -61,8 +61,8 @@ mod tests {
         let one = InputIdentity::diff("--- a\n+++ b\n");
         let same = InputIdentity::diff("--- a\n+++ b\n");
         let other = InputIdentity::diff("--- a\n+++ c\n");
-        assert_eq!(run_id(&one, ""), run_id(&same, ""));
-        assert_ne!(run_id(&one, ""), run_id(&other, ""));
+        assert_eq!(one.run_id(""), same.run_id(""));
+        assert_ne!(one.run_id(""), other.run_id(""));
     }
 
     /// The commit is half the identity: the same merge request reviewed
@@ -76,13 +76,13 @@ mod tests {
             number: 128,
         };
         assert_ne!(
-            run_id(&identity, "4b1e0d2"),
-            run_id(&identity, "aaaaaaa"),
+            identity.run_id("4b1e0d2"),
+            identity.run_id("aaaaaaa"),
             "the head sha is in the id"
         );
         assert_eq!(
-            run_id(&identity, "4b1e0d2"),
-            run_id(&identity, "4b1e0d2"),
+            identity.run_id("4b1e0d2"),
+            identity.run_id("4b1e0d2"),
             "and nothing else is, so the id is predictable from the URL"
         );
     }

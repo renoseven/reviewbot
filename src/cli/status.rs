@@ -411,9 +411,7 @@ pub(crate) mod tests {
                 outcome: Outcome::Input { files: 9 },
                 from_checkpoint: false,
             },
-            Event::StageStarted {
-                stage: Stage::Plan,
-            },
+            Event::StageStarted { stage: Stage::Plan },
             Event::StageFinished {
                 stage: Stage::Plan,
                 outcome: Outcome::Plan {

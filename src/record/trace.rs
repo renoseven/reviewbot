@@ -11,26 +11,26 @@ use crate::domain::Stage;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct Trace {
-    pub trace_id: String,
-    pub tool_calls: Vec<ToolCall>,
+    trace_id: String,
+    tool_calls: Vec<ToolCall>,
     /// The diff hunk that triggered the comment.
-    pub diff: String,
+    diff: String,
     /// Files pulled in as context. Their bodies stay internal.
-    pub context_files: Vec<ContextFile>,
+    context_files: Vec<ContextFile>,
     /// Redacted, in full.
-    pub prompt: String,
+    prompt: String,
     /// Raw, not post processed.
-    pub model_output: String,
+    model_output: String,
     /// Chain of thought. Internal only; the published view omits it.
     #[serde(default)]
-    pub reasoning: String,
+    reasoning: String,
     /// What each stage wrote down about this comment: how the conversation
     /// went, what was dropped, how far a line moved, whether a quotation held
     /// up. Every line says which stage wrote it, because a reader has to be
     /// able to tell "the model only looked half way" from "the line number
     /// moved by one" — those say very different things about the same comment.
-    pub checks: Vec<Check>,
-    pub usage: TokenUsage,
+    checks: Vec<Check>,
+    usage: TokenUsage,
 }
 
 /// One line of a stage's account of a comment, tagged with the stage that
@@ -106,8 +106,99 @@ impl Trace {
         }
     }
 
+    pub fn trace_id(&self) -> &str {
+        &self.trace_id
+    }
+
+    pub fn tool_calls(&self) -> &[ToolCall] {
+        &self.tool_calls
+    }
+
+    pub fn diff(&self) -> &str {
+        &self.diff
+    }
+
+    pub fn context_files(&self) -> &[ContextFile] {
+        &self.context_files
+    }
+
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+
+    pub fn model_output(&self) -> &str {
+        &self.model_output
+    }
+
+    pub fn reasoning(&self) -> &str {
+        &self.reasoning
+    }
+
+    pub fn checks(&self) -> &[Check] {
+        &self.checks
+    }
+
+    pub fn usage(&self) -> &TokenUsage {
+        &self.usage
+    }
+
+    pub fn set_prompt(&mut self, prompt: impl Into<String>) {
+        self.prompt = prompt.into();
+    }
+
+    pub fn set_diff(&mut self, diff: impl Into<String>) {
+        self.diff = diff.into();
+    }
+
+    pub fn set_model_output(&mut self, output: impl Into<String>) {
+        self.model_output = output.into();
+    }
+
+    pub fn record_tool_call(&mut self, call: ToolCall) {
+        self.tool_calls.push(call);
+    }
+
+    pub fn add_context_file(&mut self, file: ContextFile) {
+        self.context_files.push(file);
+    }
+
+    pub fn add_usage(&mut self, usage: &TokenUsage) {
+        self.usage.add(usage);
+    }
+
+    /// Another turn's chain of thought, separated from what came before.
+    pub fn append_reasoning(&mut self, reasoning: &str) {
+        if reasoning.is_empty() {
+            return;
+        }
+        if !self.reasoning.is_empty() {
+            self.reasoning.push_str("\n\n--- next turn ---\n\n");
+        }
+        self.reasoning.push_str(reasoning);
+    }
+
+    /// Another turn's reply, separated from what came before.
+    pub fn append_output(&mut self, text: &str) {
+        self.append_output_with(text, "\n\n--- next turn ---\n\n");
+    }
+
+    /// A re-ask's reply, marked as such so a reader can tell the turns apart.
+    pub fn append_reask(&mut self, text: &str) {
+        self.append_output_with(text, "\n\n--- re-ask ---\n\n");
+    }
+
     pub fn internal(&self) -> InternalView<'_> {
         self
+    }
+
+    fn append_output_with(&mut self, text: &str, separator: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if !self.model_output.is_empty() {
+            self.model_output.push_str(separator);
+        }
+        self.model_output.push_str(text);
     }
 
     /// Write one line down, in the name of the stage writing it.
@@ -215,8 +306,8 @@ mod tests {
     #[test]
     fn the_published_view_keeps_paths_but_drops_file_bodies() {
         let mut trace = Trace::new("t1");
-        trace.prompt = "context:\nsecret body text\nend".to_string();
-        trace.context_files.push(ContextFile {
+        trace.set_prompt("context:\nsecret body text\nend");
+        trace.add_context_file(ContextFile {
             path: "src/parse.h".to_string(),
             first_line: 1,
             last_line: 3,
@@ -227,13 +318,13 @@ mod tests {
         assert!(!published.prompt.contains("secret body text"));
         assert!(published.prompt.contains("src/parse.h lines 1-3"));
         assert_eq!(published.context_files[0].path, "src/parse.h");
-        assert!(trace.internal().context_files[0].body.contains("secret"));
+        assert!(trace.internal().context_files()[0].body.contains("secret"));
     }
 
     #[test]
     fn oversized_tool_output_is_clipped_not_dropped() {
         let mut trace = Trace::new("t1");
-        trace.tool_calls.push(ToolCall {
+        trace.record_tool_call(ToolCall {
             name: "cppcheck".to_string(),
             input: "src/parse.c".to_string(),
             output: "x".repeat(100),

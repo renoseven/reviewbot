@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::budget::estimate_tokens;
 use crate::common::truncate;
-use crate::domain::{Narrative, Stage};
+use crate::domain::{ChangeSet, Narrative, Stage};
 use crate::progress::Event;
 use crate::protocol::{InputItem, Request, Role};
 use crate::record::{ContextFile, ToolCall, Trace};
@@ -31,8 +31,8 @@ use crate::tool::{Purpose, Registry, Round, SubmitComment, ToolError};
 use crate::worktree::Worktree;
 
 use super::orient::Orientation;
-use super::prompt::{CappedList, Fence, Keep, Overflow, Prompts, code_ref};
 use super::plan::PlanOutput;
+use super::prompt::{CappedList, Fence, Keep, Overflow, Prompts, code_span};
 use super::{StageContext, StageError};
 
 /// One chunk's raw model output, kept unprocessed for `merge` to parse.
@@ -68,6 +68,14 @@ pub struct ReviewOutput {
     /// earlier one filed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pending_handoff: Option<Handoff>,
+}
+
+/// One chunk's borrowed inputs. Packed so `run_chunk` stays under five
+/// parameters once the stage holds the context.
+struct ChunkWork<'a> {
+    plan: &'a PlanOutput,
+    preamble: &'a Preamble,
+    carried: Option<&'a Handoff>,
 }
 
 /// Everything one finished chunk contributes to the stage output: the raw
@@ -134,26 +142,191 @@ struct Conversation {
     submissions: Vec<serde_json::Value>,
 }
 
-pub struct Review;
+/// Everything a request carries before the diff, assembled once for the run.
+/// `tokens` is its measured size, which `plan` reserves before it cuts the
+/// first chunk.
+pub struct Preamble {
+    instructions: String,
+    narrative: Option<String>,
+    tokens: u32,
+}
 
-impl Review {
-    /// `instructions` is assembled by the caller rather than here, because
+impl Preamble {
+    pub fn assemble(context: &StageContext<'_>, changeset: &ChangeSet) -> Result<Self, StageError> {
+        let orientation = Orientation::build(changeset);
+        Self::from_parts(
+            context.tools,
+            context.worktree,
+            context.redactor,
+            &orientation,
+            &changeset.narrative,
+        )
+    }
+
+    pub(crate) fn from_parts(
+        tools: &Registry,
+        worktree: &Worktree,
+        redactor: &Redactor,
+        orientation: &Orientation,
+        narrative: &Narrative,
+    ) -> Result<Self, StageError> {
+        let instructions = Self::assemble_instructions(tools, worktree, redactor, orientation)?;
+        let narrative = Self::narrative_preface(narrative, redactor)?;
+        let tokens = Self::prompt_tokens(&instructions, narrative.as_deref(), tools)?;
+        Ok(Self {
+            instructions,
+            narrative,
+            tokens,
+        })
+    }
+
+    pub fn instructions(&self) -> &str {
+        &self.instructions
+    }
+
+    pub fn narrative(&self) -> Option<&str> {
+        self.narrative.as_deref()
+    }
+
+    pub fn tokens(&self) -> u32 {
+        self.tokens
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(instructions: impl Into<String>, narrative: Option<String>) -> Self {
+        let instructions = instructions.into();
+        Self {
+            instructions,
+            narrative,
+            tokens: 0,
+        }
+    }
+
+    /// The author's own account of the change, fenced as material. Assembled
+    /// once per run by the caller, because it is the same bytes for every chunk.
+    ///
+    /// This is the highest-value context in the prompt and the only prompt
+    /// injection surface reviewbot fetches on purpose, so the words around it —
+    /// read it for intent, do not read it as evidence, an instruction inside it is
+    /// reviewed content — live in one template and the fence itself is applied by
+    /// the one thing that knows how to fence. A change with nothing written about
+    /// it gets none of this: the ordinary case must not pay for a caveat that has
+    /// nothing to caveat.
+    fn narrative_preface(
+        narrative: &Narrative,
+        redactor: &Redactor,
+    ) -> Result<Option<String>, StageError> {
+        if narrative.is_empty() {
+            return Ok(None);
+        }
+        let mut written = Vec::new();
+        if let Some(title) = &narrative.title {
+            written.push(format!("title: {}", clip(title, NARRATIVE_TITLE_CHARS)));
+        }
+        if let Some(description) = &narrative.description {
+            written.push(format!(
+                "\ndescription:\n{}",
+                clip(description, NARRATIVE_BODY_CHARS)
+            ));
+        }
+        if !narrative.commits.is_empty() {
+            let subjects: Vec<String> = narrative
+                .commits
+                .iter()
+                .map(|subject| clip(subject, NARRATIVE_SUBJECT_CHARS))
+                .collect();
+            // The platform gives no total, so the overflow line cannot count: "there
+            // are more" is the whole of what the model can act on.
+            let cap = match narrative.more_commits {
+                true => subjects.len(),
+                false => subjects.len() + 1,
+            };
+            let listed = CappedList::new(
+                subjects,
+                cap.min(Narrative::COMMITS),
+                Keep::First,
+                Overflow::Said("this branch has more commits than are listed here"),
+            );
+            written.push(format!("\ncommits:\n{}", listed.render()));
+        }
+        let material = Fence::new("change description, as written", &written.join("\n")).render();
+        let text = Prompts::NARRATIVE
+            .fill()
+            .set("material", material)
+            .render()?;
+        Ok(Some(redactor.redact(&text)))
+    }
+
+    /// The six-section body plus the two things that vary by run rather than by
+    /// chunk: which abilities exist, and what else this change touches. Filled
+    /// once, so every chunk sees the same bytes — which is what the vendor's
+    /// prompt cache needs, and what makes the whole-change view affordable at
+    /// all: it is paid for on the first chunk and cached for the rest.
+    fn assemble_instructions(
+        tools: &Registry,
+        worktree: &Worktree,
+        redactor: &Redactor,
+        orientation: &Orientation,
+    ) -> Result<String, StageError> {
+        let assembled = Prompts::REVIEW
+            .fill()
+            .set("capabilities", capability_paragraph(tools, worktree)?)
+            // Missing rather than empty: the template takes the whole section
+            // away with the value. A heading with nothing under it would say
+            // this change touched one file, which is not what happened.
+            .set("change", orientation.change())
+            .render()?;
+        Ok(redactor.redact(&assembled))
+    }
+
+    /// What every request carries before the diff: the instructions, the tool
+    /// schemas, and the change description. `plan` holds this back from the
+    /// window, so it is measured rather than guessed — the schemas alone run to
+    /// thousands of characters, and a guess that is half the real size is one
+    /// the vendor rejects at the worst possible moment.
+    ///
+    /// The description is in here although it rides in `input` rather than
+    /// `instructions`: what this number is for is the per-chunk overhead, and
+    /// which slot it travels in does not change what it costs.
+    fn prompt_tokens(
+        instructions: &str,
+        narrative: Option<&str>,
+        tools: &Registry,
+    ) -> Result<u32, StageError> {
+        let schemas = serde_json::to_string(&tools.request_schemas(Round::Investigation))
+            .map_err(|source| StageError::Schemas { source })?;
+        Ok(estimate_tokens(instructions)
+            .saturating_add(estimate_tokens(&schemas))
+            .saturating_add(narrative.map(estimate_tokens).unwrap_or(0)))
+    }
+}
+
+pub struct Review<'c, 'a> {
+    context: &'c mut StageContext<'a>,
+}
+
+impl<'c, 'a> Review<'c, 'a> {
+    pub fn new(context: &'c mut StageContext<'a>) -> Self {
+        Self { context }
+    }
+
+    /// `preamble` is assembled by the caller rather than here, because
     /// `plan` has to hold the same bytes back from the window before the
     /// first chunk is cut. One string, measured and sent, is what keeps the
     /// reservation honest and the prompt cache hitting.
     pub fn run(
-        context: &mut StageContext<'_>,
+        &mut self,
         plan: &PlanOutput,
-        instructions: &str,
-        narrative: Option<&str>,
+        preamble: &Preamble,
     ) -> Result<ReviewOutput, StageError> {
-        let mut output = match context.saved(Stage::Review)? {
+        let mut output = match self.context.saved(Stage::Review)? {
             Some(saved) => saved,
             None => ReviewOutput {
                 // Written down before the first chunk, because it is true of
                 // the whole run and has to survive as far as the report
                 // whatever the chunks turn out to do.
-                unavailable: context
+                unavailable: self
+                    .context
                     .worktree
                     .went_without()
                     .into_iter()
@@ -172,11 +345,11 @@ impl Review {
         // finish the bookkeeping. Same if the money had already run out.
         if output.stopped.is_some() || output.chunks.len() >= plan.chunks.len() {
             output.pending_handoff = None;
-            context.complete(Stage::Review, &output)?;
+            self.context.complete(Stage::Review, &output)?;
             return Ok(output);
         }
         for (index, chunk) in plan.chunks.iter().enumerate().skip(output.chunks.len()) {
-            context.progress.emit(Event::Chunk {
+            self.context.progress.emit(Event::Chunk {
                 index: file_number(&plan.chunks, index),
                 of,
                 path: chunk.path.clone(),
@@ -187,12 +360,13 @@ impl Review {
                 .take()
                 .filter(|previous| previous.path == chunk.path);
             match Self::run_chunk(
-                context,
+                self.context,
                 chunk,
-                plan,
-                instructions,
-                narrative,
-                carried.as_ref(),
+                &ChunkWork {
+                    plan,
+                    preamble,
+                    carried: carried.as_ref(),
+                },
             ) {
                 Ok(done) => {
                     output.chunks.push(done.output);
@@ -208,7 +382,7 @@ impl Review {
                         output.pending_handoff = None;
                         break;
                     }
-                    context.save(Stage::Review, &output)?;
+                    self.context.save(Stage::Review, &output)?;
                 }
                 // The budget did not stretch to this chunk's first call, so
                 // nothing was paid for here and the chunk itself is
@@ -224,7 +398,7 @@ impl Review {
             }
         }
         output.pending_handoff = None;
-        context.complete(Stage::Review, &output)?;
+        self.context.complete(Stage::Review, &output)?;
         Ok(output)
     }
 
@@ -235,13 +409,13 @@ impl Review {
     fn run_chunk(
         context: &mut StageContext<'_>,
         chunk: &super::plan::Chunk,
-        plan: &PlanOutput,
-        instructions: &str,
-        narrative: Option<&str>,
-        carried: Option<&Handoff>,
+        work: &ChunkWork<'_>,
     ) -> Result<ChunkRun, StageError> {
-        let window = plan.window;
-        let of = plan.chunks.len();
+        let window = work.plan.window;
+        let of = work.plan.chunks.len();
+        let instructions = work.preamble.instructions();
+        let narrative = work.preamble.narrative();
+        let carried = work.carried;
         let path = chunk.path.as_str();
         let diff = chunk.diff.as_str();
         let selection = context.settings.selection()?;
@@ -249,7 +423,7 @@ impl Review {
         let max_output_tokens = selection.model.max_output_tokens;
         let reasoning_effort = selection.model.reasoning_effort.clone();
         let context_window_tokens = selection.model.context_window_tokens;
-        let max_rounds = context.settings.config.review.max_rounds;
+        let max_rounds = context.settings.config().review.max_rounds;
         let round_bytes = window.round_bytes() as usize;
         let schemas = context.tools.request_schemas(Round::Investigation);
         let concluding_schemas = context.tools.request_schemas(Round::Conclusion);
@@ -262,7 +436,7 @@ impl Review {
         if !context.tools.usable_with_purpose(Purpose::Check).is_empty()
             && let Err(error) = context
                 .worktree
-                .fetch(path, context.settings.config.review.max_file_bytes)
+                .fetch(path, context.settings.config().review.max_file_bytes)
         {
             tracing::warn!(
                 path,
@@ -285,8 +459,8 @@ impl Review {
             false => format!("{}-{}", Stage::Review, path.replace('/', "_")),
         };
         let mut trace = Trace::new(trace_id.clone());
-        trace.diff = redacted.clone();
-        trace.prompt = context.redactor.redact(instructions);
+        trace.set_diff(redacted.clone());
+        trace.set_prompt(context.redactor.redact(instructions));
         let mut input = Vec::new();
         // Before anything else, because it is the least specific thing the
         // model is shown and the only one that is the same for every chunk.
@@ -328,17 +502,17 @@ impl Review {
 
         let mut stopped = None;
         let raw_output = loop {
-            let mut request = Request {
-                model: model.clone(),
-                instructions: instructions.to_string(),
-                input: chat.input.clone(),
-                tools: match chat.concluding {
+            let mut request = Request::compose(
+                model.clone(),
+                instructions.to_string(),
+                chat.input.clone(),
+                match chat.concluding {
                     true => concluding_schemas.clone(),
                     false => schemas.clone(),
                 },
                 max_output_tokens,
-                reasoning_effort: reasoning_effort.clone(),
-            };
+            )
+            .with_reasoning_effort(reasoning_effort.clone());
             let tokens = request.estimated_input_tokens() + max_output_tokens;
             if tokens > context_window_tokens {
                 // Two ways this is a sizing bug rather than a stop: the very
@@ -360,8 +534,8 @@ impl Review {
                         chat.rounds
                     ),
                 )?;
-                request.input = chat.input.clone();
-                request.tools = concluding_schemas.clone();
+                request.set_input(chat.input.clone());
+                request.set_tools(concluding_schemas.clone());
             }
 
             // The budget decides two things here, in this order: whether
@@ -398,9 +572,9 @@ impl Review {
                         chat.rounds
                     ),
                 )?;
-                request.input = chat.input.clone();
-                request.tools = concluding_schemas.clone();
-                request.max_output_tokens = max_output_tokens.min(CONCLUDING_OUTPUT_TOKENS);
+                request.set_input(chat.input.clone());
+                request.set_tools(concluding_schemas.clone());
+                request.cap_output(max_output_tokens.min(CONCLUDING_OUTPUT_TOKENS));
                 if let Err(error) = context.authorize(&mut request, 0) {
                     stopped = Some(error.to_string());
                     break comments_json(&chat.submissions);
@@ -428,7 +602,7 @@ impl Review {
                 }
             }
             let response = context.send_and_settle(&request)?;
-            chat.trace.usage.add(&response.usage);
+            chat.trace.add_usage(&response.usage);
             chat.record_turn(&response);
 
             let calls: Vec<(String, String, String)> = response
@@ -437,7 +611,7 @@ impl Review {
                     (call_id.to_string(), name.to_string(), arguments.to_string())
                 })
                 .collect();
-            if response.truncated(request.max_output_tokens) && !chat.concluding {
+            if response.truncated(request.max_output_tokens()) && !chat.concluding {
                 chat.ask_after_truncate(context.redactor)?;
                 continue;
             }
@@ -482,7 +656,7 @@ impl Review {
                     // The next call's size, after this round's tools went in.
                     // If it no longer fits, the top of the loop concludes.
                     // If it fits but is the last that will, say so now.
-                    request.input = chat.input.clone();
+                    request.set_input(chat.input.clone());
                     let next_tokens = request.estimated_input_tokens() + max_output_tokens;
                     if next_tokens <= context_window_tokens && chat.rounds + 1 >= max_rounds {
                         chat.warn_if_last_round(context.redactor)?;
@@ -542,7 +716,7 @@ impl Review {
                 ms: call.duration_ms,
             });
             if let Some(file) = call.context_file {
-                chat.trace.context_files.push(file);
+                chat.trace.add_context_file(file);
             }
             match &call.submission {
                 Some(finding) => {
@@ -553,7 +727,7 @@ impl Review {
                 None => {}
             }
             let output = fit_into_round(call.output, &mut room);
-            chat.trace.tool_calls.push(ToolCall {
+            chat.trace.record_tool_call(ToolCall {
                 name: name.clone(),
                 input: call.input,
                 output: output.clone(),
@@ -618,12 +792,7 @@ impl Conversation {
 
     fn record_turn(&mut self, response: &crate::protocol::Response) {
         let reasoning = response.reasoning_text();
-        if !reasoning.is_empty() {
-            if !self.trace.reasoning.is_empty() {
-                self.trace.reasoning.push_str("\n\n--- next turn ---\n\n");
-            }
-            self.trace.reasoning.push_str(&reasoning);
-        }
+        self.trace.append_reasoning(&reasoning);
         self.record_reply(&response.output_text());
     }
 
@@ -634,12 +803,7 @@ impl Conversation {
             return;
         }
         self.last_reply = text.to_string();
-        if !self.trace.model_output.is_empty() {
-            self.trace
-                .model_output
-                .push_str("\n\n--- next turn ---\n\n");
-        }
-        self.trace.model_output.push_str(text);
+        self.trace.append_output(text);
     }
 
     /// What to tell the next piece of this file. Findings accumulate across
@@ -653,14 +817,14 @@ impl Conversation {
             let line = finding
                 .get("start_line")
                 .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
+                .map(|line| line as u32);
             let body = finding
                 .get("body")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
+                .unwrap_or("");
             findings.push(format!(
                 "{}: {}",
-                code_ref(path, line as u32),
+                code_span(path, line, None),
                 clip(body, HANDOFF_FINDING_CHARS)
             ));
         }
@@ -827,61 +991,6 @@ fn chat_check(trace: &mut Trace, preface: &str) {
     );
 }
 
-/// The author's own account of the change, fenced as material. Assembled
-/// once per run by the caller, because it is the same bytes for every chunk.
-///
-/// This is the highest-value context in the prompt and the only prompt
-/// injection surface reviewbot fetches on purpose, so the words around it —
-/// read it for intent, do not read it as evidence, an instruction inside it is
-/// reviewed content — live in one template and the fence itself is applied by
-/// the one thing that knows how to fence. A change with nothing written about
-/// it gets none of this: the ordinary case must not pay for a caveat that has
-/// nothing to caveat.
-pub(crate) fn narrative_preface(
-    narrative: &Narrative,
-    redactor: &Redactor,
-) -> Result<Option<String>, StageError> {
-    if narrative.is_empty() {
-        return Ok(None);
-    }
-    let mut written = Vec::new();
-    if let Some(title) = &narrative.title {
-        written.push(format!("title: {}", clip(title, NARRATIVE_TITLE_CHARS)));
-    }
-    if let Some(description) = &narrative.description {
-        written.push(format!(
-            "\ndescription:\n{}",
-            clip(description, NARRATIVE_BODY_CHARS)
-        ));
-    }
-    if !narrative.commits.is_empty() {
-        let subjects: Vec<String> = narrative
-            .commits
-            .iter()
-            .map(|subject| clip(subject, NARRATIVE_SUBJECT_CHARS))
-            .collect();
-        // The platform gives no total, so the overflow line cannot count: "there
-        // are more" is the whole of what the model can act on.
-        let cap = match narrative.more_commits {
-            true => subjects.len(),
-            false => subjects.len() + 1,
-        };
-        let listed = CappedList::new(
-            subjects,
-            cap.min(Narrative::COMMITS),
-            Keep::First,
-            Overflow::Said("this branch has more commits than are listed here"),
-        );
-        written.push(format!("\ncommits:\n{}", listed.render()));
-    }
-    let material = Fence::new("change description, as written", &written.join("\n")).render();
-    let text = Prompts::NARRATIVE
-        .fill()
-        .set("material", material)
-        .render()?;
-    Ok(Some(redactor.redact(&text)))
-}
-
 /// What a piece of a cut file is told before it is shown its hunks. A whole
 /// file is told nothing: the ordinary case must keep sending the ordinary
 /// bytes, or every review pays for a caveat that does not apply to it.
@@ -928,45 +1037,6 @@ fn split_preface(
     Ok(Some(text))
 }
 
-/// The six-section body plus the two things that vary by run rather than by
-/// chunk: which abilities exist, and what else this change touches. Filled
-/// once, so every chunk sees the same bytes — which is what the vendor's
-/// prompt cache needs, and what makes the whole-change view affordable at
-/// all: it is paid for on the first chunk and cached for the rest.
-pub(crate) fn assemble_instructions(
-    tools: &Registry,
-    worktree: &Worktree,
-    redactor: &Redactor,
-    orientation: &Orientation,
-) -> Result<String, StageError> {
-    let assembled = Prompts::REVIEW
-        .fill()
-        .set("capabilities", capability_paragraph(tools, worktree)?)
-        // Missing rather than empty: the template takes the whole section
-        // away with the value. A heading with nothing under it would say
-        // this change touched one file, which is not what happened.
-        .set("change", orientation.change.clone())
-        .render()?;
-    Ok(redactor.redact(&assembled))
-}
-
-/// What every request carries before the diff: the instructions, the tool
-/// schemas, and the change description. `plan` holds this back from the
-/// window, so it is measured rather than guessed — the schemas alone run to
-/// thousands of characters, and a guess that is half the real size is one
-/// the vendor rejects at the worst possible moment.
-///
-/// The description is in here although it rides in `input` rather than
-/// `instructions`: what this number is for is the per-chunk overhead, and
-/// which slot it travels in does not change what it costs.
-pub(crate) fn prompt_tokens(instructions: &str, narrative: Option<&str>, tools: &Registry) -> u32 {
-    let schemas =
-        serde_json::to_string(&tools.request_schemas(Round::Investigation)).unwrap_or_default();
-    estimate_tokens(instructions)
-        .saturating_add(estimate_tokens(&schemas))
-        .saturating_add(narrative.map(estimate_tokens).unwrap_or(0))
-}
-
 /// What abilities this run has, written from the registry so the prompt and the
 /// request's `tools` field cannot name different sets. One template, because
 /// the list no longer varies: every tool is offered on every run, and what
@@ -986,7 +1056,7 @@ fn capability_paragraph(tools: &Registry, worktree: &Worktree) -> Result<String,
         .fill()
         .set("investigation", bullets(investigation))
         .set("delivery", bullets(delivery))
-        .set("worktree", Prompts::worktree(worktree)?)
+        .set("worktree", worktree.prompt_paragraph()?)
         .render()?)
 }
 
@@ -1292,7 +1362,29 @@ mod tests {
         redactor: &Redactor,
         orientation: &Orientation,
     ) -> String {
-        assemble_instructions(tools, worktree, redactor, orientation).expect("the prompt fills")
+        Preamble::from_parts(
+            tools,
+            worktree,
+            redactor,
+            orientation,
+            &Narrative::default(),
+        )
+        .expect("the prompt fills")
+        .instructions()
+        .to_string()
+    }
+
+    fn preface_of(narrative: &Narrative) -> Option<String> {
+        Preamble::from_parts(
+            &Registry::new(),
+            &checkout(),
+            &Redactor::new().expect("patterns"),
+            &Orientation::none(),
+            narrative,
+        )
+        .expect("the prompt fills")
+        .narrative()
+        .map(str::to_string)
     }
 
     fn instructions() -> String {
@@ -1341,7 +1433,9 @@ mod tests {
 
     fn review_over(fixture: &mut StageFixture, plan: &PlanOutput) -> ReviewOutput {
         let mut context = fixture.context();
-        Review::run(&mut context, plan, &instructions(), None).expect("the review stage finishes")
+        Review::new(&mut context)
+            .run(plan, &Preamble::for_test(instructions(), None))
+            .expect("the review stage finishes")
     }
 
     /// The clip note is appended once the allowance is already spent, so a
@@ -1371,12 +1465,12 @@ mod tests {
         let sent = fixture.sent();
         assert_eq!(sent.len(), 2, "one round of tools, then the answer");
         assert!(
-            sent[0].tools.iter().any(|tool| tool.name == "cppcheck"),
+            sent[0].tools().iter().any(|tool| tool.name == "cppcheck"),
             "the schema is advertised on the first call"
         );
         // The call and its output, in that order: nothing else tells the
         // model which output answered which call.
-        let replayed: Vec<&InputItem> = sent[1].input.iter().skip(1).collect();
+        let replayed: Vec<&InputItem> = sent[1].input().iter().skip(1).collect();
         assert!(
             matches!(replayed[0], InputItem::FunctionCall { name, .. } if name == "cppcheck"),
             "{replayed:?}"
@@ -1392,9 +1486,9 @@ mod tests {
             .read_trace("review-src_parse.c")
             .expect("readable")
             .expect("the trace is on disk");
-        assert_eq!(trace.tool_calls.len(), 3);
-        assert!(trace.tool_calls[0].succeeded);
-        assert_eq!(trace.tool_calls[0].output, "clean for src/parse.c");
+        assert_eq!(trace.tool_calls().len(), 3);
+        assert!(trace.tool_calls()[0].succeeded);
+        assert_eq!(trace.tool_calls()[0].output, "clean for src/parse.c");
     }
 
     #[test]
@@ -1421,14 +1515,14 @@ mod tests {
             .expect("readable")
             .expect("the trace is on disk");
         assert!(
-            trace.tool_calls[0].succeeded,
+            trace.tool_calls()[0].succeeded,
             "{}",
-            trace.tool_calls[0].output
+            trace.tool_calls()[0].output
         );
         assert!(
-            trace.tool_calls[0].input.contains("src/parse.c"),
+            trace.tool_calls()[0].input.contains("src/parse.c"),
             "{}",
-            trace.tool_calls[0].input
+            trace.tool_calls()[0].input
         );
     }
 
@@ -1484,11 +1578,11 @@ mod tests {
             .read_trace("review-src_parse.c")
             .expect("readable")
             .expect("the trace is on disk");
-        assert!(!trace.tool_calls[0].succeeded);
+        assert!(!trace.tool_calls()[0].succeeded);
         assert!(
-            trace.tool_calls[0].output.contains("finish_review"),
+            trace.tool_calls()[0].output.contains("finish_review"),
             "{}",
-            trace.tool_calls[0].output
+            trace.tool_calls()[0].output
         );
     }
 
@@ -1541,9 +1635,9 @@ mod tests {
         let sent = fixture.sent();
         assert_eq!(sent.len(), 1, "the call went out");
         assert!(
-            (1024..4096).contains(&sent[0].max_output_tokens),
+            (1024..4096).contains(&sent[0].max_output_tokens()),
             "capped to what 0.10 CNY covers, and still worth answering with: {}",
-            sent[0].max_output_tokens
+            sent[0].max_output_tokens()
         );
     }
 
@@ -1611,7 +1705,7 @@ mod tests {
         assert!(
             sent.last()
                 .expect("a concluding call went out")
-                .tools
+                .tools()
                 .iter()
                 .all(|tool| tool.name != "cppcheck"),
             "the concluding turn has no investigation tools left"
@@ -1646,12 +1740,9 @@ mod tests {
             .collect();
         assert_eq!(rounds, vec![(1, 2), (2, 2)], "no round past the ceiling");
         assert!(
-            fixture
-                .progress()
-                .iter()
-                .any(|event| {
-                    matches!(event, Event::Concluding { why } if why.contains("configured limit"))
-                }),
+            fixture.progress().iter().any(|event| {
+                matches!(event, Event::Concluding { why } if why.contains("configured limit"))
+            }),
             "the turn that replaces a round says what it is: {:?}",
             fixture.progress()
         );
@@ -1679,7 +1770,7 @@ mod tests {
         let sent = fixture.sent();
         let notes: Vec<&str> = sent
             .iter()
-            .flat_map(|request| request.input.iter())
+            .flat_map(|request| request.input().iter())
             .filter_map(|item| match item {
                 InputItem::Message { content, .. }
                     if content.contains("rounds used")
@@ -1735,16 +1826,16 @@ mod tests {
         // and saying it has none. Leaving only the first is what made a model
         // file a placeholder to get out of the round.
         let concluding: Vec<&str> = sent[2]
-            .tools
+            .tools()
             .iter()
             .map(|tool| tool.name.as_str())
             .collect();
         assert_eq!(concluding, vec!["submit_comment", "finish_review"]);
         assert!(
-            matches!(sent[2].input.last(), Some(InputItem::Message { content, .. })
+            matches!(sent[2].input().last(), Some(InputItem::Message { content, .. })
                      if content.contains("investigation tools are no longer available")),
             "{:?}",
-            sent[2].input.last()
+            sent[2].input().last()
         );
         assert_eq!(output.chunks.len(), 1);
         assert!(output.chunks[0].raw_output.contains("confidence_score"));
@@ -1788,7 +1879,8 @@ mod tests {
             .expect("readable")
             .expect("the trace is on disk");
         assert_eq!(
-            trace.tool_calls[0].output, "src/parse.c is on disk",
+            trace.tool_calls()[0].output,
+            "src/parse.c is on disk",
             "the checker had a file to open"
         );
     }
@@ -1820,14 +1912,14 @@ mod tests {
             .read_trace("review-src_parse.c")
             .expect("readable")
             .expect("the trace is on disk");
-        assert!(trace.tool_calls[0].succeeded);
+        assert!(trace.tool_calls()[0].succeeded);
         assert!(
             trace
                 .notes_by(Stage::Review)
                 .iter()
                 .any(|note| note.contains("nothing to file")),
             "{:?}",
-            trace.checks
+            trace.checks()
         );
     }
 
@@ -1870,7 +1962,8 @@ mod tests {
 
         {
             let mut context = fixture.context();
-            let error = Review::run(&mut context, &plan, &instructions(), None)
+            let error = Review::new(&mut context)
+                .run(&plan, &Preamble::for_test(instructions(), None))
                 .expect_err("the second file fails");
             assert!(matches!(error, StageError::Protocol(_)), "{error}");
         }
@@ -1894,7 +1987,8 @@ mod tests {
         fixture.queue([filed()]);
         let output = {
             let mut context = fixture.context();
-            Review::run(&mut context, &plan, &instructions(), None)
+            Review::new(&mut context)
+                .run(&plan, &Preamble::for_test(instructions(), None))
                 .expect("the second file finishes")
         };
 
@@ -1941,7 +2035,8 @@ mod tests {
 
         {
             let mut context = fixture.context();
-            Review::run(&mut context, &plan, &instructions(), None)
+            Review::new(&mut context)
+                .run(&plan, &Preamble::for_test(instructions(), None))
                 .expect_err("the second piece fails");
         }
         let saved: ReviewOutput = fixture
@@ -1957,12 +2052,13 @@ mod tests {
         fixture.queue([filed()]);
         {
             let mut context = fixture.context();
-            Review::run(&mut context, &plan, &instructions(), None)
+            Review::new(&mut context)
+                .run(&plan, &Preamble::for_test(instructions(), None))
                 .expect("the second piece finishes");
         }
 
         let second = &fixture.sent()[2];
-        let input = format!("{:?}", second.input);
+        let input = format!("{:?}", second.input());
         assert!(
             input.contains(": b") || input.contains("b"),
             "the later piece is told what the earlier one filed: {input}"
@@ -1983,7 +2079,8 @@ mod tests {
 
         let output = {
             let mut context = fixture.context();
-            Review::run(&mut context, &plan, &instructions(), None)
+            Review::new(&mut context)
+                .run(&plan, &Preamble::for_test(instructions(), None))
                 .expect("both pieces are reviewed")
         };
 
@@ -1999,7 +2096,7 @@ mod tests {
                 .read_trace(id)
                 .expect("readable")
                 .unwrap_or_else(|| panic!("{id} survived the other piece"));
-            assert_eq!(trace.trace_id, id);
+            assert_eq!(trace.trace_id(), id);
         }
     }
 
@@ -2016,34 +2113,34 @@ mod tests {
             chunks: vec![piece("src/parse.c", 0, 1), piece("src/lex.c", 1, 1)],
             ..PlanOutput::default()
         };
-        let narrative = Narrative::new(Some("bound the index".to_string()), None, Vec::new());
-        let preface = narrative_preface(&narrative, &Redactor::new())
-            .expect("the prompt fills")
-            .expect("there is prose");
+        let narrative =
+            crate::stage::input::narrative(Some("bound the index".to_string()), None, Vec::new());
+        let preface = preface_of(&narrative).expect("there is prose");
         let instructions = instructions();
 
         {
             let mut context = fixture.context();
-            Review::run(&mut context, &plan, &instructions, Some(&preface))
+            Review::new(&mut context)
+                .run(&plan, &Preamble::for_test(instructions, Some(preface)))
                 .expect("both files are reviewed");
         }
 
         let sent = fixture.sent();
         assert_eq!(sent.len(), 2);
         assert_eq!(
-            sent[0].instructions.as_bytes(),
-            sent[1].instructions.as_bytes()
+            sent[0].instructions().as_bytes(),
+            sent[1].instructions().as_bytes()
         );
         assert_eq!(
-            message(&sent[0].input[0]).as_bytes(),
-            message(&sent[1].input[0]).as_bytes(),
+            message(&sent[0].input()[0]).as_bytes(),
+            message(&sent[1].input()[0]).as_bytes(),
             "the author's account is the same bytes too"
         );
         // And nothing went out with a marker still in it.
         assert!(
-            !sent[0].instructions.contains("{{"),
+            !sent[0].instructions().contains("{{"),
             "{}",
-            sent[0].instructions
+            sent[0].instructions()
         );
     }
 
@@ -2059,7 +2156,7 @@ mod tests {
         assert_eq!(output.chunks[0].trace_id, "review-src_parse.c");
         // And nothing was said about pieces: an uncut file has none.
         let sent = fixture.sent();
-        assert_eq!(sent[0].input.len(), 1, "{:?}", sent[0].input);
+        assert_eq!(sent[0].input().len(), 1, "{:?}", sent[0].input());
     }
 
     /// The second piece of a cut file is told it is one, and told what the
@@ -2086,12 +2183,13 @@ mod tests {
 
         {
             let mut context = fixture.context();
-            Review::run(&mut context, &plan, &instructions(), None)
+            Review::new(&mut context)
+                .run(&plan, &Preamble::for_test(instructions(), None))
                 .expect("both pieces are reviewed");
         }
 
         let sent = fixture.sent();
-        let first = message(&sent[0].input[0]);
+        let first = message(&sent[0].input()[0]);
         assert!(first.contains("into 2 pieces"), "{first}");
         assert!(first.contains("piece 1"), "{first}");
         assert!(
@@ -2108,7 +2206,7 @@ mod tests {
             "nothing came before: {first}"
         );
 
-        let second = message(&sent[1].input[0]);
+        let second = message(&sent[1].input()[0]);
         assert!(second.contains("piece 2"), "{second}");
         assert!(second.contains("already filed"), "{second}");
         assert!(
@@ -2152,7 +2250,7 @@ mod tests {
 
         let sent = fixture.sent();
         let returned: usize = sent[1]
-            .input
+            .input()
             .iter()
             .filter_map(|item| match item {
                 InputItem::FunctionCallOutput { output, .. } => Some(output.len()),
@@ -2164,7 +2262,7 @@ mod tests {
             "{returned} bytes came back"
         );
         assert!(
-            sent[1].input.iter().any(|item| matches!(item,
+            sent[1].input().iter().any(|item| matches!(item,
                 InputItem::FunctionCallOutput { output, .. } if output.contains("allowance is spent"))),
             "the clip is said out loud rather than looking like a short answer"
         );
@@ -2198,13 +2296,13 @@ mod tests {
             sent.len()
         );
         let last = sent.last().expect("at least one call");
-        let concluding: Vec<&str> = last.tools.iter().map(|tool| tool.name.as_str()).collect();
+        let concluding: Vec<&str> = last.tools().iter().map(|tool| tool.name.as_str()).collect();
         assert_eq!(concluding, vec!["submit_comment", "finish_review"]);
         assert!(
-            matches!(last.input.last(), Some(InputItem::Message { content, .. })
+            matches!(last.input().last(), Some(InputItem::Message { content, .. })
                      if content.contains("investigation tools are no longer available")),
             "{:?}",
-            last.input.last()
+            last.input().last()
         );
         assert_eq!(output.chunks.len(), 1, "the chunk is still accounted for");
         let trace = fixture
@@ -2218,7 +2316,7 @@ mod tests {
                 .iter()
                 .any(|check| check.contains("not enough context left")),
             "{:?}",
-            trace.checks
+            trace.checks()
         );
     }
 
@@ -2238,18 +2336,18 @@ mod tests {
         assert_eq!(output.chunks.len(), 1);
         let sent = fixture.sent();
         assert!(
-            sent[1].input.iter().any(|item| matches!(item,
+            sent[1].input().iter().any(|item| matches!(item,
                 InputItem::FunctionCallOutput { output, .. } if output.contains("no_such_tool"))),
             "{:?}",
-            sent[1].input
+            sent[1].input()
         );
         let trace = fixture
             .recorder()
             .read_trace("review-src_parse.c")
             .expect("readable")
             .expect("the trace is on disk");
-        assert_eq!(trace.tool_calls.len(), 3);
-        assert!(!trace.tool_calls[0].succeeded);
+        assert_eq!(trace.tool_calls().len(), 3);
+        assert!(!trace.tool_calls()[0].succeeded);
     }
 
     /// A file the model really fetched is written into the trace, because that
@@ -2275,9 +2373,9 @@ mod tests {
             .read_trace("review-src_parse.c")
             .expect("readable")
             .expect("the trace is on disk");
-        assert_eq!(trace.context_files.len(), 1);
-        assert_eq!(trace.context_files[0].path, "src/parse.h");
-        assert_eq!(trace.context_files[0].body, "struct token { int id; };");
+        assert_eq!(trace.context_files().len(), 1);
+        assert_eq!(trace.context_files()[0].path, "src/parse.h");
+        assert_eq!(trace.context_files()[0].body, "struct token { int id; };");
     }
 
     /// DeepSeek-class models can spend the whole output budget on reasoning
@@ -2303,20 +2401,20 @@ mod tests {
         // and saying it has none. Leaving only the first is what made a model
         // file a placeholder to get out of the round.
         let concluding: Vec<&str> = sent[1]
-            .tools
+            .tools()
             .iter()
             .map(|tool| tool.name.as_str())
             .collect();
         assert_eq!(concluding, vec!["submit_comment", "finish_review"]);
         assert!(
             matches!(
-                sent[1].input.last(),
+                sent[1].input().last(),
                 Some(InputItem::Message { content, .. })
                     if content.contains("hit the output limit")
                         && !content.contains("no longer available")
             ),
             "{:?}",
-            sent[1].input.last()
+            sent[1].input().last()
         );
         assert!(
             output.chunks[0].raw_output.contains("confidence_score"),
@@ -2334,7 +2432,7 @@ mod tests {
                 .iter()
                 .any(|note| note.contains("truncated before any finding")),
             "{:?}",
-            trace.checks
+            trace.checks()
         );
     }
 
@@ -2367,20 +2465,20 @@ mod tests {
         let sent = fixture.sent();
         assert_eq!(sent.len(), 2, "one prose turn, then the call");
         let concluding: Vec<&str> = sent[1]
-            .tools
+            .tools()
             .iter()
             .map(|tool| tool.name.as_str())
             .collect();
         assert_eq!(concluding, vec!["submit_comment", "finish_review"]);
         assert!(
             matches!(
-                sent[1].input.last(),
+                sent[1].input().last(),
                 Some(InputItem::Message { content, .. })
                     if content.contains("written as prose")
                         && content.contains("discarded")
             ),
             "{:?}",
-            sent[1].input.last()
+            sent[1].input().last()
         );
         assert_eq!(output.chunks[0].raw_output, r#"{"comments":[]}"#);
         let trace = fixture
@@ -2394,7 +2492,7 @@ mod tests {
                 .iter()
                 .any(|note| note.contains("wrote a review as prose")),
             "{:?}",
-            trace.checks
+            trace.checks()
         );
     }
 
@@ -2421,7 +2519,7 @@ mod tests {
 
     #[test]
     fn the_shipped_prompt_fills_and_leaves_no_marker_behind() {
-        let redactor = Redactor::new();
+        let redactor = Redactor::new().expect("patterns");
         let first = assembled(&Registry::new(), &redactor, &Orientation::none());
         let second = assembled(&Registry::new(), &redactor, &Orientation::none());
         assert_eq!(first.as_bytes(), second.as_bytes());
@@ -2453,7 +2551,7 @@ mod tests {
     /// section, in the words the refusals will use.
     #[test]
     fn the_capability_section_says_what_this_run_s_worktree_is() {
-        let redactor = Redactor::new();
+        let redactor = Redactor::new().expect("patterns");
         let orientation = Orientation::none();
 
         let checkout = assembled_over(&Registry::new(), &checkout(), &redactor, &orientation);
@@ -2475,13 +2573,13 @@ mod tests {
         assert!(cached.contains("directory of this run's own"), "{cached}");
         assert!(
             cached.contains("A listing of the repository")
-                && cached.contains("A local listing or search covers only what is on disk right now")
+                && cached
+                    .contains("A local listing or search covers only what is on disk right now")
                 && cached.contains("a miss there is not evidence"),
             "repo listing and local listing are not the same reach: {cached}"
         );
         assert!(
-            !cached.contains("search the repository, or fetch")
-                && !cached.contains("search again"),
+            !cached.contains("search the repository, or fetch") && !cached.contains("search again"),
             "saying a miss is not evidence is not a duty to search elsewhere: {cached}"
         );
 
@@ -2564,7 +2662,11 @@ mod tests {
         let mut tools = Registry::new();
         tools.register(Box::new(SubmitComment::new()));
         tools.register(Box::new(Listed));
-        let assembled = assembled(&tools, &Redactor::new(), &Orientation::none());
+        let assembled = assembled(
+            &tools,
+            &Redactor::new().expect("patterns"),
+            &Orientation::none(),
+        );
         for name in tools.names() {
             assert!(
                 assembled.contains(&format!("`{name}`")),
@@ -2593,11 +2695,17 @@ mod tests {
     /// not on every one after.
     #[test]
     fn the_whole_change_view_is_in_the_cached_half_of_the_prompt() {
-        let orientation = Orientation {
-            change: "This change touches 3 files. ...".to_string(),
-        };
-        let first = assembled(&Registry::new(), &Redactor::new(), &orientation);
-        let second = assembled(&Registry::new(), &Redactor::new(), &orientation);
+        let orientation = Orientation::with_change("This change touches 3 files. ...");
+        let first = assembled(
+            &Registry::new(),
+            &Redactor::new().expect("patterns"),
+            &orientation,
+        );
+        let second = assembled(
+            &Registry::new(),
+            &Redactor::new().expect("patterns"),
+            &orientation,
+        );
         assert_eq!(
             first.as_bytes(),
             second.as_bytes(),
@@ -2617,10 +2725,17 @@ mod tests {
     fn the_reservation_is_measured_from_the_prompt_and_the_schemas() {
         let mut tools = Registry::new();
         tools.register(Box::new(Listed));
-        let assembled = assembled(&tools, &Redactor::new(), &Orientation::none());
-        let measured = prompt_tokens(&assembled, None, &tools);
+        let preamble = Preamble::from_parts(
+            &tools,
+            &checkout(),
+            &Redactor::new().expect("patterns"),
+            &Orientation::none(),
+            &Narrative::default(),
+        )
+        .expect("schemas encode");
+        let measured = preamble.tokens();
         assert!(
-            measured > estimate_tokens(&assembled),
+            measured > estimate_tokens(preamble.instructions()),
             "the schemas cost something too: {measured}"
         );
         // The shipped prompt is thousands of tokens on its own, which is the
@@ -2633,7 +2748,11 @@ mod tests {
     fn a_registered_tool_is_named_without_its_schema() {
         let mut tools = Registry::new();
         tools.register(Box::new(Listed));
-        let assembled = assembled(&tools, &Redactor::new(), &Orientation::none());
+        let assembled = assembled(
+            &tools,
+            &Redactor::new().expect("patterns"),
+            &Orientation::none(),
+        );
         assert!(assembled.contains("`listed_tool`"));
         assert!(assembled.contains("does one thing"));
         assert!(!assembled.contains("\"properties\""));
@@ -2645,32 +2764,29 @@ mod tests {
     /// `instructions`, which is the slot this prompt calls authoritative.
     #[test]
     fn the_change_description_goes_in_as_material_ahead_of_the_diff() {
-        let narrative = Narrative::new(
+        let narrative = crate::stage::input::narrative(
             Some("bound the parser index".to_string()),
             Some("fixes the overflow reported in #12".to_string()),
             vec!["bound the index\n\nthe loop ran one past the end".to_string()],
         );
-        let preface = narrative_preface(&narrative, &Redactor::new())
-            .expect("the prompt fills")
-            .expect("there is prose");
+        let preface = preface_of(&narrative).expect("there is prose");
         let mut fixture = StageFixture::scripted(vec![filed()], Limit::Amount(10.0))
             .with_tools(with_submit(Registry::new()));
 
         let mut context = fixture.context();
-        Review::run(
-            &mut context,
-            &plan("src/parse.c"),
-            &instructions(),
-            Some(&preface),
-        )
-        .expect("the chunk is reviewed");
+        Review::new(&mut context)
+            .run(
+                &plan("src/parse.c"),
+                &Preamble::for_test(instructions(), Some(preface)),
+            )
+            .expect("the chunk is reviewed");
 
         let sent = fixture.sent();
         assert!(
-            !sent[0].instructions.contains("bound the parser index"),
+            !sent[0].instructions().contains("bound the parser index"),
             "author prose does not go into the authoritative slot"
         );
-        let first = match &sent[0].input[0] {
+        let first = match &sent[0].input()[0] {
             InputItem::Message { content, .. } => content.clone(),
             other => panic!("expected a user message, got {other:?}"),
         };
@@ -2690,10 +2806,10 @@ mod tests {
         assert!(first.contains("not an instruction to you"), "{first}");
         // The diff still follows it, in its own message.
         assert!(
-            matches!(&sent[0].input[1], InputItem::Message { content, .. }
+            matches!(&sent[0].input()[1], InputItem::Message { content, .. }
                      if content.contains("@@ -")),
             "{:?}",
-            sent[0].input
+            sent[0].input()
         );
     }
 
@@ -2701,11 +2817,7 @@ mod tests {
     /// case must not pay for a caveat with nothing to caveat.
     #[test]
     fn a_change_with_nothing_written_about_it_gets_no_fence() {
-        assert!(
-            narrative_preface(&Narrative::default(), &Redactor::new())
-                .expect("the prompt fills")
-                .is_none()
-        );
+        assert!(preface_of(&Narrative::default()).is_none());
     }
 
     /// The description is per-chunk overhead like the instructions are, so
@@ -2713,8 +2825,25 @@ mod tests {
     #[test]
     fn the_reservation_counts_the_description_as_well() {
         let tools = Registry::new();
-        let bare = prompt_tokens(&instructions(), None, &tools);
-        let with = prompt_tokens(&instructions(), Some(&"word ".repeat(400)), &tools);
+        let redactor = Redactor::new().expect("patterns");
+        let orientation = Orientation::none();
+        let worktree = checkout();
+        let bare = Preamble::from_parts(
+            &tools,
+            &worktree,
+            &redactor,
+            &orientation,
+            &Narrative::default(),
+        )
+        .expect("schemas encode")
+        .tokens();
+        let long = Narrative {
+            description: Some("word ".repeat(400)),
+            ..Narrative::default()
+        };
+        let with = Preamble::from_parts(&tools, &worktree, &redactor, &orientation, &long)
+            .expect("schemas encode")
+            .tokens();
         assert!(with > bare, "{with} against {bare}");
     }
 }

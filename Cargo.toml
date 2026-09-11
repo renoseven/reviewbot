@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 bitflags = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 globset = "0.4"
 regex = "1"

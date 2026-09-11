@@ -53,14 +53,13 @@ impl<E> Failure<E> {
 }
 
 impl Client {
-    pub fn new(timeout: Duration, backoff: Backoff) -> Self {
+    pub fn new(timeout: Duration, backoff: Backoff) -> Result<Self, reqwest::Error> {
         let inner = reqwest::blocking::Client::builder()
             .timeout(timeout)
             .connect_timeout(CONNECT_TIMEOUT)
             .user_agent(USER_AGENT)
-            .build()
-            .expect("reqwest TLS client");
-        Self { inner, backoff }
+            .build()?;
+        Ok(Self { inner, backoff })
     }
 
     pub fn get(&self, url: reqwest::Url) -> reqwest::blocking::RequestBuilder {
@@ -106,7 +105,7 @@ impl Client {
     where
         E: std::fmt::Display,
     {
-        let attempts = self.backoff.attempts();
+        let attempts = self.backoff.attempts().max(1);
         let mut last = None;
         for attempt in 0..attempts {
             match once() {
@@ -127,7 +126,10 @@ impl Client {
                 Err(failure) => return Err(failure.error),
             }
         }
-        Err(last.expect("attempts is at least one"))
+        match last {
+            Some(error) => Err(error),
+            None => once().map_err(|failure| failure.error),
+        }
     }
 }
 

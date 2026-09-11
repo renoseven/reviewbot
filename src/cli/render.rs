@@ -4,6 +4,7 @@
 use std::ffi::OsString;
 use std::path::Path;
 
+use chrono::{DateTime, Utc};
 use comfy_table::presets::ASCII_FULL_CONDENSED;
 use comfy_table::{ContentArrangement, Table};
 
@@ -12,7 +13,7 @@ use reviewbot::domain::{Confidence, Severity};
 use reviewbot::security::Redactor;
 use reviewbot::{Error, RunResult};
 
-use super::Failure;
+use super::app::Failure;
 use super::args::Format;
 
 /// How far the run got. The stages before it are implied: they walk in
@@ -33,14 +34,18 @@ pub(super) fn push_summary_line(out: &mut String, label: &str, value: &str) {
     out.push_str(&format!("{label:<SUMMARY_LABEL_WIDTH$} {value}\n"));
 }
 
+fn redact(text: &str) -> Result<String, Error> {
+    Ok(Redactor::new()?.redact(text))
+}
+
 /// stdout for a finished run.
-pub fn run_result(result: &RunResult, format: Format) -> String {
+pub fn run_result(result: &RunResult, format: Format) -> Result<String, Error> {
     let text = match format {
         Format::Json => serde_json::to_string_pretty(result)
             .unwrap_or_else(|error| format!("{{\"error\":\"{error}\"}}")),
         Format::Text => text_summary(result),
     };
-    Redactor::new().redact(&text)
+    redact(&text)
 }
 
 fn text_summary(result: &RunResult) -> String {
@@ -137,14 +142,14 @@ fn error_line(reason: &str) -> String {
 /// parse included, because they all arrive here as one value. This stream
 /// has printed nothing yet, so there is no blank line to set the sentence
 /// off from; that blank belongs on stdout, after a summary's fields.
-pub(super) fn failure(failure: &Failure) -> String {
+pub(super) fn failure(failure: &Failure) -> Result<String, Error> {
     let text = match failure {
         // clap wrote its own `error:` sentence, and the usage hint below it
         // is worth keeping, so the shape is all this has left to add.
         Failure::Usage(complaint) => complaint.render().to_string(),
         Failure::Command { error, invocation } => command_failure(error, invocation.as_deref()),
     };
-    Redactor::new().redact(&text)
+    redact(&text)
 }
 
 /// Names the run, because a run that got as far as its own directory is the
@@ -207,21 +212,21 @@ pub fn config_check(settings: &Settings, format: Format) -> Result<String, Error
     let selection = settings.selection()?;
     let text = match format {
         Format::Json => serde_json::json!({
-            "config": settings.config_path.display().to_string(),
+            "config": settings.config_path().display().to_string(),
             "model": selection.model.name,
             "selected_by": selection.reason.as_str(),
             "provider": selection.provider.name,
             "protocol": selection.provider.protocol,
             "currency": selection.provider.currency,
             "budget_per_run": selection.provider.budget_per_run,
-            "platforms": settings.config.platforms.len(),
-            "tools": settings.config.tools.len(),
+            "platforms": settings.config().platforms.len(),
+            "tools": settings.config().tools.len(),
             "ok": true,
         })
         .to_string(),
         Format::Text => {
             let mut out = String::new();
-            out.push_str(&check_field("Path", settings.config_path.display()));
+            out.push_str(&check_field("Path", settings.config_path().display()));
             out.push_str(&check_field("Provider", &selection.provider.name));
             out.push_str(&check_field("Credential", "readable"));
             out.push_str(&check_field(
@@ -231,14 +236,14 @@ pub fn config_check(settings: &Settings, format: Format) -> Result<String, Error
                     &selection.provider.currency,
                 ),
             ));
-            out.push_str(&check_field("Platforms", settings.config.platforms.len()));
-            out.push_str(&check_field("Models", settings.config.models.len()));
-            out.push_str(&check_field("Tools", settings.config.tools.len()));
+            out.push_str(&check_field("Platforms", settings.config().platforms.len()));
+            out.push_str(&check_field("Models", settings.config().models.len()));
+            out.push_str(&check_field("Tools", settings.config().tools.len()));
             out.push_str("ok\n");
             out
         }
     };
-    Ok(Redactor::new().redact(&text))
+    redact(&text)
 }
 
 /// Widest `config check` label, including the colon: `Credential:`.
@@ -252,12 +257,12 @@ fn check_field(label: &str, value: impl std::fmt::Display) -> String {
 }
 
 /// stdout for `config init`.
-pub fn config_init(path: &Path, format: Format) -> String {
+pub fn config_init(path: &Path, format: Format) -> Result<String, Error> {
     let text = match format {
         Format::Json => serde_json::json!({ "config": path.display().to_string() }).to_string(),
         Format::Text => format!("wrote {}\n", path.display()),
     };
-    Redactor::new().redact(&text)
+    redact(&text)
 }
 
 /// stdout for `config info`: the four catalogs as tables.
@@ -265,20 +270,20 @@ pub fn config_info(settings: &Settings, format: Format) -> Result<String, Error>
     let tools = reviewbot::tool::inventory(settings)?;
     let text = match format {
         Format::Json => serde_json::json!({
-            "config": settings.config_path.display().to_string(),
-            "log": settings.config.log,
+            "config": settings.config_path().display().to_string(),
+            "log": settings.config().log,
             "platforms": platform_values(settings),
             "providers": provider_values(settings),
             "models": model_values(settings),
-            "plan": settings.config.plan,
-            "review": settings.config.review,
-            "security": settings.config.security,
+            "plan": settings.config().plan,
+            "review": settings.config().review,
+            "security": settings.config().security,
             "tools": tools,
         })
         .to_string(),
         Format::Text => text_info(settings, &tools),
     };
-    Ok(Redactor::new().redact(&text))
+    redact(&text)
 }
 
 fn text_info(settings: &Settings, tools: &[reviewbot::tool::ToolListing]) -> String {
@@ -292,7 +297,7 @@ fn text_info(settings: &Settings, tools: &[reviewbot::tool::ToolListing]) -> Str
 }
 
 pub fn run_list(runs_dir: &Path, format: Format) -> Result<String, Error> {
-    let runs = reviewbot::record::list_runs(runs_dir)?;
+    let runs = reviewbot::record::Runs::open(runs_dir).list()?;
     let text = match format {
         Format::Json => serde_json::json!({
             "runs_dir": runs_dir.display().to_string(),
@@ -303,7 +308,7 @@ pub fn run_list(runs_dir: &Path, format: Format) -> Result<String, Error> {
             let mut out = format!("Runs dir  {}\n", runs_dir.display());
             if runs.is_empty() {
                 out.push_str("(no runs)\n");
-                return Ok(Redactor::new().redact(&out));
+                return redact(&out);
             }
             let rows: Vec<Vec<String>> = runs
                 .iter()
@@ -324,11 +329,11 @@ pub fn run_list(runs_dir: &Path, format: Format) -> Result<String, Error> {
             out
         }
     };
-    Ok(Redactor::new().redact(&text))
+    redact(&text)
 }
 
 pub fn run_show(runs_dir: &Path, run_id: &str, format: Format) -> Result<String, Error> {
-    let show = reviewbot::record::show_run(runs_dir, run_id)?;
+    let show = reviewbot::record::Runs::open(runs_dir).show(run_id)?;
     let text = match format {
         Format::Json => serde_json::to_string_pretty(&show)
             .unwrap_or_else(|error| format!("{{\"error\":\"{error}\"}}")),
@@ -365,10 +370,10 @@ pub fn run_show(runs_dir: &Path, run_id: &str, format: Format) -> Result<String,
             out
         }
     };
-    Ok(Redactor::new().redact(&text))
+    redact(&text)
 }
 
-pub fn run_prune(report: &reviewbot::record::PruneReport, format: Format) -> String {
+pub fn run_prune(report: &reviewbot::record::PruneReport, format: Format) -> Result<String, Error> {
     let pruned = report.deleted.len();
     let text = match format {
         Format::Json => {
@@ -387,7 +392,7 @@ pub fn run_prune(report: &reviewbot::record::PruneReport, format: Format) -> Str
             prune_sentence(pruned, report.kept.len(), report.dry_run)
         ),
     };
-    Redactor::new().redact(&text)
+    redact(&text)
 }
 
 fn prune_sentence(pruned: usize, kept: usize, dry_run: bool) -> String {
@@ -410,7 +415,7 @@ fn prune_sentence(pruned: usize, kept: usize, dry_run: bool) -> String {
 /// inline secret is refused at parse time, so there is nothing here to leak.
 fn platform_values(settings: &Settings) -> Vec<serde_json::Value> {
     settings
-        .config
+        .config()
         .platforms
         .iter()
         .map(|platform| {
@@ -426,7 +431,7 @@ fn platform_values(settings: &Settings) -> Vec<serde_json::Value> {
 
 fn platform_table(settings: &Settings) -> String {
     let rows: Vec<Vec<String>> = settings
-        .config
+        .config()
         .platforms
         .iter()
         .map(|platform| vec![platform.base_url.clone(), platform.api_token.clone()])
@@ -439,7 +444,7 @@ fn platform_table(settings: &Settings) -> String {
 /// spends nothing, and both are worth being able to read off a table.
 fn provider_values(settings: &Settings) -> Vec<serde_json::Value> {
     settings
-        .config
+        .config()
         .providers
         .iter()
         .map(|provider| {
@@ -457,7 +462,7 @@ fn provider_values(settings: &Settings) -> Vec<serde_json::Value> {
 
 fn provider_table(settings: &Settings) -> String {
     let rows: Vec<Vec<String>> = settings
-        .config
+        .config()
         .providers
         .iter()
         .map(|provider| {
@@ -492,7 +497,7 @@ fn budget(value: f64, currency: &str) -> String {
 fn model_values(settings: &Settings) -> Vec<serde_json::Value> {
     let default_name = default_model_name(settings);
     settings
-        .config
+        .config()
         .models
         .iter()
         .map(|model| {
@@ -516,7 +521,7 @@ fn model_values(settings: &Settings) -> Vec<serde_json::Value> {
 fn model_table(settings: &Settings) -> String {
     let default_name = default_model_name(settings);
     let rows: Vec<Vec<String>> = settings
-        .config
+        .config()
         .models
         .iter()
         .map(|model| {
@@ -558,7 +563,7 @@ fn model_table(settings: &Settings) -> String {
 
 fn default_model_name(settings: &Settings) -> Option<&str> {
     settings
-        .config
+        .config()
         .models
         .iter()
         .find(|model| model.default)
@@ -582,7 +587,7 @@ fn tool_table(tools: &[reviewbot::tool::ToolListing]) -> String {
 
 fn currency_of<'a>(settings: &'a Settings, provider: &str) -> &'a str {
     settings
-        .config
+        .config()
         .providers
         .iter()
         .find(|entry| entry.name == provider)
@@ -603,28 +608,13 @@ fn format_unix_utc(secs: u64) -> String {
     if secs == 0 {
         return "-".to_string();
     }
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    let hour = rem / 3600;
-    let minute = (rem % 3600) / 60;
-    let second = rem % 60;
-    let (year, month, day) = civil_from_days(days);
-    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC")
-}
-
-/// Civil date from days since Unix epoch. Howard Hinnant's algorithm.
-fn civil_from_days(days: i64) -> (i32, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let year = yoe as i32 + era as i32 * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { year + 1 } else { year };
-    (year, month, day)
+    let Ok(secs) = i64::try_from(secs) else {
+        return format!("{secs}");
+    };
+    match DateTime::<Utc>::from_timestamp(secs, 0) {
+        Some(when) => when.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        None => format!("{secs}"),
+    }
 }
 
 fn column_widths(headers: &[&str], rows: &[Vec<String>]) -> Vec<usize> {
@@ -778,7 +768,8 @@ mod tests {
         let text = failure(&Failure::Command {
             error: Box::new(stopped()),
             invocation: Some(words.to_vec()),
-        });
+        })
+        .expect("redacted");
         assert!(
             text.starts_with("error: "),
             "a failure on stderr is the whole of that stream: {text:?}"
@@ -793,7 +784,8 @@ mod tests {
         let elsewhere = failure(&Failure::Command {
             error: Box::new(stopped()),
             invocation: None,
-        });
+        })
+        .expect("redacted");
         assert!(elsewhere.contains("run_id: 7f3a9c1e\n"), "{elsewhere}");
         assert!(!elsewhere.contains("next:"), "{elsewhere}");
     }
@@ -819,7 +811,8 @@ mod tests {
                 recorded: "gitlab.com/acme/app #99".to_string(),
             }),
             invocation: Some(words.to_vec()),
-        });
+        })
+        .expect("redacted");
         assert!(text.starts_with("error: "), "{text:?}");
         assert!(text.contains("records a different input"), "{text}");
         assert!(text.contains("gitlab.com/acme/app #99"), "{text}");
@@ -836,7 +829,7 @@ mod tests {
             <super::super::args::Cli as clap::Parser>::try_parse_from(["reviewbot", "review"])
                 .expect_err("review needs something to review");
 
-        let text = failure(&Failure::Usage(complaint));
+        let text = failure(&Failure::Usage(complaint)).expect("redacted");
         assert!(text.starts_with("error: "), "{text:?}");
         assert!(text.contains("Usage:"), "{text}");
     }

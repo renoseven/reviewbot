@@ -22,6 +22,18 @@ use super::{
 /// is one or two round trips.
 const TREE_PAGE: &str = "100";
 
+fn locked<'a, T>(
+    mutex: &'a Mutex<T>,
+    host: &str,
+    what: &'static str,
+) -> Result<std::sync::MutexGuard<'a, T>, PlatformError> {
+    mutex.lock().map_err(|_| PlatformError::Request {
+        operation: "using cached platform state",
+        host: host.to_string(),
+        reason: format!("the {what} lock was poisoned"),
+    })
+}
+
 pub struct GitLab {
     entry: PlatformEntry,
     token: Secret,
@@ -30,14 +42,26 @@ pub struct GitLab {
 }
 
 impl GitLab {
-    pub fn new(entry: PlatformEntry, token: Secret, backoff: Backoff) -> Self {
+    pub fn for_host(
+        entry: PlatformEntry,
+        token: Secret,
+        backoff: Backoff,
+    ) -> Result<Self, PlatformError> {
+        Self::new(entry, token, backoff)
+    }
+
+    pub fn new(
+        entry: PlatformEntry,
+        token: Secret,
+        backoff: Backoff,
+    ) -> Result<Self, PlatformError> {
         let host = entry.host().unwrap_or("gitlab.com").to_string();
         let http = Arc::new(HttpClient::new(
             entry.base_url.clone(),
             host.clone(),
             token.expose(),
             backoff,
-        ));
+        )?);
         let repo = Arc::new(GitLabRepo {
             host,
             http: Arc::clone(&http),
@@ -46,12 +70,12 @@ impl GitLab {
             tree: Mutex::new(None),
             files: Mutex::new(BTreeMap::new()),
         });
-        Self {
+        Ok(Self {
             entry,
             token,
             http,
             repo,
-        }
+        })
     }
 
     /// `group/sub/project` has to travel as one path segment.
@@ -145,7 +169,12 @@ impl GitLab {
                 Vec::new()
             }
         };
-        Narrative::new(meta.title, meta.description, messages)
+        Narrative {
+            title: meta.title,
+            description: meta.description,
+            commits: messages,
+            more_commits: false,
+        }
     }
 
     fn meta(&self, change: &ChangeRef) -> Result<GitlabMergeRequest, PlatformError> {
@@ -363,8 +392,8 @@ impl Platform for GitLab {
         Ok(posted)
     }
 
-    fn bind_repo(&self, change: &ChangeRef, head_sha: &str) {
-        self.repo.bind(&change.project, head_sha);
+    fn bind_repo(&self, change: &ChangeRef, head_sha: &str) -> Result<(), PlatformError> {
+        self.repo.bind(&change.project, head_sha)
     }
 }
 
@@ -389,17 +418,16 @@ struct GitLabRepo {
 }
 
 impl GitLabRepo {
-    fn bind(&self, project: &str, sha: &str) {
-        *self.commit.lock().expect("commit") = Some(Commit {
+    fn bind(&self, project: &str, sha: &str) -> Result<(), PlatformError> {
+        *locked(&self.commit, &self.host, "commit")? = Some(Commit {
             project: project.to_string(),
             sha: sha.to_string(),
         });
+        Ok(())
     }
 
     fn commit(&self) -> Result<Commit, PlatformError> {
-        self.commit
-            .lock()
-            .expect("commit")
+        locked(&self.commit, &self.host, "commit")?
             .clone()
             .ok_or_else(|| PlatformError::Request {
                 operation: "reading the repository",
@@ -416,7 +444,7 @@ impl GitLabRepo {
     /// gone since GitLab 15.0, and the `Link: rel=next` header carries the
     /// `page_token` for the next page.
     fn tree(&self) -> Result<Vec<String>, PlatformError> {
-        if let Some(cached) = self.tree.lock().expect("tree").clone() {
+        if let Some(cached) = locked(&self.tree, &self.host, "tree")?.clone() {
             return Ok(cached);
         }
         let commit = self.commit()?;
@@ -439,12 +467,12 @@ impl GitLabRepo {
             .collect();
         paths.sort();
         paths.dedup();
-        *self.tree.lock().expect("tree") = Some(paths.clone());
+        *locked(&self.tree, &self.host, "tree")? = Some(paths.clone());
         Ok(paths)
     }
 
     fn body(&self, path: &str) -> Result<String, PlatformError> {
-        if let Some(cached) = self.files.lock().expect("files").get(path) {
+        if let Some(cached) = locked(&self.files, &self.host, "files")?.get(path) {
             return Ok(cached.clone());
         }
         let commit = self.commit()?;
@@ -462,10 +490,7 @@ impl GitLabRepo {
                 .get(url.clone())
                 .header("PRIVATE-TOKEN", self.token.expose())
         })?;
-        self.files
-            .lock()
-            .expect("files")
-            .insert(path.to_string(), response.body.clone());
+        locked(&self.files, &self.host, "files")?.insert(path.to_string(), response.body.clone());
         Ok(response.body)
     }
 
@@ -705,6 +730,7 @@ mod tests {
             Secret::from("test-gitlab-token".to_string()),
             Backoff::new(2),
         )
+        .expect("client")
     }
 
     fn sample_hunk() -> &'static str {
@@ -872,7 +898,10 @@ mod tests {
         );
         assert_eq!(
             fetched.narrative.commits,
-            vec!["bound the index", "add a test for it"]
+            vec![
+                "bound the index\n\nthe loop ran one past the end".to_string(),
+                "add a test for it".to_string(),
+            ]
         );
     }
 
@@ -1189,7 +1218,9 @@ mod tests {
             let change = change();
             move || {
                 let gitlab = gitlab(uri);
-                gitlab.bind_repo(&change, "head222222222222222222222222222222222222");
+                gitlab
+                    .bind_repo(&change, "head222222222222222222222222222222222222")
+                    .expect("bound");
                 let repo = gitlab.repo().source();
                 (
                     repo.list_files("src/**/*.c").expect("listed"),
@@ -1243,7 +1274,9 @@ mod tests {
             let change = change();
             move || {
                 let gitlab = gitlab(uri);
-                gitlab.bind_repo(&change, "head222222222222222222222222222222222222");
+                gitlab
+                    .bind_repo(&change, "head222222222222222222222222222222222222")
+                    .expect("bound");
                 let repo = gitlab.repo().source();
                 (
                     repo.read_file("src/parse.c", None).expect("read"),
@@ -1361,7 +1394,9 @@ mod tests {
             let change = change();
             move || {
                 let gitlab = gitlab(uri);
-                gitlab.bind_repo(&change, "head222222222222222222222222222222222222");
+                gitlab
+                    .bind_repo(&change, "head222222222222222222222222222222222222")
+                    .expect("bound");
                 gitlab.repo().source().size("src/parse.c").expect("sized")
             }
         })
@@ -1391,7 +1426,9 @@ mod tests {
             let change = change();
             move || {
                 let gitlab = gitlab(uri);
-                gitlab.bind_repo(&change, "head222222222222222222222222222222222222");
+                gitlab
+                    .bind_repo(&change, "head222222222222222222222222222222222222")
+                    .expect("bound");
                 crate::platform::source::contract::listing_without_sizes_has_none(
                     &*gitlab.repo().source(),
                 );

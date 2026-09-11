@@ -76,6 +76,44 @@ pub enum WorktreeError {
     TooBig { bytes: u64 },
 }
 
+/// A checkout on disk, before a run directory exists. The head sha goes
+/// into the run id, and the run id names the directory the worktree opens
+/// in, so this is asked first and on its own.
+pub struct Checkout {
+    root: PathBuf,
+}
+
+impl Checkout {
+    pub fn open(root: impl Into<PathBuf>) -> Result<Self, WorktreeError> {
+        let root = root.into();
+        if !root.is_dir() {
+            return Err(WorktreeError::NotADirectory { path: root });
+        }
+        Ok(Self { root })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The commit this checkout stands on, read straight off `.git/HEAD`
+    /// and one level of ref rather than by shelling out to git.
+    pub fn head(&self) -> Result<String, WorktreeError> {
+        let no_head = || WorktreeError::NoHead {
+            path: self.root.clone(),
+        };
+        let text =
+            std::fs::read_to_string(self.root.join(".git").join("HEAD")).map_err(|_| no_head())?;
+        let text = text.trim();
+        let Some(reference) = text.strip_prefix("ref: ") else {
+            return Ok(text.to_string());
+        };
+        std::fs::read_to_string(self.root.join(".git").join(reference))
+            .map(|sha| sha.trim().to_string())
+            .map_err(|_| no_head())
+    }
+}
+
 /// This run's worktree.
 pub enum Worktree {
     /// Nothing to read: a plain diff with no `--worktree` and no platform.
@@ -230,27 +268,6 @@ impl Worktree {
             // what was fetched, and the platform cannot fill the rest.
             Worktree::Local { .. } => Vec::new(),
         }
-    }
-
-    /// The commit a checkout stands on, read straight off `.git/HEAD` and one
-    /// level of ref rather than by shelling out to git.
-    ///
-    /// An associated function because `input` asks it before there is a
-    /// worktree to ask: the head sha goes into the run id, and the run id
-    /// names the directory the worktree is opened in.
-    pub fn head_at(root: &Path) -> Result<String, WorktreeError> {
-        let no_head = || WorktreeError::NoHead {
-            path: root.to_path_buf(),
-        };
-        let text =
-            std::fs::read_to_string(root.join(".git").join("HEAD")).map_err(|_| no_head())?;
-        let text = text.trim();
-        let Some(reference) = text.strip_prefix("ref: ") else {
-            return Ok(text.to_string());
-        };
-        std::fs::read_to_string(root.join(".git").join(reference))
-            .map(|sha| sha.trim().to_string())
-            .map_err(|_| no_head())
     }
 
     /// What is in the worktree directory right now, matching `glob`. On a
@@ -948,19 +965,27 @@ mod tests {
         std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").expect("HEAD");
         std::fs::write(git.join("refs/heads/main"), "4b1e0d2c\n").expect("ref");
         assert_eq!(
-            Worktree::head_at(directory.path()).expect("a head"),
+            Checkout::open(directory.path())
+                .expect("a directory")
+                .head()
+                .expect("a head"),
             "4b1e0d2c"
         );
 
         std::fs::write(git.join("HEAD"), "4b1e0d2c\n").expect("detached HEAD");
         assert_eq!(
-            Worktree::head_at(directory.path()).expect("a head"),
+            Checkout::open(directory.path())
+                .expect("a directory")
+                .head()
+                .expect("a head"),
             "4b1e0d2c"
         );
 
         let elsewhere = tempfile::tempdir().expect("temp dir");
         assert!(matches!(
-            Worktree::head_at(elsewhere.path()),
+            Checkout::open(elsewhere.path())
+                .expect("a directory")
+                .head(),
             Err(WorktreeError::NoHead { .. })
         ));
     }

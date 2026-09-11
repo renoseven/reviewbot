@@ -35,7 +35,7 @@ const MANIFEST_FILES: usize = 60;
 /// The run-constant block the prompt substitutes. Empty is a legal value: a
 /// single-file change has no manifest worth printing.
 pub struct Orientation {
-    pub change: String,
+    change: String,
 }
 
 impl Orientation {
@@ -50,6 +50,17 @@ impl Orientation {
         Self {
             change: String::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_change(change: impl Into<String>) -> Self {
+        Self {
+            change: change.into(),
+        }
+    }
+
+    pub fn change(&self) -> &str {
+        &self.change
     }
 }
 

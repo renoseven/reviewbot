@@ -7,17 +7,47 @@
 //! and it tells the accepted format from the refused one by content, never
 //! by file name.
 
-use std::collections::BTreeSet;
-use std::path::Path;
-
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 use crate::domain::{ChangeSet, DEV_NULL, FileChange, Hunk, Locator, Narrative, Stage};
 use crate::platform::ChangeRef;
 use crate::record::{InputIdentity, InputKind, InputRecord};
-use crate::worktree::{Worktree, WorktreeError};
+use crate::worktree::{Checkout, WorktreeError};
 
 use super::{Adapters, StageContext, StageError};
+
+/// Normalized on the way into a change set: blank prose is no prose, and a
+/// commit is its subject line only.
+pub(crate) fn narrative(
+    title: Option<String>,
+    description: Option<String>,
+    messages: Vec<String>,
+) -> Narrative {
+    let mut commits: Vec<String> = messages.iter().filter_map(|text| subject(text)).collect();
+    let more_commits = commits.len() > Narrative::COMMITS;
+    commits.truncate(Narrative::COMMITS);
+    Narrative {
+        title: prose(title),
+        description: prose(description),
+        commits,
+        more_commits,
+    }
+}
+
+fn prose(value: Option<String>) -> Option<String> {
+    value
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+fn subject(message: &str) -> Option<String> {
+    let line = message.lines().next()?.trim();
+    match line.is_empty() {
+        true => None,
+        false => Some(line.to_string()),
+    }
+}
 
 /// What the positional argument turned out to be. `http(s)://` is a platform
 /// URL, `-` is standard input, anything else is a diff file.
@@ -41,25 +71,30 @@ impl Source {
     }
 }
 
-pub struct Input;
+/// What this run is, resolved before the run directory exists because
+/// `run_id` is built from it — and so before there is a worktree.
+pub struct Opening<'a> {
+    adapters: &'a Adapters,
+    source: &'a Source,
+    checkout: Option<Checkout>,
+}
 
-impl Input {
-    /// What this run is, resolved before the run directory exists because
-    /// `run_id` is built from it — and so before there is a worktree. The
-    /// checkout is therefore read by path: `checkout` is `--worktree`, and
-    /// `Worktree::head_at` needs no instance.
-    pub fn identify(
-        adapters: &Adapters,
-        source: &Source,
-        checkout: Option<&Path>,
-    ) -> Result<InputRecord, StageError> {
-        match source {
+impl<'a> Opening<'a> {
+    pub fn new(adapters: &'a Adapters, source: &'a Source, checkout: Option<Checkout>) -> Self {
+        Self {
+            adapters,
+            source,
+            checkout,
+        }
+    }
+
+    pub fn identify(&self) -> Result<InputRecord, StageError> {
+        match self.source {
             Source::Url(url) => {
                 let change = ChangeRef::parse(url)?;
                 let platform =
-                    adapters
-                        .platform
-                        .as_ref()
+                    self.adapters
+                        .platform()
                         .ok_or_else(|| StageError::UnreadableInput {
                             reason: format!("no platform configured for {}", change.host),
                         })?;
@@ -73,8 +108,8 @@ impl Input {
                 // A checkout parked on another commit would make every line
                 // number wrong, so it is refused here — before the run
                 // directory exists, let alone anything being read out of it.
-                if let Some(root) = checkout {
-                    let actual = Worktree::head_at(root)?;
+                if let Some(checkout) = &self.checkout {
+                    let actual = checkout.head()?;
                     if actual != head_sha {
                         return Err(StageError::Worktree(WorktreeError::HeadMismatch {
                             actual,
@@ -97,8 +132,8 @@ impl Input {
                 // A cache the run fills for itself stands on no commit of its
                 // own, and that is recorded as an empty sha rather than
                 // invented: the run id is built out of this.
-                let head_sha = match checkout {
-                    Some(root) => Worktree::head_at(root)?,
+                let head_sha = match &self.checkout {
+                    Some(checkout) => checkout.head()?,
                     None => String::new(),
                 };
                 Ok(InputRecord {
@@ -110,33 +145,51 @@ impl Input {
             }
         }
     }
+}
+
+pub struct Input<'c, 'a> {
+    context: &'c mut StageContext<'a>,
+}
+
+impl<'c, 'a> Input<'c, 'a> {
+    pub fn new(context: &'c mut StageContext<'a>) -> Self {
+        Self { context }
+    }
 
     /// The change set itself. Nothing here reads the worktree: a change is
     /// whatever the platform's diff or the diff file says it is, and the
     /// commit a checkout stands on was settled by `identify`.
-    pub fn run(context: &mut StageContext<'_>, source: &Source) -> Result<ChangeSet, StageError> {
+    pub fn run(&mut self, source: &Source) -> Result<ChangeSet, StageError> {
         let changeset = match source {
-            Source::Url(url) => Self::from_platform(context, url)?,
-            Source::Diff { content, .. } => Self::from_diff(context, content)?,
+            Source::Url(url) => Self::from_platform(self.context, url)?,
+            Source::Diff { content, .. } => Self::from_diff(self.context, content)?,
         };
+        let changeset = Self::normalize_narrative(changeset);
         tracing::info!(
             files = changeset.files.len(),
             "input normalized into a change set"
         );
-        context.complete(Stage::Input, &changeset)?;
+        self.context.complete(Stage::Input, &changeset)?;
         Ok(changeset)
+    }
+
+    fn normalize_narrative(mut changeset: ChangeSet) -> ChangeSet {
+        changeset.narrative = narrative(
+            changeset.narrative.title,
+            changeset.narrative.description,
+            changeset.narrative.commits,
+        );
+        changeset
     }
 
     fn from_platform(context: &mut StageContext<'_>, url: &str) -> Result<ChangeSet, StageError> {
         let change = ChangeRef::parse(url)?;
-        let platform =
-            context
-                .adapters
-                .platform
-                .as_ref()
-                .ok_or_else(|| StageError::UnreadableInput {
-                    reason: format!("no platform configured for {}", change.host),
-                })?;
+        let platform = context
+            .adapters
+            .platform()
+            .ok_or_else(|| StageError::UnreadableInput {
+                reason: format!("no platform configured for {}", change.host),
+            })?;
         let fetched = platform.fetch_change(&change)?;
 
         // The platform's diff endpoint returns the same unified diff a local
@@ -284,9 +337,10 @@ impl Parser {
             // Without `diff --git` this pair is the only file boundary there
             // is, so a second `---` starts the next file.
             let starts_another = self.file.as_ref().is_none_or(|file| file.paired);
-            let file = match starts_another {
-                true => self.start_file(),
-                false => self.file.as_mut().expect("present"),
+            let file = if starts_another {
+                self.start_file()
+            } else {
+                self.file.get_or_insert_with(FileBuilder::default)
             };
             file.old_path = header_path(rest);
         } else if let Some(rest) = line.strip_prefix("+++ ") {
@@ -315,10 +369,7 @@ impl Parser {
     }
 
     fn file_mut(&mut self) -> &mut FileBuilder {
-        if self.file.is_none() {
-            self.file = Some(FileBuilder::default());
-        }
-        self.file.as_mut().expect("just created")
+        self.file.get_or_insert_with(FileBuilder::default)
     }
 
     fn close_hunk(&mut self) {
@@ -614,6 +665,33 @@ mod tests {
 
     fn lines(set: &BTreeSet<u32>) -> Vec<u32> {
         set.iter().copied().collect()
+    }
+
+    #[test]
+    fn a_narrative_drops_blank_prose_and_keeps_only_subjects() {
+        let written = narrative(
+            Some("  fix the parser  ".to_string()),
+            Some("   ".to_string()),
+            vec![
+                "bound the index\n\nthe loop ran one past the end".to_string(),
+                "\n".to_string(),
+            ],
+        );
+        assert_eq!(written.title.as_deref(), Some("fix the parser"));
+        assert!(written.description.is_none());
+        assert_eq!(written.commits, vec!["bound the index"]);
+        assert!(!written.more_commits);
+        assert!(!written.is_empty());
+    }
+
+    #[test]
+    fn a_long_branch_is_cut_and_says_so() {
+        let messages: Vec<String> = (0..Narrative::COMMITS + 5)
+            .map(|index| format!("commit {index}"))
+            .collect();
+        let written = narrative(None, None, messages);
+        assert_eq!(written.commits.len(), Narrative::COMMITS);
+        assert!(written.more_commits);
     }
 
     const TYPICAL: &str = "\

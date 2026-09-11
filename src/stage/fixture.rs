@@ -247,15 +247,15 @@ impl StageFixture {
         tools.register(Box::new(SubmitComment::new()));
         tools.register(Box::new(crate::tool::FinishReview::new()));
         tools.register(Box::new(crate::tool::SubmitSummary::new()));
-        let adapters = Adapters {
-            platform: None,
-            protocol: Box::new(ScriptedProtocol {
+        let adapters = Adapters::for_test(
+            None,
+            Box::new(ScriptedProtocol {
                 replies: Arc::clone(&replies),
                 sent: Arc::clone(&sent),
                 billed: Arc::clone(&billed),
             }),
-            redactor: Redactor::new(),
-        };
+            Redactor::new().expect("patterns"),
+        );
 
         let selection = settings.selection().expect("a selected model");
         let budget = Budget::restore(
@@ -265,7 +265,7 @@ impl StageFixture {
             0.0,
         );
         let storage: Arc<dyn Storage> = Arc::new(
-            LocalStorage::create(settings.options.runs_dir.join("test-run"))
+            LocalStorage::create(settings.options().runs_dir.join("test-run"))
                 .expect("run directory"),
         );
         let meta = Meta::start(
@@ -277,7 +277,7 @@ impl StageFixture {
                     identity: crate::record::InputIdentity::diff("--- a\n+++ b\n"),
                     head_sha: String::new(),
                 },
-                fingerprint: settings.fingerprint(),
+                fingerprint: settings.fingerprint().expect("serializable"),
             },
             &selection.model.name,
             &selection.provider.name,
@@ -285,9 +285,16 @@ impl StageFixture {
             false,
         );
         let lock = storage.lock().expect("run directory lock");
-        let recorder = Recorder::open(storage, lock, meta).expect("run directory");
+        let recorder = Recorder::open(
+            storage,
+            lock,
+            meta,
+            settings.config().review.max_tool_output_bytes as usize,
+            false,
+        )
+        .expect("run directory");
         let paths = PathPolicy::new(
-            &settings.config.security,
+            &settings.config().security,
             &settings.written_paths().expect("cwd"),
             None,
         )
@@ -319,7 +326,7 @@ impl StageFixture {
             tools: &self.tools,
             recorder: &mut self.recorder,
             budget: &mut self.budget,
-            redactor: &self.adapters.redactor,
+            redactor: self.adapters.redactor(),
             paths: &self.paths,
             progress: &self.progress,
         }
@@ -337,7 +344,7 @@ impl StageFixture {
     }
 
     pub fn with_platform(mut self, platform: Box<dyn crate::platform::Platform>) -> Self {
-        self.adapters.platform = Some(platform);
+        self.adapters.set_platform(platform);
         self
     }
 
@@ -354,7 +361,7 @@ impl StageFixture {
             Worktree::open(
                 None,
                 Some(repo),
-                &self.settings.options.runs_dir.join("test-run"),
+                &self.settings.options().runs_dir.join("test-run"),
             )
             .expect("a cache"),
         );
@@ -389,7 +396,7 @@ impl StageFixture {
     /// Shrinks the window the loop measures itself against, so a test can
     /// reach the context stop without scripting a megabyte of tool output.
     pub fn with_context_window(mut self, tokens: u32) -> Self {
-        for model in &mut self.settings.config.models {
+        for model in &mut self.settings.config_mut().models {
             model.context_window_tokens = tokens;
             model.max_output_tokens = tokens / 8;
         }
@@ -399,14 +406,12 @@ impl StageFixture {
     /// The count ceiling for one file. Tests that need to hit it without
     /// filling the window set a small one here.
     pub fn with_max_rounds(mut self, rounds: u32) -> Self {
-        self.settings.config.review.max_rounds = rounds;
+        self.settings.config_mut().review.max_rounds = rounds;
         self
     }
 
     pub fn enable_publish(&mut self) {
-        self.recorder
-            .set_publish_intent(true)
-            .expect("publish intent");
+        self.recorder.intend_publish().expect("publish intent");
     }
 
     /// Every request the scripted model received, in order.

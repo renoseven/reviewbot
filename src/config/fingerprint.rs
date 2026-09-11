@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 
 use crate::domain::Stage;
 
+use super::error::ConfigError;
 use super::file::Config;
 
 /// Three digests, each named after the earliest stage that can read what
@@ -57,7 +58,11 @@ impl Fingerprint {
 /// parse time. Neither do artifact locations (`--output-dir`, `--runs-dir`)
 /// or operational settings (`[log]`, `--retries`, `-q`, `--format`,
 /// `--publish`), none of which changes what a run concludes.
-pub fn fingerprint(config: &Config, model: Option<&str>, worktree: bool) -> Fingerprint {
+pub fn fingerprint(
+    config: &Config,
+    model: Option<&str>,
+    worktree: bool,
+) -> Result<Fingerprint, ConfigError> {
     // Destructured field by field rather than read through `config.x`: a
     // section added to `Config` stops compiling here until somebody names
     // the slice it belongs to, so a new setting cannot fall out of all three
@@ -75,16 +80,17 @@ pub fn fingerprint(config: &Config, model: Option<&str>, worktree: bool) -> Fing
         platforms,
         tools,
     } = config;
-    Fingerprint {
-        input: digest(&(platforms, worktree)),
-        plan: digest(plan),
-        review: digest(&(review, security, providers, models, tools, model)),
-    }
+    Ok(Fingerprint {
+        input: digest(&(platforms, worktree))?,
+        plan: digest(plan)?,
+        review: digest(&(review, security, providers, models, tools, model))?,
+    })
 }
 
-fn digest<T: Serialize>(value: &T) -> String {
-    let canonical = serde_json::to_vec(value).expect("config is serializable");
-    format!("{:x}", Sha256::digest(&canonical))
+fn digest<T: Serialize>(value: &T) -> Result<String, ConfigError> {
+    let canonical =
+        serde_json::to_vec(value).map_err(|source| ConfigError::Fingerprint { source })?;
+    Ok(format!("{:x}", Sha256::digest(&canonical)))
 }
 
 #[cfg(test)]
@@ -135,7 +141,7 @@ api_token = "GITLAB_TOKEN"
     }
 
     fn baseline() -> Fingerprint {
-        fingerprint(&config(), None, false)
+        fingerprint(&config(), None, false).expect("serializable")
     }
 
     /// The whole point of the split: which stage a change reaches is read
@@ -169,10 +175,10 @@ api_token = "GITLAB_TOKEN"
             base_url: "https://api.github.com".to_string(),
             api_token: "GITHUB_TOKEN".to_string(),
         });
-        let changed = fingerprint(&config, None, false);
+        let changed = fingerprint(&config, None, false).expect("serializable");
         assert_eq!(base.earliest_change(&changed), Some(Stage::Input));
 
-        let with_worktree = fingerprint(&self::config(), None, true);
+        let with_worktree = fingerprint(&self::config(), None, true).expect("serializable");
         assert_eq!(base.earliest_change(&with_worktree), Some(Stage::Input));
     }
 
@@ -180,7 +186,7 @@ api_token = "GITLAB_TOKEN"
     fn the_plan_table_is_the_plan_slice() {
         let mut config = config();
         config.plan.max_chunk_tokens = 12_000;
-        let changed = fingerprint(&config, None, false);
+        let changed = fingerprint(&config, None, false).expect("serializable");
 
         assert_eq!(baseline().earliest_change(&changed), Some(Stage::Plan));
         assert_eq!(
@@ -203,11 +209,11 @@ api_token = "GITLAB_TOKEN"
 
         let mut review = config();
         review.review.max_files_per_fetch = 5;
-        unchanged(&fingerprint(&review, None, false));
+        unchanged(&fingerprint(&review, None, false).expect("serializable"));
 
         let mut security = config();
         security.security.follow_symlinks = true;
-        unchanged(&fingerprint(&security, None, false));
+        unchanged(&fingerprint(&security, None, false).expect("serializable"));
 
         let mut provider = config();
         provider.providers.push(Provider {
@@ -218,7 +224,7 @@ api_token = "GITLAB_TOKEN"
             currency: "USD".to_string(),
             budget_per_run: 1.0,
         });
-        unchanged(&fingerprint(&provider, None, false));
+        unchanged(&fingerprint(&provider, None, false).expect("serializable"));
 
         let mut model = config();
         model.models.push(Model {
@@ -233,7 +239,7 @@ api_token = "GITLAB_TOKEN"
             max_output_tokens: 8_192,
             reasoning_effort: None,
         });
-        unchanged(&fingerprint(&model, None, false));
+        unchanged(&fingerprint(&model, None, false).expect("serializable"));
 
         let mut tool = config();
         tool.tools.push(ToolEntry {
@@ -246,9 +252,9 @@ api_token = "GITLAB_TOKEN"
             requires_build: false,
             timeout_ms: 60_000,
         });
-        unchanged(&fingerprint(&tool, None, false));
+        unchanged(&fingerprint(&tool, None, false).expect("serializable"));
 
-        unchanged(&fingerprint(&config(), Some("deepseek-v4-pro"), false));
+        unchanged(&fingerprint(&config(), Some("deepseek-v4-pro"), false).expect("serializable"));
     }
 
     /// A credential is a pointer in the config and a value only in memory,
@@ -259,7 +265,7 @@ api_token = "GITLAB_TOKEN"
         let base = baseline();
         let mut config = config();
         config.providers[0].api_key = "OTHER_KEY".to_string();
-        let changed = fingerprint(&config, None, false);
+        let changed = fingerprint(&config, None, false).expect("serializable");
 
         assert_eq!(base.earliest_change(&changed), Some(Stage::Review));
         for slice in [&changed.input, &changed.plan, &changed.review] {

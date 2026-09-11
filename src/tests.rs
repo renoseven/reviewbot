@@ -15,7 +15,7 @@ use crate::platform::{
 };
 use crate::progress::{Event, Outcome, Progress, Silent};
 use crate::protocol::{OutputItem, Protocol, ProtocolError, Request, Response};
-use crate::record::{LocalStorage, Storage, layout, prune_runs};
+use crate::record::{LocalStorage, Runs, Storage, layout};
 use crate::security::Redactor;
 use crate::stage::Adapters;
 use crate::tool::{SubmitComment, SubmitSummary};
@@ -131,11 +131,12 @@ impl FakePlatform {
     fn narrated(calls: Arc<Calls>) -> Self {
         let mut platform = Self::new(calls);
         platform.change.diff = DIFF.to_string();
-        platform.change.narrative = crate::domain::Narrative::new(
-            Some("bound the parser index".to_string()),
-            Some("fixes the overflow reported in #12".to_string()),
-            vec!["bound the index".to_string()],
-        );
+        platform.change.narrative = crate::domain::Narrative {
+            title: Some("bound the parser index".to_string()),
+            description: Some("fixes the overflow reported in #12".to_string()),
+            commits: vec!["bound the index".to_string()],
+            more_commits: false,
+        };
         platform
     }
 }
@@ -201,7 +202,13 @@ impl Platform for FakePlatform {
         Ok(posted)
     }
 
-    fn bind_repo(&self, _change: &ChangeRef, _head_sha: &str) {}
+    fn bind_repo(
+        &self,
+        _change: &ChangeRef,
+        _head_sha: &str,
+    ) -> Result<(), crate::platform::PlatformError> {
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -303,7 +310,7 @@ impl Protocol for FakeProtocol {
 /// the request has no tool for stays a message, which is how the "it only
 /// talked" paths are exercised.
 fn reply_as_calls(text: &str, request: &Request) -> Option<Vec<OutputItem>> {
-    let advertised = |name: &str| request.tools.iter().any(|tool| tool.name == name);
+    let advertised = |name: &str| request.tools().iter().any(|tool| tool.name == name);
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     if value.get("overall_score").is_some() {
         return advertised(SubmitSummary::NAME).then(|| {
@@ -357,11 +364,11 @@ fn reply_as_calls(text: &str, request: &Request) -> Option<Vec<OutputItem>> {
 /// URL run opens a cache in its run directory with this fake platform behind
 /// it, and a diff run has nothing to read at all.
 fn adapters(calls: Arc<Calls>) -> Adapters {
-    Adapters {
-        platform: Some(Box::new(FakePlatform::new(Arc::clone(&calls)))),
-        protocol: Box::new(FakeProtocol::new(calls, Arc::new(Mutex::new(Vec::new())))),
-        redactor: Redactor::new(),
-    }
+    Adapters::for_test(
+        Some(Box::new(FakePlatform::new(Arc::clone(&calls)))),
+        Box::new(FakeProtocol::new(calls, Arc::new(Mutex::new(Vec::new())))),
+        Redactor::new().expect("patterns"),
+    )
 }
 
 /// A URL run that really has something to say: a diff behind the change and a
@@ -371,15 +378,15 @@ fn publishing_adapters(calls: Arc<Calls>, mr: Arc<Mr>, replies: Vec<&str>) -> Ad
     let mut platform = FakePlatform::new(Arc::clone(&calls));
     platform.change.diff = DIFF.to_string();
     platform.mr = mr;
-    Adapters {
-        platform: Some(Box::new(platform)),
-        protocol: Box::new(FakeProtocol::scripted(
+    Adapters::for_test(
+        Some(Box::new(platform)),
+        Box::new(FakeProtocol::scripted(
             calls,
             Arc::new(Mutex::new(Vec::new())),
             replies,
         )),
-        redactor: Redactor::new(),
-    }
+        Redactor::new().expect("patterns"),
+    )
 }
 
 /// A URL run whose repository answers with a body that is not what the
@@ -390,15 +397,15 @@ fn writing_adapters(calls: Arc<Calls>, replies: Vec<&str>) -> Adapters {
     let mut platform = FakePlatform::new(Arc::clone(&calls));
     platform.change.diff = DIFF.to_string();
     platform.repo = Arc::new(FakeRepo::holding(&[("src/parse.c", REPO_PARSE)]));
-    Adapters {
-        platform: Some(Box::new(platform)),
-        protocol: Box::new(FakeProtocol::scripted(
+    Adapters::for_test(
+        Some(Box::new(platform)),
+        Box::new(FakeProtocol::scripted(
             calls,
             Arc::new(Mutex::new(Vec::new())),
             replies,
         )),
-        redactor: Redactor::new(),
-    }
+        Redactor::new().expect("patterns"),
+    )
 }
 
 /// A checker that writes a marker into cwd and prints the file it was
@@ -793,7 +800,9 @@ fn prune_takes_the_cache_and_the_checks_with_the_run() {
         "the checker wrote into checks/"
     );
 
-    let report = prune_runs(&workspace.runs_dir, 0, false).expect("pruned");
+    let report = Runs::open(&workspace.runs_dir)
+        .prune(0, false)
+        .expect("pruned");
     assert_eq!(report.deleted, vec![result.run_id.clone()]);
     assert!(!run_dir.exists(), "the run directory itself is gone");
     assert!(!cache.exists(), "the fetched files cannot outlive the run");
@@ -1013,14 +1022,17 @@ fn an_unreadable_meta_starts_a_fresh_run_and_still_lists() {
     let run_dir = workspace.run_dir(&first.run_id);
     std::fs::write(run_dir.join(layout::META), b"{ not json").expect("corrupt meta");
 
-    let rows = crate::record::list_runs(&workspace.runs_dir).expect("run list still answers");
+    let rows = Runs::open(&workspace.runs_dir)
+        .list()
+        .expect("run list still answers");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].run_id, first.run_id, "the directory is still named");
     assert!(
         rows[0].completed_stages.is_empty(),
         "and claims nothing it could not read"
     );
-    let show = crate::record::show_run(&workspace.runs_dir, &first.run_id)
+    let show = Runs::open(&workspace.runs_dir)
+        .show(&first.run_id)
         .expect("run show still answers");
     assert_eq!(show.run_id, first.run_id);
     assert_eq!(show.spent, 0.0);
@@ -1055,7 +1067,7 @@ fn an_unreadable_meta_starts_a_fresh_run_and_still_lists() {
 #[test]
 fn run_parameters_do_not_change_identity_but_conclusions_do() {
     let workspace = Workspace::new();
-    let baseline = workspace.settings().fingerprint();
+    let baseline = workspace.settings().fingerprint().expect("serializable");
 
     let noisy = workspace.settings_with(RunOptions {
         runs_dir: workspace.runs_dir.join("elsewhere"),
@@ -1065,7 +1077,7 @@ fn run_parameters_do_not_change_identity_but_conclusions_do() {
         ..RunOptions::default()
     });
     assert_eq!(
-        noisy.fingerprint(),
+        noisy.fingerprint().expect("serializable"),
         baseline,
         "--retries, --publish and artifact locations stay out of every slice"
     );
@@ -1075,7 +1087,7 @@ fn run_parameters_do_not_change_identity_but_conclusions_do() {
         ..RunOptions::default()
     });
     assert_eq!(
-        baseline.earliest_change(&other_model.fingerprint()),
+        baseline.earliest_change(&other_model.fingerprint().expect("serializable")),
         Some(Stage::Review),
         "--model is first read by review"
     );
@@ -1085,7 +1097,7 @@ fn run_parameters_do_not_change_identity_but_conclusions_do() {
         ..RunOptions::default()
     });
     assert_eq!(
-        baseline.earliest_change(&with_worktree.fingerprint()),
+        baseline.earliest_change(&with_worktree.fingerprint().expect("serializable")),
         Some(Stage::Input),
         "the content source mode is settled by input"
     );
@@ -1126,14 +1138,14 @@ fn a_diff_run_completes_without_a_platform() {
     let result = crate::review_with(
         &workspace.settings(),
         &source,
-        &Adapters {
-            platform: None,
-            protocol: Box::new(FakeProtocol::new(
+        &Adapters::for_test(
+            None,
+            Box::new(FakeProtocol::new(
                 Arc::new(Calls::default()),
                 Arc::new(Mutex::new(Vec::new())),
             )),
-            redactor: Redactor::new(),
-        },
+            Redactor::new().expect("patterns"),
+        ),
         &Silent,
     )
     .expect("run completes");
@@ -1185,23 +1197,22 @@ fn scripted_diff_adapters(
     replies: Vec<&str>,
 ) -> (Adapters, Arc<Mutex<Vec<Request>>>) {
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let adapters = Adapters {
-        platform: None,
-        protocol: Box::new(FakeProtocol::scripted(
+    let adapters = Adapters::for_test(
+        None,
+        Box::new(FakeProtocol::scripted(
             calls,
             Arc::clone(&requests),
             replies,
         )),
-        redactor: Redactor::new(),
-    };
+        Redactor::new().expect("patterns"),
+    );
     (adapters, requests)
 }
 
 #[test]
 fn a_real_diff_reaches_the_model_as_one_chunk_per_surviving_file() {
-    let workspace = Workspace::with_config(
-        &CONFIG.replace("[plan]", "[plan]\nskip_paths = [\"vendor/**\"]"),
-    );
+    let workspace =
+        Workspace::with_config(&CONFIG.replace("[plan]", "[plan]\nskip_paths = [\"vendor/**\"]"));
     let calls = Arc::new(Calls::default());
     let result = crate::review_with(
         &workspace.settings(),
@@ -1334,15 +1345,15 @@ fn what_the_author_wrote_reaches_every_review_request_as_material() {
     let workspace = Workspace::new();
     let calls = Arc::new(Calls::default());
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let adapters = Adapters {
-        platform: Some(Box::new(FakePlatform::narrated(Arc::clone(&calls)))),
-        protocol: Box::new(FakeProtocol::scripted(
+    let adapters = Adapters::for_test(
+        Some(Box::new(FakePlatform::narrated(Arc::clone(&calls)))),
+        Box::new(FakeProtocol::scripted(
             calls,
             Arc::clone(&requests),
             Vec::new(),
         )),
-        redactor: Redactor::new(),
-    };
+        Redactor::new().expect("patterns"),
+    );
 
     crate::review_with(
         &workspace.settings(),
@@ -1357,7 +1368,7 @@ fn what_the_author_wrote_reaches_every_review_request_as_material() {
         .iter()
         .filter(|request| {
             request
-                .tools
+                .tools()
                 .iter()
                 .any(|tool| tool.name == "submit_comment")
         })
@@ -1365,10 +1376,10 @@ fn what_the_author_wrote_reaches_every_review_request_as_material() {
     assert!(!review_turns.is_empty(), "the diff produced no chunk");
     for request in &review_turns {
         assert!(
-            !request.instructions.contains("bound the parser index"),
+            !request.instructions().contains("bound the parser index"),
             "author prose in the authoritative slot"
         );
-        match &request.input[0] {
+        match &request.input()[0] {
             crate::protocol::InputItem::Message { content, .. } => {
                 assert!(content.contains("bound the parser index"), "{content}");
                 assert!(content.contains("fixes the overflow"), "{content}");
@@ -1398,15 +1409,15 @@ fn instructions_are_byte_identical_across_two_chunks() {
         captured.len()
     );
     assert_eq!(
-        captured[0].instructions.as_bytes(),
-        captured[1].instructions.as_bytes()
+        captured[0].instructions().as_bytes(),
+        captured[1].instructions().as_bytes()
     );
-    assert_ne!(captured[0].input, captured[1].input);
+    assert_ne!(captured[0].input(), captured[1].input());
     assert!(
-        captured[0].instructions.contains("`submit_comment`"),
+        captured[0].instructions().contains("`submit_comment`"),
         "findings are delivered as a function call"
     );
-    assert!(!captured[0].instructions.contains("read_repo_file"));
+    assert!(!captured[0].instructions().contains("read_repo_file"));
 }
 
 /// One chunk's worth of answer, on a line the fixture diff really added.
@@ -1419,9 +1430,8 @@ const SCORE: &str = r#"{"overall_score":54,"summary":"one certain finding; read 
 
 #[test]
 fn a_scored_run_writes_the_report_and_a_second_run_does_not_score_again() {
-    let workspace = Workspace::with_config(
-        &CONFIG.replace("[plan]", "[plan]\nskip_paths = [\"vendor/**\"]"),
-    );
+    let workspace =
+        Workspace::with_config(&CONFIG.replace("[plan]", "[plan]\nskip_paths = [\"vendor/**\"]"));
     let source = workspace.diff_file();
     let calls = Arc::new(Calls::default());
     let (adapters, _) = scripted_diff_adapters(Arc::clone(&calls), vec![FINDING, SCORE]);
@@ -1489,9 +1499,8 @@ fn a_scored_run_writes_the_report_and_a_second_run_does_not_score_again() {
 /// nothing, because everything on it is already there.
 #[test]
 fn a_finished_run_entered_again_rewrites_the_report_and_says_nothing_twice() {
-    let workspace = Workspace::with_config(
-        &CONFIG.replace("[plan]", "[plan]\nskip_paths = [\"vendor/**\"]"),
-    );
+    let workspace =
+        Workspace::with_config(&CONFIG.replace("[plan]", "[plan]\nskip_paths = [\"vendor/**\"]"));
     let settings = workspace.settings_with(RunOptions {
         runs_dir: workspace.runs_dir.clone(),
         publish: true,
@@ -1582,7 +1591,7 @@ diff --git a/src/parse.c b/src/parse.c
         let sent = serde_json::to_string(request).expect("request json");
         assert!(!sent.contains(SECRET_KEY), "{sent}");
     }
-    match &captured[0].input[0] {
+    match &captured[0].input()[0] {
         crate::protocol::InputItem::Message { content, .. } => {
             assert!(content.contains("<redacted:api-key>"), "{content}");
         }
@@ -1763,10 +1772,10 @@ fn a_full_run_announces_every_stage_and_numbers_the_chunks() {
         "chunks are counted from 1, for a reader rather than for the loop"
     );
     assert!(
-        watcher.events().iter().any(|event| matches!(
-            event,
-            Event::Round { round: 1, of: 100 }
-        )),
+        watcher
+            .events()
+            .iter()
+            .any(|event| matches!(event, Event::Round { round: 1, of: 100 })),
         "a round is counted against [review].max_rounds"
     );
     assert!(
@@ -1782,9 +1791,8 @@ fn a_full_run_announces_every_stage_and_numbers_the_chunks() {
 /// finding is a tool call like any other; ending the file is a second one.
 #[test]
 fn a_tool_the_model_calls_is_named_as_it_goes_out_and_returns() {
-    let workspace = Workspace::with_config(
-        &CONFIG.replace("[plan]", "[plan]\nskip_paths = [\"vendor/**\"]"),
-    );
+    let workspace =
+        Workspace::with_config(&CONFIG.replace("[plan]", "[plan]\nskip_paths = [\"vendor/**\"]"));
     let watcher = Watcher::default();
     let (adapters, _) = scripted_diff_adapters(Arc::new(Calls::default()), vec![FINDING, SCORE]);
     crate::review_with(

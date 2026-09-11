@@ -121,17 +121,19 @@ impl Prompts {
 
     /// The one re-ask when a scoring call carried no verdict.
     pub const RESCORE: Template = Template::new("rescore", include_str!("../prompts/rescore.md"));
+}
 
+impl crate::worktree::Worktree {
     /// What this run's worktree is, in the words the model reads. One
     /// template per shape rather than one with a condition in it: a run that
     /// can read nothing needs a different paragraph, not an emptier one.
-    pub fn worktree(worktree: &crate::worktree::Worktree) -> Result<String, PromptError> {
-        let template = if worktree.is_checkout() {
-            Self::WORKTREE_LOCAL
-        } else if worktree.is_cache() {
-            Self::WORKTREE_CACHE
+    pub fn prompt_paragraph(&self) -> Result<String, PromptError> {
+        let template = if self.is_checkout() {
+            Prompts::WORKTREE_LOCAL
+        } else if self.is_cache() {
+            Prompts::WORKTREE_CACHE
         } else {
-            Self::WORKTREE_EMPTY
+            Prompts::WORKTREE_EMPTY
         };
         template.text()
     }
@@ -617,7 +619,9 @@ mod tests {
             "involved was read as a license to walk the neighborhood"
         );
         assert!(
-            !Prompts::REVIEW.body_for_tests().contains("Lookup as needed")
+            !Prompts::REVIEW
+                .body_for_tests()
+                .contains("Lookup as needed")
                 && !Prompts::REVIEW
                     .body_for_tests()
                     .contains("look that definition up")
@@ -861,7 +865,9 @@ mod tests {
             "without a checker for this language, compile guesses crowded out real findings"
         );
         assert!(
-            !Prompts::REVIEW.body_for_tests().contains("Run the checkers")
+            !Prompts::REVIEW
+                .body_for_tests()
+                .contains("Run the checkers")
                 && !Prompts::REVIEW
                     .body_for_tests()
                     .contains("call them in the very first round")

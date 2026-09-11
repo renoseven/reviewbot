@@ -28,8 +28,8 @@ use crate::worktree::{Worktree, WorktreeError};
 
 use super::availability::{
     NO_FILES_PRECONDITION, NO_FILES_SHORT, NO_KEYWORD_PRECONDITION, NO_KEYWORD_SHORT,
-    NO_REGEX_PRECONDITION, NO_REGEX_SHORT, NO_REPO_PRECONDITION, NO_REPO_SHORT,
-    no_files, no_keyword_search, no_regex_search, no_repo, unavailable_description,
+    NO_REGEX_PRECONDITION, NO_REGEX_SHORT, NO_REPO_PRECONDITION, NO_REPO_SHORT, no_files,
+    no_keyword_search, no_regex_search, no_repo, unavailable_description,
 };
 use super::signature::{Arguments, Parameter, Shape, Signature};
 use super::{Purpose, Round, Tool, ToolError, ToolOutput};
@@ -670,8 +670,7 @@ impl ReadLocalFile {
              and a single answer may carry at most {} bytes, so a read that would not fit is \
              refused with the file's size. The path must be one the diff or a listing gave you: a \
              guessed path that misses costs a whole round.",
-            limits.max_file_bytes,
-            limits.max_output_bytes,
+            limits.max_file_bytes, limits.max_output_bytes,
         )
     }
 }
@@ -932,8 +931,7 @@ impl FetchRepoFile {
         format!(
             "{WHAT} A file over {} bytes is refused without being downloaded. At most {} paths; a \
              longer list is refused without fetching any.",
-            limits.max_file_bytes,
-            limits.max_files_per_fetch,
+            limits.max_file_bytes, limits.max_files_per_fetch,
         )
     }
 }

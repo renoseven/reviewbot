@@ -41,38 +41,8 @@ impl Narrative {
     /// per token than anything else in the prompt.
     pub const COMMITS: usize = 20;
 
-    /// Normalized on the way in: blank prose is no prose, and a commit is
-    /// its subject line only — the body tends to repeat the description,
-    /// and paying twice for the same paragraph is the one thing a summary
-    /// must not do.
-    pub fn new(title: Option<String>, description: Option<String>, messages: Vec<String>) -> Self {
-        let mut commits: Vec<String> = messages.iter().filter_map(|text| subject(text)).collect();
-        let more_commits = commits.len() > Self::COMMITS;
-        commits.truncate(Self::COMMITS);
-        Self {
-            title: prose(title),
-            description: prose(description),
-            commits,
-            more_commits,
-        }
-    }
-
     pub fn is_empty(&self) -> bool {
         self.title.is_none() && self.description.is_none() && self.commits.is_empty()
-    }
-}
-
-fn prose(value: Option<String>) -> Option<String> {
-    value
-        .map(|text| text.trim().to_string())
-        .filter(|text| !text.is_empty())
-}
-
-fn subject(message: &str) -> Option<String> {
-    let line = message.lines().next()?.trim();
-    match line.is_empty() {
-        true => None,
-        false => Some(line.to_string()),
     }
 }
 
@@ -124,33 +94,6 @@ pub struct Hunk {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_narrative_drops_blank_prose_and_keeps_only_subjects() {
-        let narrative = Narrative::new(
-            Some("  fix the parser  ".to_string()),
-            Some("   ".to_string()),
-            vec![
-                "bound the index\n\nthe loop ran one past the end".to_string(),
-                "\n".to_string(),
-            ],
-        );
-        assert_eq!(narrative.title.as_deref(), Some("fix the parser"));
-        assert!(narrative.description.is_none());
-        assert_eq!(narrative.commits, vec!["bound the index"]);
-        assert!(!narrative.more_commits);
-        assert!(!narrative.is_empty());
-    }
-
-    #[test]
-    fn a_long_branch_is_cut_and_says_so() {
-        let messages: Vec<String> = (0..Narrative::COMMITS + 5)
-            .map(|index| format!("commit {index}"))
-            .collect();
-        let narrative = Narrative::new(None, None, messages);
-        assert_eq!(narrative.commits.len(), Narrative::COMMITS);
-        assert!(narrative.more_commits);
-    }
 
     #[test]
     fn a_diff_has_no_narrative_at_all() {
