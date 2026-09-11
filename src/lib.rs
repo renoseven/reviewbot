@@ -168,7 +168,7 @@ impl Error {
             // breaking, and a CI job that branches on the exit code has to
             // be able to tell the two apart.
             | Error::Stage(StageError::UnreadableInput { .. })
-            | Error::Record(RecordError::RunNotFound { .. })
+            | Error::Record(RecordError::RunNotFound { .. } | RecordError::TraceNotFound { .. })
             | Error::Stage(StageError::Record(RecordError::RunNotFound { .. }))
             | Error::Stage(StageError::Worktree(
                 WorktreeError::NotADirectory { .. }
@@ -195,6 +195,7 @@ impl Error {
             Error::InRun { run_id, .. } => Some(run_id),
             Error::DifferentInput { run_id, .. } => Some(run_id),
             Error::Record(RecordError::RunNotFound { run_id, .. }) => Some(run_id),
+            Error::Record(RecordError::TraceNotFound { run_id, .. }) => Some(run_id),
             Error::Stage(StageError::Record(RecordError::RunNotFound { run_id, .. })) => {
                 Some(run_id)
             }

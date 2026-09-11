@@ -13,6 +13,8 @@ pub enum RecordError {
     LockHeld,
     #[error("no run {run_id} under {runs_dir}")]
     RunNotFound { run_id: String, runs_dir: PathBuf },
+    #[error("no trace {trace_id} in run {run_id}")]
+    TraceNotFound { run_id: String, trace_id: String },
     #[error("cannot serialize {file}: {source}")]
     Serialize {
         file: String,

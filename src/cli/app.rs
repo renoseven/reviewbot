@@ -180,6 +180,13 @@ fn dispatch(cli: &Cli, log: &LogSink) -> Result<Finished, Error> {
         Command::Run(RunCommand::Show { run_id }) => {
             render::run_show(&runs_dir(&cli.global), run_id, cli.global.format).map(Finished::ok)
         }
+        Command::Run(RunCommand::Trace { run_id, trace_id }) => render::run_traces(
+            &runs_dir(&cli.global),
+            run_id,
+            trace_id.as_deref(),
+            cli.global.format,
+        )
+        .map(Finished::ok),
         Command::Run(RunCommand::Remove { run_id }) => {
             reviewbot::record::Runs::open(runs_dir(&cli.global)).remove(run_id)?;
             Ok(Finished::ok(String::new()))

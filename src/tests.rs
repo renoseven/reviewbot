@@ -15,7 +15,7 @@ use crate::platform::{
 };
 use crate::progress::{Event, Outcome, Progress, Silent};
 use crate::protocol::{OutputItem, Protocol, ProtocolError, Request, Response};
-use crate::record::{LocalStorage, Runs, Storage, layout};
+use crate::record::{LocalStorage, Runs, Storage, Trace, layout};
 use crate::security::Redactor;
 use crate::stage::Adapters;
 use crate::tool::{SubmitComment, SubmitSummary};
@@ -1467,7 +1467,10 @@ fn a_scored_run_writes_the_report_and_a_second_run_does_not_score_again() {
     );
     assert!(report.contains("overall: 54 / 100"), "{report}");
     assert!(
-        report.contains("trace: `review-src_parse.c`"),
+        report.contains(&format!(
+            "trace: `{}`",
+            Trace::for_review("src/parse.c", None).trace_id()
+        )),
         "the report names the trace id instead of inlining it: {report}"
     );
     assert!(

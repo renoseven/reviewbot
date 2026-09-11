@@ -148,6 +148,26 @@ pub enum RunCommand {
         run_id: String,
     },
 
+    /// Show a run's review conversations
+    #[command(long_about = "Print the review conversations of a run.\n\n\
+                      Each conversation is a section: the prompt that went out, that \
+                      file's diff, every tool call (name, arguments, result, duration, \
+                      success), the model's reply, its chain of thought, and the token \
+                      usage. A file cut into pieces has one conversation per piece. \
+                      Conversations are printed oldest first, in the order they were \
+                      written.\n\n\
+                      `--trace-id` keeps one conversation. Without it every conversation \
+                      is printed. Trace ids are sixteen hex characters, the same shape \
+                      as a run id; the report and the published comments name that id.")]
+    Trace {
+        /// Run id
+        run_id: String,
+
+        /// One trace id
+        #[arg(long, value_name = "ID")]
+        trace_id: Option<String>,
+    },
+
     /// Delete one run
     #[command(long_about = "Delete one run directory by id.\n\n\
                       The run takes its report, its summary, its log, its traces and its \
@@ -270,6 +290,8 @@ mod tests {
             vec!["config", "init"],
             // The four catalogs; the tool table is the short columns.
             vec!["config", "info"],
+            // What a conversation prints, and what `--trace-id` keeps.
+            vec!["run", "trace"],
         ] {
             let mut found = &command;
             for name in &path {
@@ -312,6 +334,15 @@ mod tests {
             ],
             vec!["reviewbot", "run", "list"],
             vec!["reviewbot", "run", "show", "7f3a9c1e"],
+            vec!["reviewbot", "run", "trace", "7f3a9c1e"],
+            vec![
+                "reviewbot",
+                "run",
+                "trace",
+                "7f3a9c1e",
+                "--trace-id",
+                "a1b2c3d4e5f67890",
+            ],
             vec!["reviewbot", "run", "remove", "7f3a9c1e"],
             vec!["reviewbot", "run", "prune"],
             vec![
@@ -349,7 +380,7 @@ mod tests {
         );
         assert_eq!(
             names_of(root.find_subcommand("run").expect("run")),
-            ["list", "show", "remove", "prune"]
+            ["list", "show", "trace", "remove", "prune"]
         );
     }
 
@@ -413,6 +444,21 @@ mod tests {
                 Cli::try_parse_from(&arguments).is_err(),
                 "{arguments:?} should no longer parse"
             );
+        }
+    }
+
+    /// Conversations belong to a run. A top-level `trace` would be a second
+    /// noun for the same directory `run show` already names.
+    #[test]
+    fn trace_is_under_run_not_a_top_level_noun() {
+        assert!(Cli::try_parse_from(["reviewbot", "trace", "7f3a9c1e"]).is_err());
+        let cli = Cli::try_parse_from(["reviewbot", "run", "trace", "7f3a9c1e"]).unwrap();
+        match cli.command {
+            Command::Run(RunCommand::Trace { run_id, trace_id }) => {
+                assert_eq!(run_id, "7f3a9c1e");
+                assert!(trace_id.is_none());
+            }
+            other => panic!("expected run trace, got {other:?}"),
         }
     }
 

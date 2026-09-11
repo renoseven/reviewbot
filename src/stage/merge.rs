@@ -32,10 +32,6 @@ pub const QUOTE_UNVERIFIED: &str = "quote unverified";
 /// reuses it because alignment has just moved the line by up to that much.
 const ALIGN_WINDOW: u32 = 3;
 
-/// The scoring call belongs to no single comment, so it gets a trace of its
-/// own rather than sharing a comment's.
-const SUMMARY_TRACE_ID: &str = "merge-summary";
-
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct MergeOutput {
     pub comments: Vec<Comment>,
@@ -734,7 +730,7 @@ impl<'c, 'a> Merge<'c, 'a> {
             return Ok(Err(Unscored::Unaffordable(error.to_string())));
         }
 
-        let mut trace = Trace::new(SUMMARY_TRACE_ID);
+        let mut trace = Trace::for_summary();
         trace.set_prompt(request.instructions());
         let outcome = Self::ask_for_score(context, &request, &mut trace);
         context.recorder.write_trace(&trace)?;
@@ -1364,6 +1360,10 @@ mod tests {
         notes_by(fixture, trace_id, Stage::Merge)
     }
 
+    fn summary_id() -> String {
+        Trace::for_summary().trace_id().to_string()
+    }
+
     fn merge(
         fixture: &mut StageFixture,
         changeset: &ChangeSet,
@@ -1577,7 +1577,7 @@ mod tests {
         // reader can see what the score was computed from.
         let trace = fixture
             .recorder()
-            .read_trace("merge-summary")
+            .read_trace(&summary_id())
             .expect("readable")
             .expect("the trace is on disk");
         assert_eq!(trace.tool_calls().len(), 1);
@@ -1611,7 +1611,7 @@ mod tests {
 
         assert_eq!(output.overall_score, Some(70));
         assert_eq!(fixture.sent().len(), 2);
-        let checks = checks_of(&fixture, "merge-summary");
+        let checks = checks_of(&fixture, &summary_id());
         assert!(
             checks
                 .iter()

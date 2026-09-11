@@ -46,10 +46,16 @@ impl InputIdentity {
 
     /// `head_sha` is empty for diff input without `--worktree`.
     pub fn run_id(&self, head_sha: &str) -> String {
-        const LENGTH: usize = 16;
-        let digest = Sha256::digest(format!("{}\n{head_sha}", self.key()).as_bytes());
-        format!("{digest:x}")[..LENGTH].to_string()
+        hex_id(&format!("{}\n{head_sha}", self.key()))
     }
+}
+
+/// Sixteen lowercase hex characters. `run_id` and `trace_id` share the shape
+/// so a person tells them apart by where they appear, not by how they look.
+pub(crate) const ID_LENGTH: usize = 16;
+
+pub(crate) fn hex_id(material: &str) -> String {
+    format!("{:x}", Sha256::digest(material.as_bytes()))[..ID_LENGTH].to_string()
 }
 
 #[cfg(test)]

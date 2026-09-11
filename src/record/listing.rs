@@ -7,8 +7,10 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
+use crate::budget::TokenUsage;
 use crate::domain::{Confidence, Stage};
 
+use super::trace::{ToolCall, Trace};
 use super::{LocalStorage, Meta, RecordError, Recorder, Storage, layout};
 
 /// Comment counts by band, matching `summary.json` so `run show` can
@@ -61,6 +63,45 @@ pub struct RunShow {
     pub traces: PathBuf,
 }
 
+/// What `trace` prints: the conversations of one run, already filtered.
+#[derive(Clone, Debug, Serialize)]
+pub struct TraceListing {
+    pub run_id: String,
+    pub traces: Vec<ListedTrace>,
+}
+
+/// The fields `trace` shows. Notes, context bodies and the published view
+/// stay on disk; this is the conversation a person asked for.
+#[derive(Clone, Debug, Serialize)]
+pub struct ListedTrace {
+    pub file: String,
+    pub trace_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub piece: Option<u32>,
+    pub prompt: String,
+    pub diff: String,
+    pub tool_calls: Vec<ToolCall>,
+    pub model_output: String,
+    pub reasoning: String,
+    pub usage: TokenUsage,
+}
+
+impl ListedTrace {
+    fn from_trace(trace: Trace) -> Self {
+        Self {
+            file: trace.path().to_string(),
+            trace_id: trace.trace_id().to_string(),
+            piece: trace.piece(),
+            prompt: trace.prompt().to_string(),
+            diff: trace.diff().to_string(),
+            tool_calls: trace.tool_calls().to_vec(),
+            model_output: trace.model_output().to_string(),
+            reasoning: trace.reasoning().to_string(),
+            usage: *trace.usage(),
+        }
+    }
+}
+
 /// What `run prune` did, or would do.
 #[derive(Clone, Debug, Serialize)]
 pub struct PruneReport {
@@ -99,6 +140,14 @@ impl Runs {
 
     pub fn remove(&self, run_id: &str) -> Result<(), RecordError> {
         remove_run(&self.dir, run_id)
+    }
+
+    pub fn traces(
+        &self,
+        run_id: &str,
+        trace_id: Option<&str>,
+    ) -> Result<TraceListing, RecordError> {
+        list_traces(&self.dir, run_id, trace_id)
     }
 
     pub fn count(&self) -> Result<usize, RecordError> {
@@ -230,8 +279,98 @@ fn show_run(runs_dir: &Path, run_id: &str) -> Result<RunShow, RecordError> {
         report: directory.join(layout::REPORT),
         summary: directory.join(layout::SUMMARY),
         log: directory.join(layout::LOG),
-        traces: directory.join("traces"),
+        traces: directory.join(layout::TRACES),
     })
+}
+
+fn list_traces(
+    runs_dir: &Path,
+    run_id: &str,
+    trace_id: Option<&str>,
+) -> Result<TraceListing, RecordError> {
+    if !is_run_id(run_id) {
+        return Err(RecordError::RunNotFound {
+            run_id: run_id.to_string(),
+            runs_dir: runs_dir.to_path_buf(),
+        });
+    }
+    let directory = runs_dir.join(run_id);
+    if !directory.is_dir() {
+        return Err(RecordError::RunNotFound {
+            run_id: run_id.to_string(),
+            runs_dir: runs_dir.to_path_buf(),
+        });
+    }
+    if let Some(trace_id) = trace_id
+        && !is_run_id(trace_id)
+    {
+        return Err(RecordError::TraceNotFound {
+            run_id: run_id.to_string(),
+            trace_id: trace_id.to_string(),
+        });
+    }
+    let mut traces = read_traces(&directory)?;
+    if let Some(wanted) = trace_id {
+        traces.retain(|(_, trace)| trace.trace_id() == wanted);
+        if traces.is_empty() {
+            return Err(RecordError::TraceNotFound {
+                run_id: run_id.to_string(),
+                trace_id: wanted.to_string(),
+            });
+        }
+    }
+    traces.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then(left.1.trace_id().cmp(right.1.trace_id()))
+    });
+    Ok(TraceListing {
+        run_id: run_id.to_string(),
+        traces: traces
+            .into_iter()
+            .map(|(_, trace)| ListedTrace::from_trace(trace))
+            .collect(),
+    })
+}
+
+fn read_traces(directory: &Path) -> Result<Vec<(SystemTime, Trace)>, RecordError> {
+    let traces = directory.join(layout::TRACES);
+    let entries = match fs::read_dir(&traces) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(RecordError::Io {
+                path: traces,
+                source,
+            });
+        }
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| RecordError::Io {
+            path: traces.clone(),
+            source,
+        })?;
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let bytes = fs::read(&path).map_err(|source| RecordError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        match serde_json::from_slice::<Trace>(&bytes) {
+            Ok(trace) => found.push((mtime(&path), trace)),
+            Err(error) => {
+                tracing::warn!(
+                    file = %path.display(),
+                    %error,
+                    "trace will not parse"
+                );
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// Keep the newest `keep` run directories; delete the rest, report.md
@@ -331,13 +470,18 @@ fn mtime(path: &Path) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::{Trace, layout};
     use std::time::{Duration, SystemTime};
+
+    fn touch(path: &Path, secs: u64) {
+        let time = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+        let file = fs::File::open(path).expect("open");
+        file.set_modified(time).expect("mtime");
+    }
 
     fn touch_dir(path: &Path, secs: u64) {
         fs::create_dir_all(path).expect("dir");
-        let time = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
-        let file = fs::File::open(path).expect("open dir");
-        file.set_modified(time).expect("mtime");
+        touch(path, secs);
     }
 
     #[test]
@@ -411,5 +555,80 @@ mod tests {
         let rows = catalog.list().expect("empty");
         assert!(rows.is_empty());
         assert_eq!(catalog.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn traces_are_listed_oldest_first_and_can_be_filtered() {
+        let root = tempfile::tempdir().expect("temp");
+        let runs = root.path().join("runs");
+        let run = runs.join("2dc40c10f9a4d1b8");
+        let traces = run.join(layout::TRACES);
+        fs::create_dir_all(&traces).expect("traces");
+
+        let mut lex = Trace::for_review("src/lex.c", None);
+        lex.set_prompt("review lex");
+        lex.set_diff("@@ lex @@");
+        lex.set_model_output("lex is fine");
+        write_listed(&traces, &lex);
+
+        let mut parse = Trace::for_review("src/parse.c", Some(2));
+        parse.set_prompt("review parse piece 2");
+        parse.set_diff("@@ parse 2 @@");
+        write_listed(&traces, &parse);
+        let mut first = Trace::for_review("src/parse.c", Some(1));
+        first.set_prompt("review parse piece 1");
+        first.set_diff("@@ parse 1 @@");
+        write_listed(&traces, &first);
+
+        let mut summary = Trace::for_summary();
+        summary.set_prompt("score these");
+        write_listed(&traces, &summary);
+
+        touch(&traces.join(format!("{}.json", first.trace_id())), 100);
+        touch(&traces.join(format!("{}.json", lex.trace_id())), 200);
+        touch(&traces.join(format!("{}.json", parse.trace_id())), 300);
+        touch(&traces.join(format!("{}.json", summary.trace_id())), 400);
+
+        let catalog = Runs::open(&runs);
+        let all = catalog.traces("2dc40c10f9a4d1b8", None).expect("listed");
+        let files: Vec<(&str, Option<u32>)> = all
+            .traces
+            .iter()
+            .map(|row| (row.file.as_str(), row.piece))
+            .collect();
+        assert_eq!(
+            files,
+            [
+                ("src/parse.c", Some(1)),
+                ("src/lex.c", None),
+                ("src/parse.c", Some(2)),
+                ("", None),
+            ],
+            "mtime order, not path order"
+        );
+
+        let one = catalog
+            .traces("2dc40c10f9a4d1b8", Some(lex.trace_id()))
+            .expect("filtered");
+        assert_eq!(one.traces.len(), 1);
+        assert_eq!(one.traces[0].file, "src/lex.c");
+        assert_eq!(one.traces[0].prompt, "review lex");
+
+        assert!(matches!(
+            catalog.traces("2dc40c10f9a4d1b8", Some("deadbeefdeadbeef")),
+            Err(RecordError::TraceNotFound { .. })
+        ));
+        assert!(matches!(
+            catalog.traces("missing", None),
+            Err(RecordError::RunNotFound { .. })
+        ));
+    }
+
+    fn write_listed(dir: &Path, trace: &Trace) {
+        fs::write(
+            dir.join(format!("{}.json", trace.trace_id())),
+            serde_json::to_vec(trace).expect("json"),
+        )
+        .expect("written");
     }
 }

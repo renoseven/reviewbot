@@ -15,7 +15,9 @@ pub mod storage;
 pub mod trace;
 
 pub use error::RecordError;
-pub use listing::{DEFAULT_KEEP, PruneReport, RunRow, RunShow, Runs, WARN_AFTER_RUNS};
+pub use listing::{
+    DEFAULT_KEEP, ListedTrace, PruneReport, RunRow, RunShow, Runs, TraceListing, WARN_AFTER_RUNS,
+};
 pub use lock::DirLock;
 pub use meta::{InputKind, InputRecord, Meta, Reentry, RunIdentity};
 pub use recorder::Recorder;

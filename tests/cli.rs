@@ -748,3 +748,129 @@ fn run_remove_deletes_one_run_and_prints_nothing() {
         .expect("run");
     assert_eq!(missing.status.code(), Some(2), "{missing:?}");
 }
+
+#[test]
+fn trace_prints_conversations_and_filters_by_trace_id() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let runs = directory.path().join("runs");
+    let run = runs.join("2dc40c10f9a4d1b8");
+    let traces = run.join("traces");
+    std::fs::create_dir_all(&traces).expect("traces");
+
+    let mut parse = reviewbot::record::Trace::for_review("src/parse.c", None);
+    parse.set_prompt("review parse");
+    parse.set_diff("@@ parse @@");
+    parse.set_model_output("parse looks fine");
+    parse.append_reasoning("no defect in parse");
+    parse.record_tool_call(reviewbot::record::ToolCall {
+        name: "read_local_file".to_string(),
+        input: "{\"path\":\"src/parse.c\"}".to_string(),
+        output: "int added(void);".to_string(),
+        duration_ms: 12,
+        succeeded: true,
+    });
+    parse.add_usage(&reviewbot::budget::TokenUsage {
+        input_tokens: 80,
+        cached_input_tokens: 8,
+        output_tokens: 16,
+    });
+    let parse_id = parse.trace_id().to_string();
+    std::fs::write(
+        traces.join(format!("{parse_id}.json")),
+        serde_json::to_vec(&parse).expect("json"),
+    )
+    .expect("parse");
+
+    let mut lex = reviewbot::record::Trace::for_review("src/lex.c", None);
+    lex.set_prompt("review lex");
+    lex.set_diff("@@ lex @@");
+    lex.set_model_output("lex looks fine");
+    let lex_id = lex.trace_id().to_string();
+    std::fs::write(
+        traces.join(format!("{lex_id}.json")),
+        serde_json::to_vec(&lex).expect("json"),
+    )
+    .expect("lex");
+
+    let output = reviewbot()
+        .args(["--runs-dir", runs.to_str().unwrap()])
+        .args(["run", "trace", "2dc40c10f9a4d1b8"])
+        .output()
+        .expect("run");
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "success writes no stderr");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.starts_with("run_id     2dc40c10f9a4d1b8\n"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("| FILE"), "{stdout}");
+    assert!(stdout.contains("| src/lex.c "), "{stdout}");
+    assert!(stdout.contains("| src/parse.c "), "{stdout}");
+    assert!(stdout.contains("| TRACE_ID"), "{stdout}");
+    assert!(
+        !stdout.contains("\n========================================\n"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("[PROMPT]\n\nreview parse\n"), "{stdout}");
+    assert!(stdout.contains("[DIFF]\n\n@@ parse @@\n"), "{stdout}");
+    assert!(
+        stdout.contains("[TOOL]\n\nread_local_file  (12 ms, ok)\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("[ARGUMENTS]\n\n{\n  \"path\": \"src/parse.c\"\n}\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("[RESULT]\n\nint added(void);\n"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("[REPLY]\n\nparse looks fine\n"), "{stdout}");
+    assert!(
+        stdout.contains("[REASONING]\n\nno defect in parse\n"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("TRACE_ID"), "{stdout}");
+    assert!(stdout.contains("CACHED"), "{stdout}");
+    assert!(stdout.contains(&parse_id), "{stdout}");
+    assert!(stdout.contains("lex looks fine"), "{stdout}");
+
+    let filtered = reviewbot()
+        .args(["--runs-dir", runs.to_str().unwrap()])
+        .args(["run", "trace", "2dc40c10f9a4d1b8", "--trace-id", &parse_id])
+        .output()
+        .expect("run");
+    assert!(filtered.status.success(), "{filtered:?}");
+    let one = String::from_utf8_lossy(&filtered.stdout);
+    assert!(one.contains("| src/parse.c "), "{one}");
+    assert!(one.contains("| TRACE_ID"), "{one}");
+    assert!(one.contains("parse looks fine"), "{one}");
+    assert!(!one.contains("src/lex.c"), "{one}");
+    assert!(!one.contains("lex looks fine"), "{one}");
+
+    let json = reviewbot()
+        .args(["--runs-dir", runs.to_str().unwrap()])
+        .args(["--format", "json", "run", "trace", "2dc40c10f9a4d1b8"])
+        .output()
+        .expect("run");
+    assert!(json.status.success(), "{json:?}");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("stdout is pure json");
+    assert_eq!(parsed["run_id"], "2dc40c10f9a4d1b8");
+    assert!(parsed["traces"].is_array(), "{parsed}");
+    assert_eq!(parsed["traces"].as_array().map(Vec::len), Some(2));
+
+    let missing = reviewbot()
+        .args(["--runs-dir", runs.to_str().unwrap()])
+        .args([
+            "run",
+            "trace",
+            "2dc40c10f9a4d1b8",
+            "--trace-id",
+            "deadbeefdeadbeef",
+        ])
+        .output()
+        .expect("run");
+    assert_eq!(missing.status.code(), Some(2), "{missing:?}");
+}

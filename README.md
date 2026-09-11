@@ -91,6 +91,8 @@ Two things worth knowing. The run id is `hash(input identity + head_sha)` — th
 reviewbot --runs-dir .reviewbot/runs run list
 reviewbot --runs-dir .reviewbot/runs --format json run list
 reviewbot run show 7f3a9c1e
+reviewbot run trace 7f3a9c1e           # conversations, oldest first
+reviewbot run trace 7f3a9c1e --trace-id a1b2c3d4e5f67890
 reviewbot run remove 7f3a9c1e          # delete one run; prints nothing
 reviewbot run prune                    # delete every run; prints how many
 reviewbot run prune --keep-latest 10   # keep the newest 10 instead
@@ -99,6 +101,8 @@ reviewbot config info                  # platforms, providers, models, tools
 ```
 
 `config info` lists the platforms, providers, models, and tools in the loaded config. Column titles are uppercase; a title of more than one word is joined with `_`. The tool table is name, purpose, and rounds; `--format json` has the rest of the contract. Credentials are named by source, never printed; `config check` is what reads them.
+
+`run trace` prints the review conversations of a run: the prompt, that file's diff, every tool call, the model's reply, its chain of thought, and the token usage. Without `--trace-id` the conversations are printed oldest first. A `trace_id` is sixteen hex characters, the same shape as a `run_id`; the report and the published comments name that id.
 
 `review` never deletes a run, including when it re-enters one. `run prune` with no `--keep-latest` deletes every run. If a review leaves more than 10 runs, it warns once with a `run prune` line you can paste.
 

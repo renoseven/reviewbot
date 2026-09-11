@@ -373,6 +373,136 @@ pub fn run_show(runs_dir: &Path, run_id: &str, format: Format) -> Result<String,
     redact(&text)
 }
 
+pub fn run_traces(
+    runs_dir: &Path,
+    run_id: &str,
+    trace_id: Option<&str>,
+    format: Format,
+) -> Result<String, Error> {
+    let listing = reviewbot::record::Runs::open(runs_dir).traces(run_id, trace_id)?;
+    let text = match format {
+        Format::Json => serde_json::to_string_pretty(&listing)
+            .unwrap_or_else(|error| format!("{{\"error\":\"{error}\"}}")),
+        Format::Text => text_traces(&listing),
+    };
+    redact(&text)
+}
+
+fn text_traces(listing: &reviewbot::record::TraceListing) -> String {
+    let mut out = String::new();
+    push_summary_line(&mut out, "run_id", &listing.run_id);
+    if listing.traces.is_empty() {
+        out.push_str("(no traces)\n");
+        return out;
+    }
+    for row in &listing.traces {
+        out.push('\n');
+        push_conversation(&mut out, row);
+    }
+    out
+}
+
+fn push_conversation(out: &mut String, row: &reviewbot::record::ListedTrace) {
+    out.push_str(&trace_header(row));
+    push_section(out, "PROMPT", &row.prompt);
+    push_section(out, "DIFF", &row.diff);
+    for call in &row.tool_calls {
+        push_tool(out, call);
+    }
+    push_section(out, "REASONING", &row.reasoning);
+    push_section(out, "REPLY", &row.model_output);
+}
+
+fn trace_header(row: &reviewbot::record::ListedTrace) -> String {
+    let file = match row.file.as_str() {
+        "" => "scoring",
+        path => path,
+    };
+    let usage = &row.usage;
+    let input = usage.input_tokens.to_string();
+    let cached = usage.cached_input_tokens.to_string();
+    let output = usage.output_tokens.to_string();
+    match row.piece {
+        Some(piece) => boxed_table(
+            &["TRACE_ID", "FILE", "PIECE", "IN", "CACHED", "OUT"],
+            &[vec![
+                row.trace_id.clone(),
+                file.to_string(),
+                piece.to_string(),
+                input,
+                cached,
+                output,
+            ]],
+        ),
+        None => boxed_table(
+            &["TRACE_ID", "FILE", "IN", "CACHED", "OUT"],
+            &[vec![
+                row.trace_id.clone(),
+                file.to_string(),
+                input,
+                cached,
+                output,
+            ]],
+        ),
+    }
+}
+
+fn push_section(out: &mut String, label: &str, body: &str) {
+    if body.is_empty() {
+        return;
+    }
+    write_section(out, label, &pretty_if_json(body));
+}
+
+/// A tool's arguments and result always have a slot, even when the call
+/// carried nothing — otherwise a reader cannot tell "not recorded" from
+/// "the renderer hid it".
+fn push_slot(out: &mut String, label: &str, body: &str) {
+    let body = match body.is_empty() {
+        true => "(none)".to_string(),
+        false => pretty_if_json(body),
+    };
+    write_section(out, label, &body);
+}
+
+fn write_section(out: &mut String, label: &str, body: &str) {
+    out.push('\n');
+    out.push('[');
+    out.push_str(label);
+    out.push_str("]\n\n");
+    out.push_str(body);
+    if !body.ends_with('\n') {
+        out.push('\n');
+    }
+}
+
+fn push_tool(out: &mut String, call: &reviewbot::record::ToolCall) {
+    let result = if call.succeeded { "ok" } else { "failed" };
+    push_section(
+        out,
+        "TOOL",
+        &format!("{}  ({} ms, {result})", call.name, call.duration_ms),
+    );
+    push_slot(out, "ARGUMENTS", &call.input);
+    push_slot(out, "RESULT", &call.output);
+}
+
+/// Tool arguments and results are often one-line JSON. Pretty-print those
+/// so a person can read them; leave prose alone.
+fn pretty_if_json(text: &str) -> String {
+    let trimmed = text.trim();
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return text.to_string();
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(value) => match serde_json::to_string_pretty(&value) {
+            Ok(pretty) => pretty,
+            Err(_) => text.to_string(),
+        },
+        Err(_) => text.to_string(),
+    }
+}
+
 pub fn run_prune(report: &reviewbot::record::PruneReport, format: Format) -> Result<String, Error> {
     let pruned = report.deleted.len();
     let text = match format {
@@ -634,13 +764,17 @@ fn column_widths(headers: &[&str], rows: &[Vec<String>]) -> Vec<usize> {
 
 /// One catalog: the name, then a boxed grid of the column header and body.
 fn catalog_table(title: &str, headers: &[&str], rows: &[Vec<String>]) -> String {
+    format!("{title}\n{}", boxed_table(headers, rows))
+}
+
+fn boxed_table(headers: &[&str], rows: &[Vec<String>]) -> String {
     let mut table = Table::new();
     table
         .load_style(ASCII_FULL_CONDENSED)
         .set_content_arrangement(ContentArrangement::Disabled)
         .set_header(headers)
         .add_rows(rows.iter().cloned());
-    format!("{title}\n{table}\n")
+    format!("{table}\n")
 }
 
 fn pad_table(headers: &[&str], rows: &[Vec<String>]) -> String {
@@ -860,6 +994,155 @@ mod tests {
     fn money_puts_the_currency_after_the_amount() {
         assert_eq!(money(3.0, "CNY", 2), "3.00 CNY");
         assert_eq!(money(0.0316, "", 4), "0.0316");
+    }
+
+    #[test]
+    fn a_conversation_prints_the_prompt_diff_tools_reply_reasoning_and_usage() {
+        let listing = reviewbot::record::TraceListing {
+            run_id: "2dc40c10f9a4d1b8".to_string(),
+            traces: vec![reviewbot::record::ListedTrace {
+                file: "src/parse.c".to_string(),
+                trace_id: "a1b2c3d4e5f67890".to_string(),
+                piece: None,
+                prompt: "review this file".to_string(),
+                diff: "@@ -1 +1 @@\n+int added(void);\n".to_string(),
+                tool_calls: vec![reviewbot::record::ToolCall {
+                    name: "read_local_file".to_string(),
+                    input: "{\"path\":\"src/parse.c\"}".to_string(),
+                    output: "int added(void);".to_string(),
+                    duration_ms: 12,
+                    succeeded: true,
+                }],
+                model_output: "looks fine".to_string(),
+                reasoning: "no defect".to_string(),
+                usage: reviewbot::budget::TokenUsage {
+                    input_tokens: 100,
+                    cached_input_tokens: 10,
+                    output_tokens: 20,
+                },
+            }],
+        };
+        let text = text_traces(&listing);
+        assert_eq!(
+            text,
+            "\
+run_id     2dc40c10f9a4d1b8
+
++------------------+-------------+-----+--------+-----+
+| TRACE_ID         | FILE        | IN  | CACHED | OUT |
++=====================================================+
+| a1b2c3d4e5f67890 | src/parse.c | 100 | 10     | 20  |
++------------------+-------------+-----+--------+-----+
+
+[PROMPT]
+
+review this file
+
+[DIFF]
+
+@@ -1 +1 @@
++int added(void);
+
+[TOOL]
+
+read_local_file  (12 ms, ok)
+
+[ARGUMENTS]
+
+{
+  \"path\": \"src/parse.c\"
+}
+
+[RESULT]
+
+int added(void);
+
+[REASONING]
+
+no defect
+
+[REPLY]
+
+looks fine
+"
+        );
+    }
+
+    #[test]
+    fn two_conversations_follow_without_a_rule() {
+        let row = |file: &str, reply: &str| reviewbot::record::ListedTrace {
+            file: file.to_string(),
+            trace_id: "a1b2c3d4e5f67890".to_string(),
+            piece: None,
+            prompt: String::new(),
+            diff: String::new(),
+            tool_calls: Vec::new(),
+            model_output: reply.to_string(),
+            reasoning: String::new(),
+            usage: reviewbot::budget::TokenUsage::default(),
+        };
+        let text = text_traces(&reviewbot::record::TraceListing {
+            run_id: "2dc40c10f9a4d1b8".to_string(),
+            traces: vec![row("src/lex.c", "lex"), row("src/parse.c", "parse")],
+        });
+        assert!(text.contains("| src/lex.c "), "{text}");
+        assert!(text.contains("| src/parse.c "), "{text}");
+        assert!(
+            !text.contains("\n========================================\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_split_file_puts_piece_in_the_header() {
+        let text = text_traces(&reviewbot::record::TraceListing {
+            run_id: "2dc40c10f9a4d1b8".to_string(),
+            traces: vec![reviewbot::record::ListedTrace {
+                file: "src/parse.c".to_string(),
+                trace_id: "a1b2c3d4e5f67890".to_string(),
+                piece: Some(2),
+                prompt: String::new(),
+                diff: String::new(),
+                tool_calls: Vec::new(),
+                model_output: String::new(),
+                reasoning: String::new(),
+                usage: reviewbot::budget::TokenUsage::default(),
+            }],
+        });
+        assert!(
+            text.contains("| TRACE_ID         | FILE        | PIECE |"),
+            "{text}"
+        );
+        assert!(
+            text.contains("| a1b2c3d4e5f67890 | src/parse.c | 2     |"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_tool_without_arguments_still_shows_the_slots() {
+        let text = text_traces(&reviewbot::record::TraceListing {
+            run_id: "2dc40c10f9a4d1b8".to_string(),
+            traces: vec![reviewbot::record::ListedTrace {
+                file: "src/parse.c".to_string(),
+                trace_id: "a1b2c3d4e5f67890".to_string(),
+                piece: None,
+                prompt: String::new(),
+                diff: String::new(),
+                tool_calls: vec![reviewbot::record::ToolCall {
+                    name: "finish_review".to_string(),
+                    input: String::new(),
+                    output: String::new(),
+                    duration_ms: 0,
+                    succeeded: true,
+                }],
+                model_output: String::new(),
+                reasoning: String::new(),
+                usage: reviewbot::budget::TokenUsage::default(),
+            }],
+        });
+        assert!(text.contains("[ARGUMENTS]\n\n(none)\n"), "{text}");
+        assert!(text.contains("[RESULT]\n\n(none)\n"), "{text}");
     }
 
     #[test]

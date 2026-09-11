@@ -506,8 +506,9 @@ diff 模式认**内容**不认路径：同一份 diff 改个文件名，命中�
 <runs_dir>/<run_id>/
   meta.json                 # 输入、模型、指纹、预算、发布意图，以及 completed_through
   stages/<n>-<stage>.json   # 每阶段结果；编号与名字都由同一个 Stage 给出
-  traces/<trace_id>.json    # internal 视图。`review-<path>`，被切开的文件是
-                            # `review-<path>-<第几片>`（[§7](#分片交接单文件被切开时)）
+  traces/<trace_id>.json    # internal 视图。`trace_id` 是十六位小写十六进制，
+                            # 和 `run_id` 同形；文件路径记在 JSON 里，不进文件名
+                            # （[§7](#分片交接单文件被切开时)）
   published.json            # 已发布 comment 的幂等键
   report.md                 # 人看的报告，总是生成
   summary.json              # 脚本读的结构化结果，总是生成
@@ -1097,7 +1098,7 @@ prompt 分两段送出：`instructions` 装不随分片变化的部分，`input`
 
 摘要与那句话都有长度上限，因为它们要跟着**每一片**往下传，不设上限就把切分想省下的东西又长回来了。条数上限只有一处——就是那个「最多 N 条、超出报数」的渲染件——不在传递的那一头再设一道，两道迟早不一致。这段交接原样记进该片的 trace，否则读 trace 的人会看到一片凭空知道自己没提过的意见。
 
-**每一片有各自的 `trace_id`**：`review-<path>-<第几片>`，未切开的文件仍是 `review-<path>`。这不是好看——trace 是以 `trace_id` 命名的文件，几片共用一个名字就是后写的覆盖先写的，前面几片的意见在报告里那行 `trace:` 指向的会是最后一片的 prompt 和 diff。
+**每一片有各自的 `trace_id`**：十六位小写十六进制，和 `run_id` 同形，由路径（被切开时再加上第几片）算出来。这不是好看——trace 是以 `trace_id` 命名的文件，几片共用一个名字就是后写的覆盖先写的，前面几片的意见在报告里那行 `trace:` 指向的会是最后一片的 prompt 和 diff。报告、MR 评论和幂等标记用的是同一个 id。`reviewbot run trace <run_id>` 按落盘时间从早到晚把对话摊开，`--trace-id` 只留一份。
 
 ### 分片归并（`merge`）
 
@@ -1322,7 +1323,7 @@ suggestion:
 buf 声明为 char[3]，第 88 行的索引是常量 5，越界成立。
 
 run: `{run_id}`
-trace: `review-src_parse.c`
+trace: `a1b2c3d4e5f67890`
 <!-- reviewbot:{run_id}:{trace_id} -->
 ```
 
@@ -1386,6 +1387,10 @@ reviewbot review <diff 文件 | ->        # 原始 unified diff，此时不接�
 reviewbot run list                      # runs 目录里的 run：id、输入、阶段、花费、时间
                                         # 连同当前生效的 runs 目录一起报
 reviewbot run show <run_id>             # 单个 run 的阶段状态、comment、trace、账目
+reviewbot run trace <run_id>            # 按时间打印这次 review 的对话：prompt、diff、
+                                        # 工具调用、模型回复、思维链、用量
+reviewbot run trace <run_id> --trace-id <id>
+                                        # 只打印这一份；id 是十六位十六进制
 reviewbot run remove <run_id>           # 删掉这一个 run；成功时一个字节都不打
 reviewbot run prune                     # 默认一个不留；`--keep-latest N` 留最新 N 个
                                         # 成功时打一句，例如 `pruned 3 runs, retaining none.`
@@ -1396,7 +1401,7 @@ reviewbot config info                   # 四张表：PLATFORMS / PROVIDERS / MO
                                         # 列标题全大写，多词用 `_` 连接；tool 表只印名字、用途、轮次
 ```
 
-**查看类命令的名词一律用单数**：`run` / `config`。旧的 `model` / `tool` / `platform` / `provider` 顶层命令直接不认，不留别名——那四段现在是 `config info` 的四张表。
+**查看类命令的名词一律用单数**：`run` / `config`。旧的 `model` / `tool` / `platform` / `provider` 顶层命令直接不认，不留别名——那四段现在是 `config info` 的四张表。对话在 `run trace` 下面，不另起一个顶层名词。
 
 `config info` 的 platform / provider 表只报**密钥的来源**，不报密钥：写在配置里的字面密钥在解析时就被拒了（[§5 密钥来源](#密钥来源)），所以能走到这里的配置手里只有一个来源可印。它不去读那个凭据——读它是 `config check` 的活。provider 的 `BUDGET_PER_RUN` 把 `-1` 与 `0` 印成词而不是数字：那两个是设置不是金额，印成 `-1.00 CNY` 只会读成「这家可以花负一块」。
 
@@ -1408,7 +1413,7 @@ reviewbot config info                   # 四张表：PLATFORMS / PROVIDERS / MO
 |---|---|---|---|
 | `--config <path>` | 配置文件，路径的唯一来源 | `~/.reviewbot/config.toml` | [§5](#5-配置) |
 | `--runs-dir <path>` | run 与 checkpoint 落在哪 | `~/.reviewbot/runs` | [§6 可恢复](#可恢复) |
-| `--format text\|json` | stdout 怎么渲染（含 `run` 的列表与 `config info`） | `text` | [§10 输出](#输出) |
+| `--format text\|json` | stdout 怎么渲染（含 `run` 的列表与对话、`config info`） | `text` | [§10 输出](#输出) |
 | `-q` | stdout 一个字节都不写（状态屏也不出），只留 stderr 上的错误 | 关 | [§10 输出](#输出) |
 | `--no-color` | 关掉颜色 | 非 TTY 时自动 | [§10 输出](#输出) |
 | `--retries <n>` | 瞬时故障重试次数 | 2 | [§6 可恢复](#失败与重试) |
@@ -1430,6 +1435,12 @@ reviewbot config info                   # 四张表：PLATFORMS / PROVIDERS / MO
 | `--keep-latest <n>` | 保留最新的几个 run，其余整个删掉 | 0 | [§6 可恢复](#可恢复) |
 | `--dry-run` | 只报将删的个数，不真删 | 关 | [§6 可恢复](#可恢复) |
 
+**`run trace`**
+
+| flag | 含义 | 默认 | 详述 |
+|---|---|---|---|
+| `--trace-id <id>` | 只打印这一份对话 | 无：按时间打印这次 run 的全部对话 | [§6 可观测](#可观测) |
+
 几条要点：
 
 - **两份产物总是都生成**，`report.md` 给人看、`summary.json` 给脚本读，都落在 run 目录里。两者都带 `overall_score` 与那段 `summary`（[§7 汇总打分](#汇总打分)）；未打分时字段为 `null` 并另有一个字段说明原因，**不填 0**。
@@ -1440,7 +1451,7 @@ reviewbot config info                   # 四张表：PLATFORMS / PROVIDERS / MO
 - **`--publish` 是开关，不是选择器**。报告永远生成，加了 `--publish` 才额外把 comment 发回 MR/PR。它是整个命令行里唯一一个产生外部副作用的开关。diff 输入下给 `--publish` 直接启动失败。
 - **`--dry-run` 只属于 `run prune`。**
 - **`config info` 的 tool 表不是「这次调用注册了什么」**。所谓「未注册」是关于某一次评审的事实，这条命令不评审任何东西。文本只印名字、用途、轮次。`--format json` 仍带完整契约。
-- **每个子命令与每个参数都有帮助文案**，该长说的有长说明：`review`（目标可以是 URL、`-` 或 diff 文件，各自能做什么不能做什么）、`run prune`（保留数从最新算起，成功打个数）、`run remove`（删一个，成功不打字）、`config check`（全程本地，不发请求）、`config init`（写示例、不覆盖）、`config info`（四张表，tool 表只印名字、用途、轮次）。有一个用例遍历整棵命令树，短说明与长说明都缺就失败——以后新命令不写说明就落不了地。
+- **每个子命令与每个参数都有帮助文案**，该长说的有长说明：`review`（目标可以是 URL、`-` 或 diff 文件，各自能做什么不能做什么）、`run prune`（保留数从最新算起，成功打个数）、`run remove`（删一个，成功不打字）、`config check`（全程本地，不发请求）、`config init`（写示例、不覆盖）、`config info`（四张表，tool 表只印名字、用途、轮次）、`run trace`（按时间打印对话，`--trace-id` 只留一份）。有一个用例遍历整棵命令树，短说明与长说明都缺就失败——以后新命令不写说明就落不了地。
 - **`config check` 只做本地校验，不发任何请求**：表内 `name` 唯一、`[[platform]]` 的 `base_url` 只能是 `gitlab.com` 或 `api.github.com` 的 API、引用链完整、密钥可读、tool 与 protocol 能在 registry 解析、`deny_paths` 与 `skip_paths` 的 glob 语法合法、每个 `[[model]]` 都给齐了单价与上下文两项、每个 `[[provider]]` 都给齐了 `currency` 与 `budget_per_run`、且它不是 `-1` 以外的负数。`[[tool]]` 的条目多查几项：`name` 没跟内建 tool 撞、`bin` 是绝对路径且不在被评审仓库内、`args` 里每个占位符要么是内置的要么在 `params` 里声明过、`params` 里没有裸的 `type = "string"`、每条都给齐了 `description` 与 `params`、不得出现 `schedule` / `skippable` / `enabled` 等未定义字段。**不查这些路径是否真实存在。**
 - **`--model` 给错名字、或多条候选都没标 `default` 时，错误信息直接把 `model list` 那张表打出来**，不只说「请指定模型」。
 - **`config init` 写随二进制走的示例配置**（`src/config/example.toml`），默认落到 `~/.reviewbot/config.toml`；已有文件不覆盖，换路径用 `--config`。
@@ -1473,7 +1484,7 @@ reviewbot config info                   # 四张表：PLATFORMS / PROVIDERS / MO
 
 **`--format` 管 stdout，`--output-dir` 管文件，互不干涉。**
 
-- `--format json` 是说「stdout 给我 JSON」。此时 stdout 只有那份 JSON，状态屏不出。它对 `run list` / `config info` / `config check` / `config init` / `run prune` 同样有效。
+- `--format json` 是说「stdout 给我 JSON」。此时 stdout 只有那份 JSON，状态屏不出。它对 `run list` / `run trace` / `config info` / `config check` / `config init` / `run prune` 同样有效。
 
   推论：**text 模式下印在表格上方的抬头，json 模式下必须变成文档里的字段，不能变成 JSON 前面的一行字**。`run list` 报的那个「当前生效的 runs 目录」在 json 下就得是顶层的 `runs_dir` 键，输出整体成为 `{"runs_dir": "...", "runs": [...]}` 而不是裸数组。
 - `--output-dir d` 是说「把可对外的那两份产物导到这个目录」，落成 `d/report-<run_id>.md` 与 `d/summary-<run_id>.json`。它们的格式固定，**不受 `--format` 影响**。这个目录可以落在检出内（CI 收 artifacts 就得这样），届时它会被自动追加进 `deny_paths`，免得报告被当成待评审内容读回去（[§6 安全](#安全)）。
@@ -1707,7 +1718,7 @@ crate 同时产出 `lib` 与 `bin` 两个 target。**业务逻辑一律针对 li
 - **工具契约**：断言给模型的 JSON Schema 是从参数声明派生的（改声明就改 schema，全仓库只有一处写 schema）；断言带引号的整数在任意深度都按整数读（含嵌套对象里和数组元素里），而 `"92.5"`、`"high"`、`101` 照旧拒；断言拒绝理由点名工具与参数、嵌套参数用点号说清位置；断言一轮只提供该轮的工具——调查轮有内容与提交意见、收尾轮只剩提交意见、打分轮只有提交总分；断言配置来的检查器与内建工具走的是同一份校验代码。
 - **prompt 与输出契约**：断言 `instructions` 在整个 run 内逐字不变（各分片之间做字节比对），只有 `input` 在换——这是 prompt 缓存能命中的前提；断言 prompt 本体里一个未注册的工具名都不出现（能力段由 registry 生成，本体只点名 `submit_comment` 与 `finish_review` 这两条交付通道）；断言能力段末尾那段 worktree 说明随三个变体变，且 `Empty` 那一版明说「这是本次 run 的限制，不是关于仓库的事实」；断言改动清单落在 `instructions` 这一半里（即两次装配字节相同），断言只改一个文件时不出清单、且空掉的标记不留下空行也不留下 `{{...}}` 字面量；断言 prompt 里没有目录摘要、也不出现 digest 一词；断言证据字段叫 `evidence.lines`、不出现 `evidences` / `diff_lines` / `ref_lines` / `src_lines`，且写明 `start_line` / `end_line` 是一段挂点、依据不必等于挂点；断言 `plan` 预留的骨架是量出来的（装配好的 `instructions` 加 `tools` 字段的 schema，两者都算），量出的值更大时分片上限等额缩小、比地板常量更小时不缩；断言注册成功的工具同时出现在 instructions 的能力段和请求的 `tools` 字段里，两份同源；断言意见经 `submit_comment` 提交、聊天正文里的 JSON 不算；喂一份带 `evidence` 三字段的模型输出，断言 `start_line` 落不进可评论行集合、±3 窗口也不中时对齐改用 `evidence.lines`，三条都不中才退化为文件级，`external_files` 列了没取过的文件时标注出现；断言总分经 `submit_summary` 这个工具调用交回、那一轮只挂这一个工具、调用连输入输出一起进 trace，且**没有任何一处再从聊天正文读 JSON**（剥围栏那一套已删）；断言只回文字不调工具时重问一次，断言参数被拒时那次调用连拒绝理由一起回传进下一次请求的 `input` 再重问；断言 `confidence_score` 与 `overall_score` 写成 `"92"` 这种带引号的整数时照收，写成 `"45.7"`、`"high"`、`101` 时照旧拒；断言单条 comment 缺 `evidence` 时那一条照收、只是拿不到来源徽标，而缺 `body`、缺 `suggestion`、或缺 `confidence_score`（或它不是 0–100 的整数）时**只丢这一条并进 trace**、不重问也不牵连同片其余的 comment、更不许补默认值。
 - **配置必填项**：逐个删掉 `[review]` / `[plan]` / `[security]` 里的数值项，断言启动失败且错误点名的正是那个字段，把它写成 `0` 得到同一个错误；断言 `src/config/example.toml` 原样通得过校验（`config init` 写出去的就是它，代码里没有默认值可以替它兜底）；断言 `max_files_per_listing` / `max_hits_per_search` 改了之后，模型看到的 tool 描述里那个数字跟着改，且真实的列表与检索按新值截断——两处同源。
-- **分片交接**：把一个文件切成两片，断言两片的 `trace_id` 不同、两份 trace 文件都还在（此前它们同名，后写的覆盖了先写的）；断言未切开的文件仍拿 `review-<path>` 这个名字、且它的 `input` 里没有任何交接段；断言第二片的 `input` 首条消息里写着「第 2 片 / 共 2 片」、带着第一片已提交意见的行号与摘要、带着第一片模型留下的那句话，而第一片自己那段里没有「已经提过」；断言末片不再被要求留交接。
+- **分片交接**：把一个文件切成两片，断言两片的 `trace_id` 不同、两份 trace 文件都还在（此前它们同名，后写的覆盖了先写的）；断言未切开的文件的 id 只由路径算出、且它的 `input` 里没有任何交接段；断言第二片的 `input` 首条消息里写着「第 2 片 / 共 2 片」、带着第一片已提交意见的行号与摘要、带着第一片模型留下的那句话，而第一片自己那段里没有「已经提过」；断言末片不再被要求留交接。
 - **上下文**：断言可用量随 `--model` 的 `context_window` 变化、工作大小取 `max_chunk_tokens` 且被可用量夹住；断言循环的上限是 `[review].max_rounds` 与当时窗口剩余里先到的那个，屏幕上的 `of` 就是配置里的 `max_rounds`；why 写真实原因（context 不足或配置硬限制到了）；断言没有检视类工具答得上来时窗口侧容量是 1；断言可用量装不下一份最小 diff 时**启动即失败**、错误点名这个模型的窗口与 `max_output_tokens`；断言普通轮次不报「用掉几轮 / 共几轮」，下一轮仍装得进且是最后一轮时才提醒；查阅范围写在 instructions 里；假模型一轮返回多个 `function_call`，断言这一轮回填进 `input` 的工具输出合计不超过 `max_tool_output_bytes`；假 tool 每轮返回大段输出，断言循环在撑爆 `context_window` 前主动停止并要到最后一轮结论，全程没有一个请求是靠厂商 400 拦下的；断言 `context_window` 缺失或不大于 `max_output_tokens` 时启动失败。
 - **命令树的帮助文案**：遍历整棵命令树，断言每个子命令与每个参数至少有一份说明（短说明与长说明都缺就失败），并断言 `review`、`run prune`、`config check`、`tool list` 四条各有长说明。
 - **trace 的阶段归属**：断言每条记录都带写它的 `Stage`；断言 `merge` 重跑只清掉自己那些记录、`review` 记的会话经过还在（这正是从前被整份清空的东西）；断言 `publish` 降级成文件级评论时那句话记在 `publish` 名下且不重复记第二遍。

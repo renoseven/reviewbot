@@ -448,17 +448,10 @@ impl<'c, 'a> Review<'c, 'a> {
         // The pieces of one file must not share a `trace_id`: the traces are
         // files named after it, so the later piece would overwrite the earlier
         // one and every comment from the earlier piece would point at the
-        // wrong evidence. A whole file keeps the plain name.
-        let trace_id = match chunk.is_split() {
-            true => format!(
-                "{}-{}-{}",
-                Stage::Review,
-                path.replace('/', "_"),
-                chunk.piece + 1
-            ),
-            false => format!("{}-{}", Stage::Review, path.replace('/', "_")),
-        };
-        let mut trace = Trace::new(trace_id.clone());
+        // wrong evidence. A whole file hashes only the path.
+        let piece = chunk.is_split().then_some(chunk.piece + 1);
+        let mut trace = Trace::for_review(path, piece);
+        let trace_id = trace.trace_id().to_string();
         trace.set_diff(redacted.clone());
         trace.set_prompt(context.redactor.redact(instructions));
         let mut input = Vec::new();
@@ -1431,6 +1424,14 @@ mod tests {
         review_over(fixture, &plan("src/parse.c"))
     }
 
+    fn review_id(path: &str) -> String {
+        Trace::for_review(path, None).trace_id().to_string()
+    }
+
+    fn review_piece_id(path: &str, piece: usize) -> String {
+        Trace::for_review(path, Some(piece)).trace_id().to_string()
+    }
+
     fn review_over(fixture: &mut StageFixture, plan: &PlanOutput) -> ReviewOutput {
         let mut context = fixture.context();
         Review::new(&mut context)
@@ -1483,7 +1484,7 @@ mod tests {
 
         let trace = fixture
             .recorder()
-            .read_trace("review-src_parse.c")
+            .read_trace(&review_id("src/parse.c"))
             .expect("readable")
             .expect("the trace is on disk");
         assert_eq!(trace.tool_calls().len(), 3);
@@ -1511,7 +1512,7 @@ mod tests {
         );
         let trace = fixture
             .recorder()
-            .read_trace("review-src_parse.c")
+            .read_trace(&review_id("src/parse.c"))
             .expect("readable")
             .expect("the trace is on disk");
         assert!(
@@ -1575,7 +1576,7 @@ mod tests {
         );
         let trace = fixture
             .recorder()
-            .read_trace("review-src_parse.c")
+            .read_trace(&review_id("src/parse.c"))
             .expect("readable")
             .expect("the trace is on disk");
         assert!(!trace.tool_calls()[0].succeeded);
@@ -1875,7 +1876,7 @@ mod tests {
 
         let trace = fixture
             .recorder()
-            .read_trace("review-src_parse.c")
+            .read_trace(&review_id("src/parse.c"))
             .expect("readable")
             .expect("the trace is on disk");
         assert_eq!(
@@ -1909,7 +1910,7 @@ mod tests {
         assert_eq!(output.chunks[0].raw_output, r#"{"comments":[]}"#);
         let trace = fixture
             .recorder()
-            .read_trace("review-src_parse.c")
+            .read_trace(&review_id("src/parse.c"))
             .expect("readable")
             .expect("the trace is on disk");
         assert!(trace.tool_calls()[0].succeeded);
@@ -2084,12 +2085,14 @@ mod tests {
                 .expect("both pieces are reviewed")
         };
 
+        let first = review_piece_id("src/parse.c", 1);
+        let second = review_piece_id("src/parse.c", 2);
         let ids: Vec<&str> = output
             .chunks
             .iter()
             .map(|chunk| chunk.trace_id.as_str())
             .collect();
-        assert_eq!(ids, ["review-src_parse.c-1", "review-src_parse.c-2"]);
+        assert_eq!(ids, [first.as_str(), second.as_str()]);
         for id in ids {
             let trace = fixture
                 .recorder()
@@ -2144,16 +2147,16 @@ mod tests {
         );
     }
 
-    /// A whole file is the ordinary case and keeps the ordinary name, so the
-    /// piece suffix cannot creep into every trace id in the run directory.
+    /// A whole file is the ordinary case and hashes only the path, so a
+    /// piece number cannot creep into every trace id in the run directory.
     #[test]
-    fn a_whole_file_keeps_the_plain_trace_id() {
+    fn a_whole_file_gets_an_id_from_its_path() {
         let mut fixture = StageFixture::scripted(vec![filed()], Limit::Amount(10.0))
             .with_tools(with_submit(Registry::new()));
 
         let output = review(&mut fixture);
 
-        assert_eq!(output.chunks[0].trace_id, "review-src_parse.c");
+        assert_eq!(output.chunks[0].trace_id, review_id("src/parse.c"));
         // And nothing was said about pieces: an uncut file has none.
         let sent = fixture.sent();
         assert_eq!(sent[0].input().len(), 1, "{:?}", sent[0].input());
@@ -2307,7 +2310,7 @@ mod tests {
         assert_eq!(output.chunks.len(), 1, "the chunk is still accounted for");
         let trace = fixture
             .recorder()
-            .read_trace("review-src_parse.c")
+            .read_trace(&review_id("src/parse.c"))
             .expect("readable")
             .expect("the trace is on disk");
         assert!(
@@ -2343,7 +2346,7 @@ mod tests {
         );
         let trace = fixture
             .recorder()
-            .read_trace("review-src_parse.c")
+            .read_trace(&review_id("src/parse.c"))
             .expect("readable")
             .expect("the trace is on disk");
         assert_eq!(trace.tool_calls().len(), 3);
@@ -2370,7 +2373,7 @@ mod tests {
 
         let trace = fixture
             .recorder()
-            .read_trace("review-src_parse.c")
+            .read_trace(&review_id("src/parse.c"))
             .expect("readable")
             .expect("the trace is on disk");
         assert_eq!(trace.context_files().len(), 1);
@@ -2423,7 +2426,7 @@ mod tests {
         );
         let trace = fixture
             .recorder()
-            .read_trace("review-src_parse.c")
+            .read_trace(&review_id("src/parse.c"))
             .expect("readable")
             .expect("the trace is on disk");
         assert!(
@@ -2483,7 +2486,7 @@ mod tests {
         assert_eq!(output.chunks[0].raw_output, r#"{"comments":[]}"#);
         let trace = fixture
             .recorder()
-            .read_trace("review-src_parse.c")
+            .read_trace(&review_id("src/parse.c"))
             .expect("readable")
             .expect("the trace is on disk");
         assert!(

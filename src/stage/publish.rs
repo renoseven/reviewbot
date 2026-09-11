@@ -459,9 +459,12 @@ mod tests {
 
     #[test]
     fn markers_are_stable_and_readable_back() {
-        let marker = marker("7f3a9c1e", "review-src_parse.c");
-        assert_eq!(marker, "<!-- reviewbot:7f3a9c1e:review-src_parse.c -->");
-        assert_eq!(trace_id_from(&marker), "review-src_parse.c");
+        let marker = marker("7f3a9c1e48cbe7a3", "a1b2c3d4e5f67890");
+        assert_eq!(
+            marker,
+            "<!-- reviewbot:7f3a9c1e48cbe7a3:a1b2c3d4e5f67890 -->"
+        );
+        assert_eq!(trace_id_from(&marker), "a1b2c3d4e5f67890");
         assert_eq!(
             summary_marker("7f3a9c1e"),
             "<!-- reviewbot:7f3a9c1e:summary -->"

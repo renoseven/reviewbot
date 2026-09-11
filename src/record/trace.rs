@@ -9,9 +9,18 @@ use crate::budget::TokenUsage;
 use crate::common::truncate;
 use crate::domain::Stage;
 
+use super::run_id::hex_id;
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct Trace {
     trace_id: String,
+    /// The file this conversation was about. Empty on the scoring call.
+    #[serde(default)]
+    path: String,
+    /// 1-based piece of a split file. Absent when the file was whole, or
+    /// when this is the scoring call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    piece: Option<u32>,
     tool_calls: Vec<ToolCall>,
     /// The diff hunk that triggered the comment.
     diff: String,
@@ -106,8 +115,40 @@ impl Trace {
         }
     }
 
+    /// One file's review conversation. `piece` is 1-based when the file was
+    /// cut; `None` when the file went out as a whole.
+    pub fn for_review(path: impl Into<String>, piece: Option<usize>) -> Self {
+        let path = path.into();
+        let scope = match piece {
+            Some(n) => format!("review:{path}:{n}"),
+            None => format!("review:{path}"),
+        };
+        Self {
+            trace_id: hex_id(&scope),
+            path,
+            piece: piece.map(|n| n as u32),
+            ..Self::default()
+        }
+    }
+
+    /// The scoring call belongs to no file.
+    pub fn for_summary() -> Self {
+        Self {
+            trace_id: hex_id("merge:summary"),
+            ..Self::default()
+        }
+    }
+
     pub fn trace_id(&self) -> &str {
         &self.trace_id
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn piece(&self) -> Option<u32> {
+        self.piece
     }
 
     pub fn tool_calls(&self) -> &[ToolCall] {
@@ -319,6 +360,38 @@ mod tests {
         assert!(published.prompt.contains("src/parse.h lines 1-3"));
         assert_eq!(published.context_files[0].path, "src/parse.h");
         assert!(trace.internal().context_files()[0].body.contains("secret"));
+    }
+
+    #[test]
+    fn a_review_trace_id_is_sixteen_hex_characters_like_a_run_id() {
+        let whole = Trace::for_review("src/parse.c", None);
+        let again = Trace::for_review("src/parse.c", None);
+        let other = Trace::for_review("src/lex.c", None);
+        let piece = Trace::for_review("src/parse.c", Some(1));
+        assert_eq!(whole.trace_id(), again.trace_id());
+        assert_ne!(whole.trace_id(), other.trace_id());
+        assert_ne!(whole.trace_id(), piece.trace_id());
+        assert_eq!(whole.path(), "src/parse.c");
+        assert_eq!(whole.piece(), None);
+        assert_eq!(piece.piece(), Some(1));
+        assert_eq!(whole.trace_id().len(), super::super::run_id::ID_LENGTH);
+        assert!(
+            whole.trace_id().chars().all(|c| c.is_ascii_hexdigit()),
+            "{}",
+            whole.trace_id()
+        );
+    }
+
+    #[test]
+    fn the_summary_trace_is_not_a_file_and_has_the_same_id_shape() {
+        let summary = Trace::for_summary();
+        assert!(summary.path().is_empty());
+        assert_eq!(summary.piece(), None);
+        assert_eq!(summary.trace_id().len(), super::super::run_id::ID_LENGTH);
+        assert_ne!(
+            summary.trace_id(),
+            Trace::for_review("src/parse.c", None).trace_id()
+        );
     }
 
     #[test]

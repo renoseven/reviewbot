@@ -12,6 +12,10 @@ pub const SUMMARY: &str = "summary.json";
 
 /// Files fetched at the reviewed commit. The worktree cache lives here when
 /// this run has a repository and no command-line checkout.
+/// One JSON file per conversation. Named by `trace_id`, sixteen hex
+/// characters, the same shape as a run id.
+pub const TRACES: &str = "traces";
+
 pub const CACHE: &str = "cache";
 
 /// Writable cwd for checkers. Empty except for whatever a checker drops;
@@ -24,7 +28,7 @@ pub fn stage_file(stage: Stage) -> String {
 }
 
 pub fn trace_file(trace_id: &str) -> String {
-    format!("traces/{trace_id}.json")
+    format!("{TRACES}/{trace_id}.json")
 }
 
 /// The two artifacts `--output-dir` exports carry the run id in their names,
