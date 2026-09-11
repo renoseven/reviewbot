@@ -11,7 +11,8 @@
 //!
 //! Two checks run before every call, both locally: the budget (which also
 //! caps `max_output_tokens` to what is left to spend), and whether the answer
-//! would still fit in the context window. Neither waits for the vendor to
+//! would still fit in the context window. Investigation rounds are also
+//! capped by `[review].max_rounds`. None of these waits for the vendor to
 //! say no.
 
 use std::collections::BTreeSet;
@@ -248,7 +249,7 @@ impl Review {
         let max_output_tokens = selection.model.max_output_tokens;
         let reasoning_effort = selection.model.reasoning_effort.clone();
         let context_window_tokens = selection.model.context_window_tokens;
-        let max_rounds = window.rounds();
+        let max_rounds = context.settings.config.review.max_rounds;
         let round_bytes = window.round_bytes() as usize;
         let schemas = context.tools.request_schemas(Round::Investigation);
         let concluding_schemas = context.tools.request_schemas(Round::Conclusion);
@@ -355,8 +356,7 @@ impl Review {
                 chat.conclude(
                     context.redactor,
                     format!(
-                        "the tool loop stopped after {} rounds: the conversation reached \
-                         {tokens} of {context_window_tokens} tokens",
+                        "the tool loop stopped after {} rounds: not enough context left",
                         chat.rounds
                     ),
                 )?;
@@ -420,10 +420,12 @@ impl Review {
                 true => context.progress.emit(Event::Concluding {
                     why: chat.concluding_why.clone().unwrap_or_default(),
                 }),
-                false => context.progress.emit(Event::Round {
-                    round: chat.rounds + 1,
-                    of: max_rounds,
-                }),
+                false => {
+                    context.progress.emit(Event::Round {
+                        round: chat.rounds + 1,
+                        of: max_rounds,
+                    });
+                }
             }
             let response = context.send_and_settle(&request)?;
             chat.trace.usage.add(&response.usage);
@@ -468,15 +470,23 @@ impl Review {
             }
 
             if investigated {
-                match chat.rounds >= max_rounds {
-                    true => chat.conclude(
+                if chat.rounds >= max_rounds {
+                    chat.conclude(
                         context.redactor,
-                        format!("the tool loop reached its ceiling of {max_rounds} rounds"),
-                    )?,
-                    // Ordinary rounds get nothing. The count was read as a
-                    // quota. The last-round warning is the one sentence that
-                    // changes what the next call should do.
-                    false => chat.warn_if_last_round(context.redactor, max_rounds)?,
+                        format!(
+                            "the tool loop stopped after {max_rounds} rounds: \
+                             the configured limit was reached"
+                        ),
+                    )?;
+                } else {
+                    // The next call's size, after this round's tools went in.
+                    // If it no longer fits, the top of the loop concludes.
+                    // If it fits but is the last that will, say so now.
+                    request.input = chat.input.clone();
+                    let next_tokens = request.estimated_input_tokens() + max_output_tokens;
+                    if next_tokens <= context_window_tokens && chat.rounds + 1 >= max_rounds {
+                        chat.warn_if_last_round(context.redactor)?;
+                    }
                 }
             }
         };
@@ -583,10 +593,7 @@ impl Conversation {
 
     /// The next round is the last one there is. Earlier rounds get no
     /// note: showing the remaining count was read as a quota to spend.
-    fn warn_if_last_round(&mut self, redactor: &Redactor, total: u32) -> Result<(), StageError> {
-        if self.rounds + 1 < total {
-            return Ok(());
-        }
+    fn warn_if_last_round(&mut self, redactor: &Redactor) -> Result<(), StageError> {
         self.input.push(InputItem::Message {
             role: Role::User,
             content: redactor.redact(&Prompts::ROUNDS_LAST.text()?),
@@ -1304,10 +1311,9 @@ mod tests {
         }
     }
 
-    /// The same plan with the window dictated: how many rounds the loop gets,
-    /// and how much all of one round's output may add up to. Derived from the
-    /// model's window in a real run, which is not a thing a test can reach the
-    /// ceiling of without scripting a megabyte of answers.
+    /// The same plan with the window dictated: how much all of one round's
+    /// output may add up to, and a leftover `rounds` field the loop no
+    /// longer reads. The investigation ceiling is `[review].max_rounds`.
     fn plan_with(path: &str, rounds: u32, round_bytes: u64) -> TriagePlan {
         TriagePlan {
             chunks: vec![piece(path, 0, 1)],
@@ -1625,7 +1631,8 @@ mod tests {
             ],
             Limit::Amount(10.0),
         )
-        .with_tools(with_submit(tools));
+        .with_tools(with_submit(tools))
+        .with_max_rounds(2);
 
         review_over(&mut fixture, &plan_with("src/parse.c", 2, 32_768));
 
@@ -1642,7 +1649,9 @@ mod tests {
             fixture
                 .progress()
                 .iter()
-                .any(|event| matches!(event, Event::Concluding { why } if why.contains("ceiling"))),
+                .any(|event| {
+                    matches!(event, Event::Concluding { why } if why.contains("configured limit"))
+                }),
             "the turn that replaces a round says what it is: {:?}",
             fixture.progress()
         );
@@ -1662,7 +1671,8 @@ mod tests {
             ],
             Limit::Amount(10.0),
         )
-        .with_tools(with_submit(tools));
+        .with_tools(with_submit(tools))
+        .with_max_rounds(3);
 
         review_over(&mut fixture, &plan_with("src/parse.c", 3, 32_768));
 
@@ -1711,7 +1721,8 @@ mod tests {
             ],
             Limit::Amount(10.0),
         )
-        .with_tools(with_submit(tools));
+        .with_tools(with_submit(tools))
+        .with_max_rounds(2);
 
         let output = review_over(&mut fixture, &plan);
 
@@ -2205,7 +2216,7 @@ mod tests {
             trace
                 .notes_by(Stage::Review)
                 .iter()
-                .any(|check| check.contains("the conversation reached")),
+                .any(|check| check.contains("not enough context left")),
             "{:?}",
             trace.checks
         );

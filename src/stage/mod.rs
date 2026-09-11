@@ -398,6 +398,7 @@ max_hits_per_search = 50
 max_files_per_fetch = 20
 max_file_bytes = 262144
 max_tool_output_bytes = 32768
+max_rounds = 100
 
 [triage]
 max_chunk_tokens = 24000

@@ -156,8 +156,10 @@ impl Window {
         self.chunk_tokens
     }
 
-    /// How many times the model may ask for something before it is asked to
-    /// conclude with what it has.
+    /// Remaining full-chunk dumps after the diff has its share. The review
+    /// loop does not use this as its ceiling: that is `[review].max_rounds`
+    /// plus a live window check. Tests still read it as what the window
+    /// can afford.
     pub fn rounds(self) -> u32 {
         self.rounds
     }
@@ -390,7 +392,7 @@ impl Triage {
             chunks = plan.chunks.len(),
             skipped = plan.skipped.len(),
             chunk_limit = window.chunk_tokens(),
-            rounds = window.rounds(),
+            max_rounds = context.settings.config.review.max_rounds,
             round_bytes = window.round_bytes(),
             prompt_tokens,
             "triage done"
@@ -487,6 +489,7 @@ max_hits_per_search = 50
 max_files_per_fetch = 20
 max_file_bytes = 262144
 max_tool_output_bytes = 32768
+max_rounds = 100
 
 [triage]
 max_chunk_tokens = 20000
@@ -928,11 +931,10 @@ max_output_tokens = 4096
         );
     }
 
-    /// Rounds are what the window can afford once the diff has its share, so
-    /// a bigger window buys rounds and a bigger chunk spends them. Nobody
-    /// configures either number any more, which is the point: the pair that
-    /// used to be configured multiplied into a reservation taken out of this
-    /// same window, and the ceiling people ended up with was far too low.
+    /// How many full-chunk dumps still fit after the diff has its share.
+    /// A bigger window buys more; a bigger chunk spends them. The review
+    /// loop does not stop on this number — it stops on `[review].max_rounds`
+    /// or a conversation that no longer fits.
     #[test]
     fn rounds_are_what_is_left_of_the_window_after_the_diff() {
         let written = config(CONFIG);

@@ -26,6 +26,7 @@ max_hits_per_search = 50
 max_files_per_fetch = 20
 max_file_bytes = 262144
 max_tool_output_bytes = 32768
+max_rounds = 100
 
 [triage]
 max_chunk_tokens = 24000
@@ -392,6 +393,13 @@ impl StageFixture {
             model.context_window_tokens = tokens;
             model.max_output_tokens = tokens / 8;
         }
+        self
+    }
+
+    /// The count ceiling for one file. Tests that need to hit it without
+    /// filling the window set a small one here.
+    pub fn with_max_rounds(mut self, rounds: u32) -> Self {
+        self.settings.config.review.max_rounds = rounds;
         self
     }
 

@@ -69,6 +69,8 @@ max_files_per_fetch = 20      # paths one fetch_repo_file call may pull
 max_file_bytes = 262144       # most of one file a read may fetch
                               # a read takes the whole file; a larger file is refused
 max_tool_output_bytes = 32768 # most one tool answer may hand back
+max_rounds = 100              # investigation rounds one file may take
+                              # the conversation also stops when the next call no longer fits
 
 # What may be touched.
 # A whitelist and a deny list; sizes live under [review].

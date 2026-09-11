@@ -152,14 +152,13 @@ pub enum Event {
         piece: usize,
         pieces: usize,
     },
-    /// One round of the tool loop inside the current file. `of` is the ceiling
-    /// this run worked out, not a forecast: most files end far short of it.
-    /// Never emitted for the concluding turn, which is not a round of the loop
-    /// — saying so was how a screen came to show `round 13/12`.
+    /// One round of the tool loop inside the current file. `of` is
+    /// `[review].max_rounds`. Never emitted for the concluding turn, which
+    /// is not a round of the loop — saying so was how a screen came to
+    /// show `round 13/12`.
     Round { round: u32, of: u32 },
-    /// The loop is over and the model is being asked to conclude: either it
-    /// used every round, or the conversation reached the window. `why` is the
-    /// same sentence the trace and the report carry.
+    /// The loop is over and the model is being asked to conclude. `why` says
+    /// which stop it was: not enough context, or the configured limit.
     Concluding { why: String },
     /// A tool the model asked for, as the call goes out. Its answer goes to
     /// the model and to the trace, not here.

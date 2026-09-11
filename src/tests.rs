@@ -28,6 +28,7 @@ max_hits_per_search = 50
 max_files_per_fetch = 20
 max_file_bytes = 262144
 max_tool_output_bytes = 32768
+max_rounds = 100
 
 [triage]
 max_chunk_tokens = 24000
@@ -1761,24 +1762,12 @@ fn a_full_run_announces_every_stage_and_numbers_the_chunks() {
         ],
         "chunks are counted from 1, for a reader rather than for the loop"
     );
-    // The ceiling is derived from the window rather than configured, so what a
-    // round is counted against is whatever `triage` wrote down.
-    let plan: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(
-            workspace
-                .run_dir(&result.run_id)
-                .join(layout::stage_file(Stage::Triage)),
-        )
-        .expect("triage checkpoint"),
-    )
-    .expect("checkpoint json");
-    let rounds = plan["window"]["rounds"].as_u64().expect("rounds") as u32;
     assert!(
-        watcher
-            .events()
-            .iter()
-            .any(|event| matches!(event, Event::Round { round: 1, of } if *of == rounds)),
-        "a round is counted against the ceiling triage worked out"
+        watcher.events().iter().any(|event| matches!(
+            event,
+            Event::Round { round: 1, of: 100 }
+        )),
+        "a round is counted against [review].max_rounds"
     );
     assert!(
         watcher

@@ -108,6 +108,11 @@ pub struct ReviewSettings {
     /// the diff has taken its share, worked out per run.
     #[serde(default)]
     pub max_tool_output_bytes: u64,
+    /// How many investigation rounds one file may take. A dead-loop guard,
+    /// not a window reservation: the conversation also stops when the next
+    /// call no longer fits. Per file, not per run.
+    #[serde(default)]
+    pub max_rounds: u32,
 }
 
 #[cfg(test)]
@@ -121,6 +126,7 @@ impl ReviewSettings {
             max_files_per_fetch: 20,
             max_file_bytes: 262_144,
             max_tool_output_bytes: 32_768,
+            max_rounds: 100,
         }
     }
 }

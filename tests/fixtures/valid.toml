@@ -4,6 +4,7 @@ max_hits_per_search = 50
 max_files_per_fetch = 20
 max_file_bytes = 262144
 max_tool_output_bytes = 65536
+max_rounds = 100
 
 [[provider]]
 name = "deepseek"

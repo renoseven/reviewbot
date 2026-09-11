@@ -558,10 +558,9 @@ impl Config {
     /// output is worth carrying. A builtin default would make those calls
     /// silently, and the wrong call is quiet.
     ///
-    /// The round ceiling used to be here and is not any more: it is not a
-    /// project fact but whatever the model's window can afford once the diff
-    /// has its share, so it is worked out per run rather than guessed by hand
-    /// (see `stage::triage::Window`).
+    /// `max_rounds` is here too: it is a dead-loop guard for one file, not
+    /// a reservation carved out of the window. The window still stops a
+    /// conversation that no longer fits.
     fn check_sizes(&self) -> Result<(), ConfigError> {
         let required = [
             (
@@ -589,6 +588,7 @@ impl Config {
                 "[review].max_tool_output_bytes",
                 self.review.max_tool_output_bytes,
             ),
+            ("[review].max_rounds", u64::from(self.review.max_rounds)),
         ];
         for (field, value) in required {
             if value == 0 {
@@ -756,6 +756,7 @@ max_hits_per_search = 50
 max_files_per_fetch = 20
 max_file_bytes = 262144
 max_tool_output_bytes = 32768
+max_rounds = 100
 
 [triage]
 max_chunk_tokens = 24000
@@ -999,6 +1000,7 @@ api_token = "GITHUB_TOKEN"
                 "[review].max_tool_output_bytes",
                 "max_tool_output_bytes = 32768",
             ),
+            ("[review].max_rounds", "max_rounds = 100"),
         ] {
             assert!(MINIMAL.contains(line), "the fixture stopped setting {line}");
             let absent = MINIMAL.replace(line, "");
