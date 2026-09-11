@@ -6,12 +6,14 @@
 //! the seventh talks to the model: the comments themselves arrived through
 //! `submit_comment`, and `review` serialised the document this stage reads.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{ChangeSet, Comment, CommentTarget, Confidence, FileChange, Severity, Stage};
+use crate::domain::{
+    ChangeSet, Comment, CommentTarget, Confidence, FileChange, Hunk, Severity, Stage,
+};
 use crate::protocol::{InputItem, Request, Role};
 use crate::record::{ToolCall, Trace};
 use crate::tool::{Round, SubmitSummary, whole_score};
@@ -31,6 +33,13 @@ pub const QUOTE_UNVERIFIED: &str = "quote unverified";
 /// further than this would point at unrelated code. The quotation check
 /// reuses it because alignment has just moved the line by up to that much.
 const ALIGN_WINDOW: u32 = 3;
+
+/// A backtick span shorter than this cannot pick a hang unless it sits on
+/// exactly one commentable line: `len()` and `i` appear all over a file.
+const QUOTE_PIN: usize = 8;
+
+/// A unique span may be this short. Below this, even one hit is noise.
+const QUOTE_UNIQUE: usize = 6;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct MergeOutput {
@@ -171,6 +180,9 @@ struct ChunkFile<'a> {
     trace_id: &'a str,
     commentable_lines: &'a BTreeSet<u32>,
     changed_lines: &'a BTreeSet<u32>,
+    /// The hunks this file was built from, so a hang on a blank or a lone
+    /// closer can be walked back to a line that still has code on it.
+    hunks: &'a [Hunk],
     /// As recorded, which is exactly what went into `function_call_output`.
     /// Checking against a rawer capture would fail on anything the model was
     /// never shown.
@@ -201,6 +213,15 @@ struct Produced {
 struct Alignment {
     line: Option<u32>,
     note: Option<String>,
+}
+
+/// What step 3 needs to pick a hang. One comment, one file, one pass.
+struct AlignNeed<'a> {
+    commentable: &'a BTreeSet<u32>,
+    line: Option<u32>,
+    evidence: &'a [u32],
+    texts: &'a BTreeMap<u32, String>,
+    body: &'a str,
 }
 
 /// Step 7's outcome: the model's verdict, or the reason there is none.
@@ -427,6 +448,7 @@ impl<'c, 'a> Merge<'c, 'a> {
                 trace_id: &chunk.trace_id,
                 commentable_lines: &file.commentable_lines,
                 changed_lines: &file.changed_lines,
+                hunks: &file.hunks,
                 tool_calls: &tool_calls,
                 fetched: &fetched,
                 root: self.context.settings.options().worktree.as_deref(),
@@ -522,8 +544,18 @@ impl<'c, 'a> Merge<'c, 'a> {
 
         // Step 3, alignment. It moves the line and nothing else: where a
         // comment hangs and whether it is right are different questions.
-        let alignment = self.align(file.commentable_lines, raw.start_line, &lines);
-        let end_line = end_line_of(&alignment, raw.end_line, file.commentable_lines);
+        // A blank or a lone closer is still commentable, but it is not a
+        // hang — the defect is on a statement, and a whole-file add makes
+        // every line look equally legal.
+        let texts = new_side_text(file.hunks);
+        let alignment = self.align(&AlignNeed {
+            commentable: file.commentable_lines,
+            line: raw.start_line,
+            evidence: &lines,
+            texts: &texts,
+            body: &body,
+        });
+        let end_line = end_line_of(&alignment, raw.end_line, file.commentable_lines, &texts);
         let mut notes = Vec::new();
         notes.extend(alignment.note);
 
@@ -586,16 +618,49 @@ impl<'c, 'a> Merge<'c, 'a> {
     }
 
     /// Step 3. The commentable set is the one that decides where a comment
-    /// may hang; whether it may exist at all was step 2's question.
-    fn align(&self, commentable: &BTreeSet<u32>, line: Option<u32>, lines: &[u32]) -> Alignment {
-        if let Some(line) = line {
-            if commentable.contains(&line) {
+    /// may hang; whether it may exist at all was step 2's question. A blank
+    /// or a lone closer is still in that set — the platform will take a
+    /// comment there — but it is not a statement, so this step leaves it
+    /// when a stronger hang is at hand. A real statement that does not
+    /// contain the longest quoted span is left too, unless that span pins
+    /// somewhere else. Scores stay where the model put them.
+    fn align(&self, need: &AlignNeed<'_>) -> Alignment {
+        if let Some(line) = need.line {
+            if usable(need.commentable, need.texts, line) {
+                if let Some(quoted) = quoted_pin(need, Some(line)) {
+                    if quoted != line {
+                        return Alignment {
+                            line: Some(quoted),
+                            note: Some(format!(
+                                "line {line} does not contain the quoted span; moved {} to {quoted}",
+                                offset(line, quoted)
+                            )),
+                        };
+                    }
+                }
                 return Alignment {
                     line: Some(line),
                     note: None,
                 };
             }
-            if let Some(near) = nearest_commentable(commentable, line) {
+            if need.commentable.contains(&line) {
+                if let Some(better) = stronger_hang(need, Some(line)) {
+                    return Alignment {
+                        line: Some(better),
+                        note: Some(format!(
+                            "line {line} is blank or a lone closer; moved {} to {better}",
+                            offset(line, better)
+                        )),
+                    };
+                }
+                return Alignment {
+                    line: None,
+                    note: Some(format!(
+                        "line {line} is blank or a lone closer; became a file level comment"
+                    )),
+                };
+            }
+            if let Some(near) = nearest_usable(need.commentable, need.texts, line) {
                 return Alignment {
                     line: Some(near),
                     note: Some(format!(
@@ -607,20 +672,25 @@ impl<'c, 'a> Merge<'c, 'a> {
         }
         // What the model said it read is usually closer to the truth than the
         // line it wrote down: the first it copied, the second it counted.
-        if let Some(fallback) = lines
-            .iter()
-            .copied()
-            .find(|line| commentable.contains(line))
-        {
+        if let Some(fallback) = first_usable(need.commentable, need.texts, need.evidence) {
             return Alignment {
                 line: Some(fallback),
-                note: Some(match line {
+                note: Some(match need.line {
                     Some(line) => format!(
-                        "line {line} is more than {ALIGN_WINDOW} lines from any commentable line; \
+                        "line {line} is more than {ALIGN_WINDOW} lines from any usable hang; \
                          used evidence.lines {fallback} instead"
                     ),
                     None => format!("no line was given; used evidence.lines {fallback}"),
                 }),
+            };
+        }
+        if let Some(quoted) = quoted_pin(need, need.line) {
+            return Alignment {
+                line: Some(quoted),
+                note: Some(format!(
+                    "no commentable hang was usable; pinned to line {quoted} from a quotation \
+                     in the body"
+                )),
             };
         }
         Alignment {
@@ -963,13 +1033,18 @@ fn file_of<'a>(changeset: &'a ChangeSet, path: &str) -> Option<&'a FileChange> {
     changeset.files.iter().find(|file| file.new_path == path)
 }
 
-/// The closest commentable line within the window, preferring the line above
-/// on a tie so the choice is reproducible.
-fn nearest_commentable(commentable: &BTreeSet<u32>, line: u32) -> Option<u32> {
+/// The closest usable line within the window, preferring the line above
+/// on a tie so the choice is reproducible. A closer inside the window is
+/// skipped: landing on one is the hang this step exists to leave.
+fn nearest_usable(
+    commentable: &BTreeSet<u32>,
+    texts: &BTreeMap<u32, String>,
+    line: u32,
+) -> Option<u32> {
     (1..=ALIGN_WINDOW)
         .flat_map(|distance| [line.checked_sub(distance), line.checked_add(distance)])
         .flatten()
-        .find(|candidate| commentable.contains(candidate))
+        .find(|candidate| usable(commentable, texts, *candidate))
 }
 
 fn offset(from: u32, to: u32) -> String {
@@ -979,15 +1054,222 @@ fn offset(from: u32, to: u32) -> String {
     }
 }
 
+/// Leave a blank or a lone closer. A quoted span in the body first: the
+/// line numbers on a weak hang are the same counting error that produced
+/// it, so evidence is the fallback, not the lead. No walk back.
+fn stronger_hang(need: &AlignNeed<'_>, from: Option<u32>) -> Option<u32> {
+    quoted_pin(need, from).or_else(|| first_usable(need.commentable, need.texts, need.evidence))
+}
+
+fn first_usable(
+    commentable: &BTreeSet<u32>,
+    texts: &BTreeMap<u32, String>,
+    lines: &[u32],
+) -> Option<u32> {
+    lines
+        .iter()
+        .copied()
+        .find(|line| usable(commentable, texts, *line))
+}
+
+fn usable(commentable: &BTreeSet<u32>, texts: &BTreeMap<u32, String>, line: u32) -> bool {
+    commentable.contains(&line) && !weak_hang(texts.get(&line).map(String::as_str))
+}
+
+/// A hang the platform will accept and a reader will not: nothing there, or
+/// only a closer (`}` / `)` / `]`) with optional `;` / `,`. A lone `{` is
+/// still a statement opener. A line this step has never seen the text of
+/// is not weak — old tests and a checkpoint whose hunks do not cover the
+/// line keep the four-step walk.
+fn weak_hang(text: Option<&str>) -> bool {
+    let Some(text) = text else {
+        return false;
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    trimmed
+        .chars()
+        .all(|c| matches!(c, '}' | ')' | ']' | ';' | ','))
+        && trimmed.chars().any(|c| matches!(c, '}' | ')' | ']'))
+}
+
+/// New-file line text reconstructed from the hunks. The increment matches
+/// the cursor that minted `commentable_lines`, so a hang in the set has a
+/// row here unless the hunk text was rewritten underneath the checkpoint.
+fn new_side_text(hunks: &[Hunk]) -> BTreeMap<u32, String> {
+    let mut lines = BTreeMap::new();
+    for hunk in hunks {
+        let mut new_line = match hunk.new_count {
+            0 => hunk.new_start + 1,
+            _ => hunk.new_start,
+        };
+        for line in hunk.text.lines() {
+            if line.starts_with("@@") {
+                continue;
+            }
+            match line.chars().next() {
+                Some('\\' | '-') => {}
+                Some('+' | ' ') => {
+                    lines.insert(new_line, line.get(1..).unwrap_or("").to_string());
+                    new_line += 1;
+                }
+                None => {
+                    lines.insert(new_line, String::new());
+                    new_line += 1;
+                }
+                Some(_) => {
+                    lines.insert(new_line, line.to_string());
+                    new_line += 1;
+                }
+            }
+        }
+    }
+    lines
+}
+
+/// A backtick span in the body that sits on a commentable line. Unique hits
+/// near the hang or on an evidence line beat a longer name that appears
+/// twice; otherwise the longest span wins, and several hits take the
+/// uniquely nearest to `from`. Suggestion is not read: proposed code is
+/// not a location in this file.
+fn quoted_pin(need: &AlignNeed<'_>, from: Option<u32>) -> Option<u32> {
+    let mut found = Vec::new();
+    let mut rest = need.body;
+    while let Some(start) = rest.find('`') {
+        rest = &rest[start + 1..];
+        let Some(end) = rest.find('`') else {
+            break;
+        };
+        let quote = rest[..end].trim();
+        rest = &rest[end + 1..];
+        let len = quote.chars().count();
+        let hits: Vec<u32> = need
+            .commentable
+            .iter()
+            .copied()
+            .filter(|line| {
+                need.texts
+                    .get(line)
+                    .is_some_and(|text| text.contains(quote))
+            })
+            .collect();
+        let unique = hits.len() == 1;
+        if len < QUOTE_UNIQUE || (len < QUOTE_PIN && !unique) {
+            continue;
+        }
+        let Some(pin) = pin_from_hits(&hits, from) else {
+            continue;
+        };
+        found.push(QuoteHit { len, pin, unique });
+    }
+    pick_quote(&found, from, need.evidence)
+}
+
+struct QuoteHit {
+    len: usize,
+    pin: u32,
+    unique: bool,
+}
+
+fn pick_quote(found: &[QuoteHit], from: Option<u32>, evidence: &[u32]) -> Option<u32> {
+    if let Some(from) = from {
+        if let Some(pin) =
+            best_unique(found, |hit| from.abs_diff(hit.pin) <= ALIGN_WINDOW)
+        {
+            return Some(pin);
+        }
+    }
+    if let Some(pin) = best_unique(found, |hit| evidence.contains(&hit.pin)) {
+        return Some(pin);
+    }
+    let best_len = found.iter().map(|hit| hit.len).max()?;
+    let mut pins = Vec::new();
+    for hit in found {
+        if hit.len == best_len && !pins.contains(&hit.pin) {
+            pins.push(hit.pin);
+        }
+    }
+    match pins.len() {
+        1 => Some(pins[0]),
+        _ => None,
+    }
+}
+
+fn best_unique(found: &[QuoteHit], keep: impl Fn(&QuoteHit) -> bool) -> Option<u32> {
+    let mut best_len = 0;
+    let mut pins = Vec::new();
+    for hit in found {
+        if !hit.unique || !keep(hit) {
+            continue;
+        }
+        if hit.len > best_len {
+            best_len = hit.len;
+            pins.clear();
+            pins.push(hit.pin);
+        } else if hit.len == best_len && !pins.contains(&hit.pin) {
+            pins.push(hit.pin);
+        }
+    }
+    match pins.len() {
+        1 => Some(pins[0]),
+        _ => None,
+    }
+}
+
+fn pin_from_hits(hits: &[u32], from: Option<u32>) -> Option<u32> {
+    match (hits, from) {
+        ([], _) => None,
+        ([hit], _) => Some(*hit),
+        (_, Some(from)) => uniquely_nearest(hits, from),
+        _ => None,
+    }
+}
+
+fn uniquely_nearest(hits: &[u32], from: u32) -> Option<u32> {
+    let mut best: Option<(u32, u32)> = None;
+    let mut tied = false;
+    for &hit in hits {
+        let dist = from.abs_diff(hit);
+        match best {
+            None => {
+                best = Some((dist, hit));
+                tied = false;
+            }
+            Some((best_dist, _)) if dist < best_dist => {
+                best = Some((dist, hit));
+                tied = false;
+            }
+            Some((best_dist, best_line)) if dist == best_dist && hit != best_line => {
+                tied = true;
+            }
+            _ => {}
+        }
+    }
+    if tied {
+        None
+    } else {
+        best.map(|(_, line)| line)
+    }
+}
+
 /// The model's end line, kept only when it still describes a range that can
-/// carry a comment. A file level comment has no range at all.
+/// carry a comment. A file level comment has no range at all. An end that
+/// is itself blank or a lone closer is dropped: the span was about the
+/// dead hang, not about a second statement.
 fn end_line_of(
     alignment: &Alignment,
     end_line: Option<u32>,
     commentable: &BTreeSet<u32>,
+    texts: &BTreeMap<u32, String>,
 ) -> Option<u32> {
     let line = alignment.line?;
-    end_line.filter(|end| *end > line && commentable.contains(end))
+    let end = end_line.filter(|end| *end > line && commentable.contains(end))?;
+    if weak_hang(texts.get(&end).map(String::as_str)) {
+        return None;
+    }
+    Some(end)
 }
 
 /// A file level comment sorts after the lines of the same file rather than
@@ -1221,7 +1503,9 @@ mod tests {
         )
     }
 
-    /// One file with the two line sets spelled out, which is all merge reads.
+    /// One file with the two line sets spelled out. The dummy hunk only
+    /// covers line 1, so hangs on the given numbers have no text and stay
+    /// on the four-step walk.
     fn file(path: &str, commentable: &[u32], changed: &[u32]) -> FileChange {
         FileChange {
             old_path: path.to_string(),
@@ -1376,9 +1660,32 @@ mod tests {
     }
 
     fn aligned(commentable: &BTreeSet<u32>, line: Option<u32>, lines: &[u32]) -> Alignment {
+        aligned_on(commentable, line, lines, &BTreeMap::new(), "")
+    }
+
+    fn aligned_on(
+        commentable: &BTreeSet<u32>,
+        line: Option<u32>,
+        lines: &[u32],
+        texts: &BTreeMap<u32, String>,
+        body: &str,
+    ) -> Alignment {
         let mut fixture = StageFixture::new(Vec::new());
         let mut context = fixture.context();
-        Merge::new(&mut context).align(commentable, line, lines)
+        Merge::new(&mut context).align(&AlignNeed {
+            commentable,
+            line,
+            evidence: lines,
+            texts,
+            body,
+        })
+    }
+
+    fn texts(pairs: &[(u32, &str)]) -> BTreeMap<u32, String> {
+        pairs
+            .iter()
+            .map(|(line, text)| (*line, (*text).to_string()))
+            .collect()
     }
 
     #[test]
@@ -1479,6 +1786,269 @@ mod tests {
         // commentable set, so a deletion still has somewhere to hang; a file
         // with nothing commentable at all degrades instead of vanishing.
         assert_eq!(aligned(&BTreeSet::new(), Some(11), &[11]).line, None);
+    }
+
+    #[test]
+    fn alignment_will_not_hang_on_a_blank_or_a_lone_closer() {
+        let commentable: BTreeSet<u32> = [32, 33, 36, 37, 38].into_iter().collect();
+        let texts = texts(&[
+            (32, "        return Firmware::VERSION;"),
+            (33, "    }"),
+            (36, "        return Firmware::HW_VERSION;"),
+            (37, "    }"),
+            (38, ""),
+        ]);
+
+        let quoted = aligned_on(
+            &commentable,
+            Some(37),
+            &[37, 38],
+            &texts,
+            "`return Firmware::VERSION;` returns const char*",
+        );
+        assert_eq!(quoted.line, Some(32), "the unique quote is the statement");
+        assert!(
+            quoted.note.as_deref().unwrap().contains("closer")
+                || quoted.note.as_deref().unwrap().contains("blank"),
+            "{:?}",
+            quoted.note
+        );
+
+        let via_evidence = aligned_on(&commentable, Some(38), &[38, 32], &texts, "");
+        assert_eq!(
+            via_evidence.line,
+            Some(32),
+            "with no quote, a real evidence line still beats the blank"
+        );
+
+        let no_guess = aligned_on(
+            &commentable,
+            Some(38),
+            &[38],
+            &texts,
+            "no quotation long enough to pin anything",
+        );
+        assert_eq!(
+            no_guess.line,
+            None,
+            "without evidence or a quote, a weak hang becomes file level"
+        );
+
+        let kept = aligned_on(
+            &commentable,
+            Some(32),
+            &[32],
+            &texts,
+            "`return Firmware::VERSION;` returns const char*",
+        );
+        assert_eq!(kept.line, Some(32));
+        assert!(kept.note.is_none(), "a real statement is left alone");
+    }
+
+    #[test]
+    fn alignment_pins_a_signature_hang_to_the_quoted_call() {
+        let commentable: BTreeSet<u32> = [69, 73, 78, 96, 112].into_iter().collect();
+        let texts = texts(&[
+            (69, "pub fn get_patch_status<P, Q>("),
+            (73, ") -> std::io::Result<PatchStatus>"),
+            (78, "    let ioctl_fd = ioctl_dev.as_raw_fd();"),
+            (
+                96,
+                "    let status_code = unsafe { ffi::ioctl_get_patch_status(ioctl_dev, &request) }?;",
+            ),
+            (112, "    let ioctl_fd = ioctl_dev.as_raw_fd();"),
+        ]);
+        let body = "`ioctl_dev.as_raw_fd()` is called on a `RawFd`. \
+                    Inconsistent with the `get_patch_status` body.";
+
+        let moved = aligned_on(&commentable, Some(73), &[73, 27, 40, 60], &texts, body);
+        assert_eq!(
+            moved.line,
+            Some(78),
+            "the longest quote's nearest hit beats the signature"
+        );
+        assert!(
+            moved.note.as_deref().unwrap().contains("quoted"),
+            "{:?}",
+            moved.note
+        );
+
+        let stayed = aligned_on(&commentable, Some(78), &[78], &texts, body);
+        assert_eq!(stayed.line, Some(78));
+        assert!(
+            stayed.note.is_none(),
+            "a hang that already contains the span is left alone: {:?}",
+            stayed.note
+        );
+    }
+
+    #[test]
+    fn a_short_unique_quote_inside_the_window_beats_a_longer_name() {
+        let commentable: BTreeSet<u32> = [166, 167, 168, 169].into_iter().collect();
+        let texts = texts(&[
+            (166, "    pub fn get_patch_status(&self, patch: &UserPatch) -> Result<PatchStatus> {"),
+            (
+                167,
+                "        sys::get_patch_status(self.ioctl_fd(), &patch.target_elf, &patch.patch_file).map_err(|e| {",
+            ),
+            (168, "            anyhow!("),
+            (169, "                \"Kpatch: Failed to get patch status, {}\","),
+        ]);
+        let body = "The error message of `get_patch_status` uses the `Kpatch:` prefix \
+                    instead of `Upatch:`.";
+
+        let moved = aligned_on(&commentable, Some(168), &[167, 168], &texts, body);
+        assert_eq!(
+            moved.line,
+            Some(169),
+            "the unique prefix in the window is the line to change"
+        );
+    }
+
+    #[test]
+    fn a_unique_quote_on_an_evidence_line_beats_a_longer_name_that_appears_twice() {
+        let commentable: BTreeSet<u32> = [19, 29, 70, 100].into_iter().collect();
+        let texts = texts(&[
+            (19, "    const UPATCH_MAGIC: u8 = 0xE5;"),
+            (29, "    pub const UPATCH_STATUS_ACTIVED: i32 = 3;"),
+            (70, "    ioctl_dev: RawFd,"),
+            (100, "        ffi::UPATCH_STATUS_ACTIVED => PatchStatus::Actived,"),
+        ]);
+        let body = "`UPATCH_STATUS_ACTIVED` is 3, and `UPATCH_MAGIC` is passed through.";
+
+        let moved = aligned_on(&commentable, Some(70), &[19], &texts, body);
+        assert_eq!(
+            moved.line,
+            Some(19),
+            "evidence plus a unique quote beats the longer name's nearer hit"
+        );
+    }
+
+    #[test]
+    fn a_weak_hang_prefers_the_quoted_call_over_a_wrong_evidence_line() {
+        let commentable: BTreeSet<u32> = [184, 185, 192, 211, 219].into_iter().collect();
+        let texts = texts(&[
+            (184, "                \"Upatch: Failed to load patch, {}\","),
+            (185, "            )"),
+            (192, "                \"Upatch: Failed to remove patch, {}\","),
+            (
+                211,
+                "        sys::deactive_patch(self.ioctl_fd(), &patch.target_elf, &patch.patch_file).map_err(",
+            ),
+            (219, "        self.unregister_patch(patch);"),
+        ]);
+        let body = "When `sys::deactive_patch` fails, the `?` returns early, so \
+                    `self.unregister_patch(patch)` never runs.";
+
+        let moved = aligned_on(&commentable, Some(185), &[192, 184, 185], &texts, body);
+        assert_eq!(
+            moved.line,
+            Some(219),
+            "the longest quote beats evidence that pointed at another function"
+        );
+    }
+
+    #[test]
+    fn a_lone_opener_is_not_a_weak_hang_and_a_window_skips_closers() {
+        let commentable: BTreeSet<u32> = [10, 11].into_iter().collect();
+
+        let opener = aligned_on(
+            &commentable,
+            Some(11),
+            &[11],
+            &texts(&[(10, "int bar()"), (11, "{")]),
+            "",
+        );
+        assert_eq!(
+            opener.line,
+            Some(11),
+            "a lone opening brace is a real hang"
+        );
+
+        let near = aligned_on(
+            &commentable,
+            Some(13),
+            &[13],
+            &texts(&[(10, "    return x;"), (11, "}")]),
+            "",
+        );
+        assert_eq!(
+            near.line,
+            Some(10),
+            "±3 skips the closer and lands on the statement"
+        );
+    }
+
+    #[test]
+    fn new_side_text_reads_added_and_context_lines_and_skips_deletions() {
+        let hunks = [Hunk {
+            old_start: 10,
+            old_count: 3,
+            new_start: 10,
+            new_count: 3,
+            text: "@@ -10,3 +10,3 @@\n int kept;\n-int gone;\n+int added;\n \n".to_string(),
+        }];
+        let lines = new_side_text(&hunks);
+        assert_eq!(lines.get(&10).map(String::as_str), Some("int kept;"));
+        assert_eq!(lines.get(&11).map(String::as_str), Some("int added;"));
+        assert_eq!(lines.get(&12).map(String::as_str), Some(""));
+        assert_eq!(lines.len(), 3);
+    }
+
+    #[test]
+    fn a_closer_hang_is_moved_and_its_end_line_is_dropped() {
+        let start = 32;
+        let source = [
+            "        return Firmware::VERSION;",
+            "    }",
+            "",
+            "    const char* DeviceService::getHwVersion() {",
+            "        return Firmware::HW_VERSION;",
+            "    }",
+            "",
+        ];
+        let mut text = format!("@@ -0,0 +{start},{} @@\n", source.len());
+        let mut commentable = BTreeSet::new();
+        for (i, line) in source.iter().enumerate() {
+            commentable.insert(start + i as u32);
+            text.push('+');
+            text.push_str(line);
+            text.push('\n');
+        }
+        let changeset = changeset(vec![FileChange {
+            old_path: "src/service/device.cpp".to_string(),
+            new_path: "src/service/device.cpp".to_string(),
+            hunks: vec![Hunk {
+                old_start: 0,
+                old_count: 0,
+                new_start: start,
+                new_count: source.len() as u32,
+                text,
+            }],
+            commentable_lines: commentable.clone(),
+            changed_lines: commentable,
+            binary: false,
+        }]);
+        let raw = document(&[format!(
+            r#"{{"path":"src/service/device.cpp","start_line":37,"end_line":38,"body":"`return Firmware::VERSION;` returns const char*","suggestion":"make VERSION an array","severity_score":85,"confidence_score":85,"evidence":{{"lines":[37,38]}}}}"#
+        )]);
+        let mut fixture = scoring(vec![r#"{"overall_score":50,"summary":"s"}"#]);
+        write_trace(&fixture, "review-src_service_device.cpp");
+
+        let output = merge(
+            &mut fixture,
+            &changeset,
+            &review(vec![chunk("src/service/device.cpp", &raw)]),
+        );
+
+        assert_eq!(output.comments.len(), 1);
+        assert_eq!(output.comments[0].target.start_line, Some(32));
+        assert_eq!(
+            output.comments[0].target.end_line, None,
+            "the blank after the closer is not a span"
+        );
+        assert_eq!(output.comments[0].severity_score, 85);
+        assert_eq!(output.comments[0].confidence_score, 85);
     }
 
     #[test]
