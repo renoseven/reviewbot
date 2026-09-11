@@ -25,7 +25,7 @@ src/
   security/           # 只提供检查：redactor、路径校验、子进程环境清洗与资源上限、输出截断
   budget/             # 钱与 token 的账
     mod.rs            #   Budget：冻结上限与货币、调用前检查、累计与结算
-    estimate.rs       #   字符数 token 估算（triage 切分与 review 上下文检查共用同一个函数）
+    estimate.rs       #   字符数 token 估算（plan 切分与 review 上下文检查共用同一个函数）
     price.rs          #   模型条目单价 → usage 换算，缓存命中走 cached_input_per_1m
   record/             # run_id、run 目录、lock、meta.json、checkpoint 原子写、Trace 两视图、Storage trait
   platform/           # Platform trait + RepoSource trait + gitlab / github + URL 解析 + capabilities()
@@ -33,7 +33,7 @@ src/
   protocol/           # Request/Response + Protocol trait + openai
   tool/               # Tool trait + registry + command 实现 + 六个内建 tool（读取前调 security 的路径校验）
   progress.rs         # 类型化的事件通道：run 边跑边说自己在做什么，谁在看由调用方定
-  stage/{input,triage,review,merge,report,publish}.rs
+  stage/{input,plan,review,merge,report,publish}.rs
   prompts/{review.md,summary.md}   # include_str!，配置改不动
 tests/                # 少量整装与 CLI 契约测试（assert_cmd）
 ```
@@ -51,7 +51,7 @@ tests/                # 少量整装与 CLI 契约测试（assert_cmd）
 
 **M1 分层骨架**。`Cargo.toml` 补齐 `tokio`/`reqwest`(rustls)/`serde`/`serde_json`/`toml`/`clap`/`sha2`/`regex`/`thiserror`/`tracing`/`tracing-subscriber`，另加 `globset`（`deny_paths` / `skip_paths` 的 glob 匹配，设计的依赖清单没列但绕不开），dev 加 `assert_cmd`。三个扩展点 trait（`Platform` / `Protocol` / `Tool`）与 `record::Storage` 先定死；两个来源 trait 跟着主人放在 `platform` 与 `worktree`，签名收普通的仓库相对路径。`stage::*` 六个空阶段 + 假适配器。验收是「假实现下空跑到底、正确落盘、把同一条命令再跑一遍能从任一阶段接上」。
 
-**M2 input + triage**。unified diff 解析器（同时服务本地文件与平台 diff 端点，按内容判 mbox 并拒绝），每个文件建**可评论行**与**变更行**两个集合并随 `ChangeSet` 落盘；`triage` 做过滤、按变更行数降序、一文件一分片、超限按 hunk 再切，分片上限按 `context_window − max_output_tokens − 固定骨架 − 工具余量 − headroom` 算。仍用假 protocol。
+**M2 input + plan**。unified diff 解析器（同时服务本地文件与平台 diff 端点，按内容判 mbox 并拒绝），每个文件建**可评论行**与**变更行**两个集合并随 `ChangeSet` 落盘；`plan` 做过滤、按变更行数降序、一文件一分片、超限按 hunk 再切，分片上限按 `context_window − max_output_tokens − 固定骨架 − 工具余量 − headroom` 算。仍用假 protocol。
 
 **M3 review 主干**。`protocol::openai` 打 `POST {base_url}/responses`，无流式、无 `previous_response_id`；prompt 六段写进 `src/prompts/review.md` 用 `include_str!`，`instructions` 在整个 run 内逐字不变，`input` 只装一个文件的 diff；调用前预算检查 + usage 结算 + 脱敏 + 瞬时故障退避重试（500ms 起、翻倍、上限 8s、抖动，只对超时 / 5xx / 429 / 空 body）。不含工具。
 

@@ -16,14 +16,14 @@ use crate::record::layout;
 
 use super::merge::MergeOutput;
 use super::prompt::code_span;
-use super::triage::TriagePlan;
+use super::plan::PlanOutput;
 use super::{StageContext, StageError};
 
 /// Everything the report is rendered from, gathered by the caller so the
 /// stage takes one argument. No changeset and no platform: this stage reads
 /// back what the run decided, it does not look the change up again.
 pub struct ReportInput<'a> {
-    pub plan: &'a TriagePlan,
+    pub plan: &'a PlanOutput,
     pub merged: &'a MergeOutput,
     pub unreviewed: &'a [String],
     /// Why the run stopped short, when it did. Recorded for scripts reading
@@ -364,7 +364,7 @@ mod tests {
     }
 
     fn render(fixture: &mut StageFixture, merged: &MergeOutput) {
-        let plan = TriagePlan::default();
+        let plan = PlanOutput::default();
         let input = ReportInput {
             plan: &plan,
             merged,
@@ -393,12 +393,12 @@ mod tests {
             }],
             ..MergeOutput::default()
         };
-        let plan = TriagePlan {
-            skipped: vec![crate::stage::triage::SkippedFile {
+        let plan = PlanOutput {
+            skipped: vec![crate::stage::plan::SkippedFile {
                 path: "src/gone.c".to_string(),
                 reason: "the whole file was deleted".to_string(),
             }],
-            ..TriagePlan::default()
+            ..PlanOutput::default()
         };
         let input = ReportInput {
             plan: &plan,
@@ -610,7 +610,7 @@ mod tests {
             summary: Some("Nothing worth flagging; safe to merge.".to_string()),
             ..MergeOutput::default()
         };
-        let plan = TriagePlan::default();
+        let plan = PlanOutput::default();
         let unavailable = ["could not read any file: it saw the diff and nothing else".to_string()];
         let input = ReportInput {
             plan: &plan,

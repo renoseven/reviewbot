@@ -20,7 +20,7 @@ use super::file::Config;
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Fingerprint {
     pub input: String,
-    pub triage: String,
+    pub plan: String,
     pub review: String,
 }
 
@@ -31,7 +31,7 @@ impl Fingerprint {
     fn slices(&self) -> [(Stage, &str); 3] {
         [
             (Stage::Input, self.input.as_str()),
-            (Stage::Triage, self.triage.as_str()),
+            (Stage::Plan, self.plan.as_str()),
             (Stage::Review, self.review.as_str()),
         ]
     }
@@ -68,7 +68,7 @@ pub fn fingerprint(config: &Config, model: Option<&str>, worktree: bool) -> Fing
         // would be charging for the question rather than the answer.
         log: _,
         review,
-        triage,
+        plan,
         security,
         providers,
         models,
@@ -77,7 +77,7 @@ pub fn fingerprint(config: &Config, model: Option<&str>, worktree: bool) -> Fing
     } = config;
     Fingerprint {
         input: digest(&(platforms, worktree)),
-        triage: digest(triage),
+        plan: digest(plan),
         review: digest(&(review, security, providers, models, tools, model)),
     }
 }
@@ -101,7 +101,7 @@ max_file_bytes = 262144
 max_tool_output_bytes = 32768
 max_rounds = 100
 
-[triage]
+[plan]
 max_chunk_tokens = 24000
 skip_files_over_bytes = 262144
 
@@ -149,8 +149,8 @@ api_token = "GITLAB_TOKEN"
         later.review = "other".to_string();
         assert_eq!(base.earliest_change(&later), Some(Stage::Review));
 
-        later.triage = "other".to_string();
-        assert_eq!(base.earliest_change(&later), Some(Stage::Triage));
+        later.plan = "other".to_string();
+        assert_eq!(base.earliest_change(&later), Some(Stage::Plan));
 
         later.input = "other".to_string();
         assert_eq!(
@@ -177,12 +177,12 @@ api_token = "GITLAB_TOKEN"
     }
 
     #[test]
-    fn the_triage_table_is_the_triage_slice() {
+    fn the_plan_table_is_the_plan_slice() {
         let mut config = config();
-        config.triage.max_chunk_tokens = 12_000;
+        config.plan.max_chunk_tokens = 12_000;
         let changed = fingerprint(&config, None, false);
 
-        assert_eq!(baseline().earliest_change(&changed), Some(Stage::Triage));
+        assert_eq!(baseline().earliest_change(&changed), Some(Stage::Plan));
         assert_eq!(
             baseline().input,
             changed.input,
@@ -197,7 +197,7 @@ api_token = "GITLAB_TOKEN"
         let base = baseline();
         let unchanged = |changed: &Fingerprint| {
             assert_eq!(base.input, changed.input, "input is untouched");
-            assert_eq!(base.triage, changed.triage, "triage is untouched");
+            assert_eq!(base.plan, changed.plan, "plan is untouched");
             assert_eq!(base.earliest_change(changed), Some(Stage::Review));
         };
 
@@ -262,7 +262,7 @@ api_token = "GITLAB_TOKEN"
         let changed = fingerprint(&config, None, false);
 
         assert_eq!(base.earliest_change(&changed), Some(Stage::Review));
-        for slice in [&changed.input, &changed.triage, &changed.review] {
+        for slice in [&changed.input, &changed.plan, &changed.review] {
             assert!(!slice.contains("KEY"), "a digest, not the text: {slice}");
         }
     }

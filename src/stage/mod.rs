@@ -8,7 +8,7 @@ pub mod prompt;
 pub mod publish;
 pub mod report;
 pub mod review;
-pub mod triage;
+pub mod plan;
 
 #[cfg(test)]
 mod fixture;
@@ -59,7 +59,7 @@ pub enum StageError {
     #[error("cannot read the input: {reason}")]
     UnreadableInput { reason: String },
     /// The first turn of a chunk does not fit. Nothing the tool loop can do
-    /// about it: the chunk limit `triage` computed was wrong.
+    /// about it: the chunk limit `plan` computed was wrong.
     #[error(
         "{path}: the first turn already needs {tokens} tokens of a {context_window_tokens} token window"
     )]
@@ -400,7 +400,7 @@ max_file_bytes = 262144
 max_tool_output_bytes = 32768
 max_rounds = 100
 
-[triage]
+[plan]
 max_chunk_tokens = 24000
 skip_files_over_bytes = 262144
 

@@ -28,7 +28,7 @@ max_file_bytes = 262144
 max_tool_output_bytes = 32768
 max_rounds = 100
 
-[triage]
+[plan]
 max_chunk_tokens = 24000
 skip_files_over_bytes = 262144
 

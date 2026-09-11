@@ -8,7 +8,7 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::budget::{bytes_for_ascii_tokens, estimate_tokens};
-use crate::config::{Config, ConfigError, Model, PROMPT_SKELETON_TOKENS, TriageSettings};
+use crate::config::{Config, ConfigError, Model, PROMPT_SKELETON_TOKENS, PlanSettings};
 use crate::domain::{ChangeSet, DEV_NULL, FileChange, Stage};
 use crate::security::PathPolicy;
 use crate::tool::Registry;
@@ -66,11 +66,11 @@ pub struct SkippedFile {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
-pub struct TriagePlan {
+pub struct PlanOutput {
     pub chunks: Vec<Chunk>,
     pub skipped: Vec<SkippedFile>,
     /// How the window was divided. Carried rather than recomputed: `review`
-    /// has to spend exactly what `triage` set aside, and a checkpoint keeps
+    /// has to spend exactly what `plan` set aside, and a checkpoint keeps
     /// the two agreeing across a re-entered run.
     #[serde(default)]
     pub window: Window,
@@ -82,7 +82,7 @@ pub struct TriagePlan {
 ///
 /// Only the first of those is asked for. The window, less the output the model
 /// may write and the prompt it always carries, is what there is; the diff takes
-/// what `[triage].max_chunk_tokens` asks for, and **every token left buys
+/// what `[plan].max_chunk_tokens` asks for, and **every token left buys
 /// rounds**. One round may append as much as a whole chunk may be, so the
 /// number of rounds is simply how many chunk-sized answers still fit.
 ///
@@ -135,7 +135,7 @@ impl Window {
                 left: available,
             });
         }
-        let chunk_tokens = available.min(config.triage.max_chunk_tokens);
+        let chunk_tokens = available.min(config.plan.max_chunk_tokens);
         // Rounds only mean something when something can be investigated.
         // Delivery-only tools do not grow the conversation, and neither does
         // one this run's worktree cannot answer: it is offered to the model
@@ -169,7 +169,7 @@ impl Window {
         self.round_bytes
     }
 
-    /// One round over the smallest diff worth reviewing: what a `TriagePlan`
+    /// One round over the smallest diff worth reviewing: what a `PlanOutput`
     /// says before anything has divided a real window. Tests build plans this
     /// way, and a review handed this one gets a single round rather than a
     /// generous number nobody worked out.
@@ -212,12 +212,12 @@ pub struct FileFilter {
 }
 
 impl FileFilter {
-    pub fn new(triage: &TriageSettings) -> Result<Self, ConfigError> {
+    pub fn new(plan: &PlanSettings) -> Result<Self, ConfigError> {
         let mut builder = GlobSetBuilder::new();
-        for pattern in &triage.skip_paths {
+        for pattern in &plan.skip_paths {
             builder.add(
                 Glob::new(pattern).map_err(|error| ConfigError::InvalidGlob {
-                    field: "[triage].skip_paths",
+                    field: "[plan].skip_paths",
                     pattern: pattern.clone(),
                     reason: error.to_string(),
                 })?,
@@ -225,12 +225,12 @@ impl FileFilter {
         }
         Ok(Self {
             skip_paths: builder.build().map_err(|error| ConfigError::InvalidGlob {
-                field: "[triage].skip_paths",
+                field: "[plan].skip_paths",
                 pattern: String::new(),
                 reason: error.to_string(),
             })?,
-            skip_generated: triage.skip_generated,
-            skip_files_over_bytes: triage.skip_files_over_bytes,
+            skip_generated: plan.skip_generated,
+            skip_files_over_bytes: plan.skip_files_over_bytes,
         })
     }
 
@@ -249,7 +249,7 @@ impl FileFilter {
             return Some("extension is not in allow_extensions".to_string());
         }
         if self.skip_paths.is_match(&file.new_path) {
-            return Some("matches [triage].skip_paths".to_string());
+            return Some("matches [plan].skip_paths".to_string());
         }
         if file.binary {
             return Some("binary".to_string());
@@ -266,7 +266,7 @@ impl FileFilter {
         let size = diff.new_side_bytes();
         if size > self.skip_files_over_bytes {
             return Some(format!(
-                "larger than [triage].skip_files_over_bytes ({size} > {})",
+                "larger than [plan].skip_files_over_bytes ({size} > {})",
                 self.skip_files_over_bytes
             ));
         }
@@ -367,14 +367,14 @@ impl<'a> FileDiff<'a> {
     }
 }
 
-pub struct Triage;
+pub struct Plan;
 
-impl Triage {
+impl Plan {
     pub fn run(
         context: &mut StageContext<'_>,
         changeset: &ChangeSet,
         prompt_tokens: u32,
-    ) -> Result<TriagePlan, StageError> {
+    ) -> Result<PlanOutput, StageError> {
         let model = context.settings.selection()?.model;
         let window = Window::new(
             model,
@@ -382,7 +382,7 @@ impl Triage {
             context.tools,
             prompt_tokens,
         )?;
-        let filter = FileFilter::new(&context.settings.config.triage)?;
+        let filter = FileFilter::new(&context.settings.config.plan)?;
         let plan = Self::plan(changeset, &filter, context.paths, window);
 
         for file in &plan.skipped {
@@ -395,9 +395,9 @@ impl Triage {
             max_rounds = context.settings.config.review.max_rounds,
             round_bytes = window.round_bytes(),
             prompt_tokens,
-            "triage done"
+            "plan done"
         );
-        context.complete(Stage::Triage, &plan)?;
+        context.complete(Stage::Plan, &plan)?;
         Ok(plan)
     }
 
@@ -408,7 +408,7 @@ impl Triage {
         filter: &FileFilter,
         paths: &PathPolicy,
         window: Window,
-    ) -> TriagePlan {
+    ) -> PlanOutput {
         let mut skipped = Vec::new();
         let mut reviewable: Vec<&FileChange> = Vec::new();
         for file in &changeset.files {
@@ -446,7 +446,7 @@ impl Triage {
                 });
             }
         }
-        TriagePlan {
+        PlanOutput {
             chunks,
             skipped,
             window,
@@ -491,7 +491,7 @@ max_file_bytes = 262144
 max_tool_output_bytes = 32768
 max_rounds = 100
 
-[triage]
+[plan]
 max_chunk_tokens = 20000
 skip_files_over_bytes = 262144
 
@@ -626,9 +626,9 @@ max_output_tokens = 4096
         }
     }
 
-    fn plan(files: Vec<FileChange>, limit: u32) -> TriagePlan {
-        let settings = TriageSettings::for_tests();
-        Triage::plan(
+    fn plan(files: Vec<FileChange>, limit: u32) -> PlanOutput {
+        let settings = PlanSettings::for_tests();
+        Plan::plan(
             &changeset(files),
             &FileFilter::new(&settings).expect("valid globs"),
             &policy(&[]),
@@ -710,10 +710,10 @@ max_output_tokens = 4096
 
         let big = file("src/huge.c", 40, 4);
 
-        let settings = TriageSettings {
+        let settings = PlanSettings {
             skip_paths: vec!["vendor/**".to_string()],
             skip_files_over_bytes: 1_024,
-            ..TriageSettings::for_tests()
+            ..PlanSettings::for_tests()
         };
         let files = vec![
             file("vendor/lib.c", 1, 1),
@@ -724,7 +724,7 @@ max_output_tokens = 4096
             file(".reviewbot/runs/abc/report.md", 1, 1),
             file("src/kept.c", 1, 1),
         ];
-        let plan = Triage::plan(
+        let plan = Plan::plan(
             &changeset(files),
             &FileFilter::new(&settings).expect("valid globs"),
             &policy(&["secrets/**"]),
@@ -783,11 +783,11 @@ max_output_tokens = 4096
         let mut deleted = file("docs/old.md", 1, 1);
         deleted.new_path = DEV_NULL.to_string();
 
-        let settings = TriageSettings {
+        let settings = PlanSettings {
             skip_files_over_bytes: 1_024,
-            ..TriageSettings::for_tests()
+            ..PlanSettings::for_tests()
         };
-        let plan = Triage::plan(
+        let plan = Plan::plan(
             &changeset(vec![
                 file("README.md", 1, 1),
                 file("Makefile", 1, 1),

@@ -30,7 +30,7 @@ max_file_bytes = 262144
 max_tool_output_bytes = 32768
 max_rounds = 100
 
-[triage]
+[plan]
 max_chunk_tokens = 24000
 skip_files_over_bytes = 262144
 
@@ -422,7 +422,7 @@ const MARK_CALL: &str = r#"{"tool":"mark","arguments":{"path":"src/parse.c"}}"#;
 fn with_checker(config: &str) -> String {
     format!(
         "{}\n{CHECKER}",
-        config.replace("[triage]", "[triage]\nskip_paths = [\"vendor/**\"]")
+        config.replace("[plan]", "[plan]\nskip_paths = [\"vendor/**\"]")
     )
 }
 
@@ -605,7 +605,7 @@ fn the_same_command_again_leaves_a_finished_input_stage_alone() {
     let input_before = std::fs::read(&input_file).expect("input checkpoint");
 
     rewind_to(&run_dir, 1);
-    assert!(!run_dir.join(layout::stage_file(Stage::Triage)).exists());
+    assert!(!run_dir.join(layout::stage_file(Stage::Plan)).exists());
 
     let calls = Arc::new(Calls::default());
     let second = review(&workspace, Arc::clone(&calls)).expect("the second run completes");
@@ -830,10 +830,10 @@ fn enter_diff_run(
 
 /// The settings are not in the run id, so a config change walks back into
 /// the run it already has and drops only what the change can reach.
-/// `[triage]` is first read by triage, so the input checkpoint still answers
+/// `[plan]` is first read by plan, so the input checkpoint still answers
 /// the question it was written for and is used again.
 #[test]
-fn a_changed_triage_table_reruns_from_triage_in_the_same_run() {
+fn a_changed_plan_table_reruns_from_plan_in_the_same_run() {
     let workspace = Workspace::new();
     let fresh = Arc::new(Calls::default());
     let first = enter_diff_run(
@@ -865,7 +865,7 @@ fn a_changed_triage_table_reruns_from_triage_in_the_same_run() {
     assert_eq!(
         from_checkpoint(&watcher),
         vec![true, false, false, false, false, false],
-        "input survived; triage and everything after it ran again"
+        "input survived; plan and everything after it ran again"
     );
     assert_eq!(
         Calls::get(&calls.send),
@@ -878,7 +878,7 @@ fn a_changed_triage_table_reruns_from_triage_in_the_same_run() {
 /// One stage later, and the two before it are untouched: `[review]` is read
 /// by nothing earlier than review.
 #[test]
-fn a_changed_review_table_leaves_input_and_triage_alone() {
+fn a_changed_review_table_leaves_input_and_plan_alone() {
     let workspace = Workspace::new();
     let fresh = Arc::new(Calls::default());
     let first = enter_diff_run(
@@ -1200,7 +1200,7 @@ fn scripted_diff_adapters(
 #[test]
 fn a_real_diff_reaches_the_model_as_one_chunk_per_surviving_file() {
     let workspace = Workspace::with_config(
-        &CONFIG.replace("[triage]", "[triage]\nskip_paths = [\"vendor/**\"]"),
+        &CONFIG.replace("[plan]", "[plan]\nskip_paths = [\"vendor/**\"]"),
     );
     let calls = Arc::new(Calls::default());
     let result = crate::review_with(
@@ -1226,9 +1226,9 @@ fn a_real_diff_reaches_the_model_as_one_chunk_per_surviving_file() {
     assert_eq!(files[0]["changed_lines"], serde_json::json!([11, 12]));
 
     let plan: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(run_dir.join(layout::stage_file(Stage::Triage))).unwrap(),
+        &std::fs::read(run_dir.join(layout::stage_file(Stage::Plan))).unwrap(),
     )
-    .expect("triage checkpoint");
+    .expect("plan checkpoint");
     let chunks = plan["chunks"].as_array().expect("chunks");
     assert_eq!(chunks.len(), 1, "the vendored file was skipped");
     assert_eq!(chunks[0]["path"], "src/parse.c");
@@ -1420,7 +1420,7 @@ const SCORE: &str = r#"{"overall_score":54,"summary":"one certain finding; read 
 #[test]
 fn a_scored_run_writes_the_report_and_a_second_run_does_not_score_again() {
     let workspace = Workspace::with_config(
-        &CONFIG.replace("[triage]", "[triage]\nskip_paths = [\"vendor/**\"]"),
+        &CONFIG.replace("[plan]", "[plan]\nskip_paths = [\"vendor/**\"]"),
     );
     let source = workspace.diff_file();
     let calls = Arc::new(Calls::default());
@@ -1490,7 +1490,7 @@ fn a_scored_run_writes_the_report_and_a_second_run_does_not_score_again() {
 #[test]
 fn a_finished_run_entered_again_rewrites_the_report_and_says_nothing_twice() {
     let workspace = Workspace::with_config(
-        &CONFIG.replace("[triage]", "[triage]\nskip_paths = [\"vendor/**\"]"),
+        &CONFIG.replace("[plan]", "[plan]\nskip_paths = [\"vendor/**\"]"),
     );
     let settings = workspace.settings_with(RunOptions {
         runs_dir: workspace.runs_dir.clone(),
@@ -1721,7 +1721,7 @@ fn a_full_run_announces_every_stage_and_numbers_the_chunks() {
         vec![
             (&Outcome::Input { files: 2 }, &false),
             (
-                &Outcome::Triage {
+                &Outcome::Plan {
                     chunks: 2,
                     skipped: 0,
                 },
@@ -1783,7 +1783,7 @@ fn a_full_run_announces_every_stage_and_numbers_the_chunks() {
 #[test]
 fn a_tool_the_model_calls_is_named_as_it_goes_out_and_returns() {
     let workspace = Workspace::with_config(
-        &CONFIG.replace("[triage]", "[triage]\nskip_paths = [\"vendor/**\"]"),
+        &CONFIG.replace("[plan]", "[plan]\nskip_paths = [\"vendor/**\"]"),
     );
     let watcher = Watcher::default();
     let (adapters, _) = scripted_diff_adapters(Arc::new(Calls::default()), vec![FINDING, SCORE]);
@@ -1852,7 +1852,7 @@ fn a_run_entered_again_reports_every_stage_off_its_checkpoints() {
     }
     assert_eq!(
         stages[1].1,
-        Outcome::Triage {
+        Outcome::Plan {
             chunks: 2,
             skipped: 0
         }

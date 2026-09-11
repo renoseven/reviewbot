@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 #[repr(u8)]
 pub enum Stage {
     Input = 1,
-    Triage = 2,
+    Plan = 2,
     Review = 3,
     Merge = 4,
     Report = 5,
@@ -32,7 +32,7 @@ impl Stage {
     /// the sequence a run actually walks is still `review`'s to state.
     pub const ALL: [Self; 6] = [
         Self::Input,
-        Self::Triage,
+        Self::Plan,
         Self::Review,
         Self::Merge,
         Self::Report,
@@ -50,7 +50,7 @@ impl Stage {
     pub fn name(self) -> &'static str {
         match self {
             Self::Input => "input",
-            Self::Triage => "triage",
+            Self::Plan => "plan",
             Self::Review => "review",
             Self::Merge => "merge",
             Self::Report => "report",
@@ -113,10 +113,10 @@ mod tests {
     #[test]
     fn a_stage_knows_what_came_before_it() {
         assert_eq!(Stage::Input.previous(), None);
-        assert_eq!(Stage::Review.previous(), Some(Stage::Triage));
+        assert_eq!(Stage::Review.previous(), Some(Stage::Plan));
         assert_eq!(
             Stage::Merge.through().collect::<Vec<_>>(),
-            vec![Stage::Input, Stage::Triage, Stage::Review, Stage::Merge]
+            vec![Stage::Input, Stage::Plan, Stage::Review, Stage::Merge]
         );
     }
 }

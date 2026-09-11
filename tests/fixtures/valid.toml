@@ -37,7 +37,7 @@ max_output_tokens = 384000
 base_url = "https://gitlab.com/api/v4"
 api_token = "GITLAB_TOKEN"
 
-[triage]
+[plan]
 max_chunk_tokens = 24000
 skip_files_over_bytes = 262144
 skip_paths = ["**/*.lock", "vendor/**"]

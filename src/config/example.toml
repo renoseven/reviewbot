@@ -54,7 +54,7 @@ reasoning_effort = "low"
 
 # Which files to skip, and the size of one review turn.
 # Skipped files are named in the report.
-[triage]
+[plan]
 max_chunk_tokens = 24000                # working size of one review turn, in tokens
 skip_files_over_bytes = 262144          # larger files are skipped and named in the report
 skip_paths = ["**/*.lock", "vendor/**"] # globs; skipped and named in the report

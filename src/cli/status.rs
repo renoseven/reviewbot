@@ -261,7 +261,7 @@ impl State {
             } => {
                 // A concluding turn belongs to the file that hit the ceiling
                 // or the prose re-ask, not to the next one. Leaving the flag
-                // set is how every later wait said "waiting for conclusion".
+                // set is how every later wait said "concluding".
                 self.forget_chunk();
                 self.piece = Some((piece, pieces));
                 // The plan's place, not how many paths this process has
@@ -347,7 +347,7 @@ impl State {
     fn learn(&mut self, outcome: &Outcome) {
         match outcome {
             Outcome::Input { files } => self.input_files = Some(*files),
-            Outcome::Triage { skipped, .. } => {
+            Outcome::Plan { skipped, .. } => {
                 self.files_total = self.input_files.map(|files| files.saturating_sub(*skipped));
             }
             _ => {}
@@ -412,11 +412,11 @@ pub(crate) mod tests {
                 from_checkpoint: false,
             },
             Event::StageStarted {
-                stage: Stage::Triage,
+                stage: Stage::Plan,
             },
             Event::StageFinished {
-                stage: Stage::Triage,
-                outcome: Outcome::Triage {
+                stage: Stage::Plan,
+                outcome: Outcome::Plan {
                     chunks: 7,
                     skipped: 2,
                 },
@@ -478,7 +478,7 @@ pub(crate) mod tests {
             "\
 run  change.diff  model deepseek-v4-flash  worktree /repo
 [1/6] input     9 files
-[2/6] triage    7 chunks, 2 files skipped
+[2/6] plan      7 chunks, 2 files skipped
 [3/6] review    file 3/7  src/foo.c
 [3/6] review    7 chunks reviewed
 "
@@ -615,7 +615,7 @@ run  change.diff  model deepseek-v4-flash  worktree /repo
 
     /// A concluding turn is about that file. The next file starts a new
     /// conversation; leaving the flag set made every later wait say
-    /// "waiting for conclusion" while the loop was still investigating.
+    /// "concluding" while the loop was still investigating.
     #[test]
     fn a_later_file_is_not_still_the_conclusion() {
         let now = Instant::now();
@@ -665,8 +665,8 @@ run  change.diff  model deepseek-v4-flash  worktree /repo
         );
         state.apply(
             Event::StageFinished {
-                stage: Stage::Triage,
-                outcome: Outcome::Triage {
+                stage: Stage::Plan,
+                outcome: Outcome::Plan {
                     chunks: 57,
                     skipped: 8,
                 },

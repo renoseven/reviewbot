@@ -236,7 +236,7 @@ mod tests {
     fn fingerprint() -> Fingerprint {
         Fingerprint {
             input: "i".to_string(),
-            triage: "t".to_string(),
+            plan: "t".to_string(),
             review: "r".to_string(),
         }
     }
@@ -305,10 +305,10 @@ mod tests {
         for (change, from, survives) in [
             (
                 Fingerprint {
-                    triage: "other".to_string(),
+                    plan: "other".to_string(),
                     ..fingerprint()
                 },
-                Stage::Triage,
+                Stage::Plan,
                 Some(Stage::Input),
             ),
             (
@@ -317,7 +317,7 @@ mod tests {
                     ..fingerprint()
                 },
                 Stage::Review,
-                Some(Stage::Triage),
+                Some(Stage::Plan),
             ),
             (
                 Fingerprint {

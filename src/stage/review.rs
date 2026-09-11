@@ -32,7 +32,7 @@ use crate::worktree::Worktree;
 
 use super::orient::Orientation;
 use super::prompt::{CappedList, Fence, Keep, Overflow, Prompts, code_ref};
-use super::triage::TriagePlan;
+use super::plan::PlanOutput;
 use super::{StageContext, StageError};
 
 /// One chunk's raw model output, kept unprocessed for `merge` to parse.
@@ -138,12 +138,12 @@ pub struct Review;
 
 impl Review {
     /// `instructions` is assembled by the caller rather than here, because
-    /// `triage` has to hold the same bytes back from the window before the
+    /// `plan` has to hold the same bytes back from the window before the
     /// first chunk is cut. One string, measured and sent, is what keeps the
     /// reservation honest and the prompt cache hitting.
     pub fn run(
         context: &mut StageContext<'_>,
-        plan: &TriagePlan,
+        plan: &PlanOutput,
         instructions: &str,
         narrative: Option<&str>,
     ) -> Result<ReviewOutput, StageError> {
@@ -234,8 +234,8 @@ impl Review {
     /// can stop this.
     fn run_chunk(
         context: &mut StageContext<'_>,
-        chunk: &super::triage::Chunk,
-        plan: &TriagePlan,
+        chunk: &super::plan::Chunk,
+        plan: &PlanOutput,
         instructions: &str,
         narrative: Option<&str>,
         carried: Option<&Handoff>,
@@ -344,7 +344,7 @@ impl Review {
                 // Two ways this is a sizing bug rather than a stop: the very
                 // first turn, which the loop has not added anything to yet,
                 // and a conclusion that still does not fit, which has
-                // nowhere left to shrink to. Both are triage's to answer for
+                // nowhere left to shrink to. Both are plan's to answer for
                 // and neither is worth paying the vendor to refuse.
                 if chat.rounds == 0 || chat.concluding {
                     return Err(StageError::ChunkTooLarge {
@@ -894,7 +894,7 @@ pub(crate) fn narrative_preface(
 /// one a handoff. The slots fill the list and the note; the headings stay in
 /// the template and leave with an empty slot.
 fn split_preface(
-    chunk: &super::triage::Chunk,
+    chunk: &super::plan::Chunk,
     carried: Option<&Handoff>,
 ) -> Result<Option<String>, StageError> {
     if !chunk.is_split() {
@@ -951,7 +951,7 @@ pub(crate) fn assemble_instructions(
 }
 
 /// What every request carries before the diff: the instructions, the tool
-/// schemas, and the change description. `triage` holds this back from the
+/// schemas, and the change description. `plan` holds this back from the
 /// window, so it is measured rather than guessed — the schemas alone run to
 /// thousands of characters, and a guess that is half the real size is one
 /// the vendor rejects at the worst possible moment.
@@ -1000,7 +1000,7 @@ fn bullets(lines: Vec<String>) -> String {
 
 /// This file's place in the plan, counted from 1. Pieces of one file share
 /// a number: the screen counts files, and the piece fields say the rest.
-fn file_number(chunks: &[super::triage::Chunk], at: usize) -> usize {
+fn file_number(chunks: &[super::plan::Chunk], at: usize) -> usize {
     chunks
         .iter()
         .take(at + 1)
@@ -1009,7 +1009,7 @@ fn file_number(chunks: &[super::triage::Chunk], at: usize) -> usize {
         .len()
 }
 
-fn file_count(chunks: &[super::triage::Chunk]) -> usize {
+fn file_count(chunks: &[super::plan::Chunk]) -> usize {
     chunks
         .iter()
         .map(|chunk| chunk.path.as_str())
@@ -1019,7 +1019,7 @@ fn file_count(chunks: &[super::triage::Chunk]) -> usize {
 
 /// The files behind the chunks that were never sent, each named once even
 /// when a big file was cut into several chunks.
-fn remaining_paths(chunks: &[super::triage::Chunk]) -> Vec<String> {
+fn remaining_paths(chunks: &[super::plan::Chunk]) -> Vec<String> {
     let mut paths: Vec<String> = Vec::new();
     for chunk in chunks {
         if !paths.contains(&chunk.path) {
@@ -1050,7 +1050,7 @@ mod tests {
     use super::*;
     use crate::budget::{Limit, Price, TokenUsage};
     use crate::stage::fixture::{Reply, StageFixture};
-    use crate::stage::triage::Chunk;
+    use crate::stage::plan::Chunk;
     use crate::tool::{Purpose, Round, Signature, SubmitComment, Tool, ToolError, ToolOutput};
 
     /// The two deliveries a review round always has: file a finding, or say
@@ -1304,21 +1304,21 @@ mod tests {
             .expect("the shipped prompt fills")
     }
 
-    fn plan(path: &str) -> TriagePlan {
-        TriagePlan {
+    fn plan(path: &str) -> PlanOutput {
+        PlanOutput {
             chunks: vec![piece(path, 0, 1)],
-            ..TriagePlan::default()
+            ..PlanOutput::default()
         }
     }
 
     /// The same plan with the window dictated: how much all of one round's
     /// output may add up to, and a leftover `rounds` field the loop no
     /// longer reads. The investigation ceiling is `[review].max_rounds`.
-    fn plan_with(path: &str, rounds: u32, round_bytes: u64) -> TriagePlan {
-        TriagePlan {
+    fn plan_with(path: &str, rounds: u32, round_bytes: u64) -> PlanOutput {
+        PlanOutput {
             chunks: vec![piece(path, 0, 1)],
             skipped: Vec::new(),
-            window: crate::stage::triage::Window::dictated(20_000, rounds, round_bytes),
+            window: crate::stage::plan::Window::dictated(20_000, rounds, round_bytes),
         }
     }
 
@@ -1339,7 +1339,7 @@ mod tests {
         review_over(fixture, &plan("src/parse.c"))
     }
 
-    fn review_over(fixture: &mut StageFixture, plan: &TriagePlan) -> ReviewOutput {
+    fn review_over(fixture: &mut StageFixture, plan: &PlanOutput) -> ReviewOutput {
         let mut context = fixture.context();
         Review::run(&mut context, plan, &instructions(), None).expect("the review stage finishes")
     }
@@ -1580,10 +1580,10 @@ mod tests {
 
         // Two files, and rounds enough that money rather than the ceiling is
         // what ends the first one.
-        let plan = TriagePlan {
+        let plan = PlanOutput {
             chunks: vec![piece("src/parse.c", 0, 1), piece("src/other.c", 1, 1)],
             skipped: Vec::new(),
-            window: crate::stage::triage::Window::dictated(20_000, 24, 80_000),
+            window: crate::stage::plan::Window::dictated(20_000, 24, 80_000),
         };
         let output = review_over(&mut fixture, &plan);
 
@@ -1863,9 +1863,9 @@ mod tests {
     fn an_interrupted_review_resumes_from_the_chunks_it_already_wrote() {
         let mut fixture = StageFixture::scripted(vec![filed(), Reply::Fail], Limit::Amount(10.0))
             .with_tools(with_submit(Registry::new()));
-        let plan = TriagePlan {
+        let plan = PlanOutput {
             chunks: vec![piece("src/parse.c", 0, 1), piece("src/lex.c", 1, 1)],
-            ..TriagePlan::default()
+            ..PlanOutput::default()
         };
 
         {
@@ -1934,9 +1934,9 @@ mod tests {
     fn a_handoff_survives_an_interrupt_between_pieces() {
         let mut fixture = StageFixture::scripted(vec![filed(), Reply::Fail], Limit::Amount(10.0))
             .with_tools(with_submit(Registry::new()));
-        let plan = TriagePlan {
+        let plan = PlanOutput {
             chunks: vec![piece("src/parse.c", 0, 2), piece("src/parse.c", 1, 2)],
-            ..TriagePlan::default()
+            ..PlanOutput::default()
         };
 
         {
@@ -1976,9 +1976,9 @@ mod tests {
     fn the_pieces_of_one_file_get_a_trace_each() {
         let mut fixture = StageFixture::scripted(vec![filed(), filed()], Limit::Amount(10.0))
             .with_tools(with_submit(Registry::new()));
-        let plan = TriagePlan {
+        let plan = PlanOutput {
             chunks: vec![piece("src/parse.c", 0, 2), piece("src/parse.c", 1, 2)],
-            ..TriagePlan::default()
+            ..PlanOutput::default()
         };
 
         let output = {
@@ -2012,9 +2012,9 @@ mod tests {
     fn every_chunk_of_a_run_gets_the_same_prompt_bytes() {
         let mut fixture = StageFixture::scripted(vec![filed(), filed()], Limit::Amount(10.0))
             .with_tools(with_submit(Registry::new()));
-        let plan = TriagePlan {
+        let plan = PlanOutput {
             chunks: vec![piece("src/parse.c", 0, 1), piece("src/lex.c", 1, 1)],
-            ..TriagePlan::default()
+            ..PlanOutput::default()
         };
         let narrative = Narrative::new(Some("bound the index".to_string()), None, Vec::new());
         let preface = narrative_preface(&narrative, &Redactor::new())
@@ -2079,9 +2079,9 @@ mod tests {
             Limit::Amount(10.0),
         )
         .with_tools(with_submit(Registry::new()));
-        let plan = TriagePlan {
+        let plan = PlanOutput {
             chunks: vec![piece("src/parse.c", 0, 2), piece("src/parse.c", 1, 2)],
-            ..TriagePlan::default()
+            ..PlanOutput::default()
         };
 
         {
@@ -2610,7 +2610,7 @@ mod tests {
         );
     }
 
-    /// What `triage` holds back has to be what the request actually carries.
+    /// What `plan` holds back has to be what the request actually carries.
     /// The schemas are the half that is easy to forget: they travel in
     /// `Request.tools`, not in `instructions`, and they are not small.
     #[test]
@@ -2709,7 +2709,7 @@ mod tests {
     }
 
     /// The description is per-chunk overhead like the instructions are, so
-    /// `triage` has to hold it back from the window too.
+    /// `plan` has to hold it back from the window too.
     #[test]
     fn the_reservation_counts_the_description_as_well() {
         let tools = Registry::new();

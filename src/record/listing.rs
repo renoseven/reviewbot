@@ -34,9 +34,9 @@ pub const WARN_AFTER_RUNS: usize = 10;
 pub struct RunRow {
     pub run_id: String,
     pub input: String,
-    /// Spelled out rather than kept as the one stage the run reached: what a
-    /// reader wants is the list, and deriving it here keeps `meta.json` free
-    /// of a fact it can work out.
+    /// Every stage through the one the run reached. The screen prints the
+    /// last of them; JSON keeps the walk so a caller does not have to know
+    /// the order. Derived here so `meta.json` stays a single `completed_through`.
     pub completed_stages: Vec<Stage>,
     pub spent: f64,
     pub currency: String,

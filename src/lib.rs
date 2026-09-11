@@ -39,10 +39,10 @@ use record::{
 use stage::input::Input;
 use stage::merge::{Merge, MergeOutput};
 use stage::orient::Orientation;
+use stage::plan::{Plan, PlanOutput, SkippedFile};
 use stage::publish::{Publish, PublishInput, PublishedComment};
 use stage::report::{Report, ReportInput};
 use stage::review::{Review, ReviewOutput};
-use stage::triage::{SkippedFile, Triage, TriagePlan};
 use stage::{Adapters, Equipment, StageContext, StageError};
 use worktree::WorktreeError;
 
@@ -402,7 +402,7 @@ fn finish(
 }
 
 /// Everything a request carries before the diff, assembled once for the run.
-/// `tokens` is its measured size, which `triage` reserves before it cuts the
+/// `tokens` is its measured size, which `plan` reserves before it cuts the
 /// first chunk.
 struct Preamble {
     instructions: String,
@@ -427,9 +427,9 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
         from_checkpoint,
     );
 
-    let planned: Option<TriagePlan> = context.completed(Stage::Triage)?;
+    let planned: Option<PlanOutput> = context.completed(Stage::Plan)?;
     let reviewed_before: Option<ReviewOutput> = context.completed(Stage::Review)?;
-    // One set of bytes for both stages: `review` sends them and `triage`
+    // One set of bytes for both stages: `review` sends them and `plan`
     // holds their measured size back from the window, and those two have to
     // agree. Assembled only when one of them is going to run. The change
     // list comes from the changeset already in hand — a run re-entered with
@@ -458,18 +458,18 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
         }
         false => None,
     };
-    context.stage_started(Stage::Triage);
+    context.stage_started(Stage::Plan);
     let from_checkpoint = planned.is_some();
-    let plan: TriagePlan = match planned {
+    let plan: PlanOutput = match planned {
         Some(done) => done,
         None => {
-            let preamble = preamble.as_ref().expect("assembled for triage");
-            Triage::run(context, &changeset, preamble.tokens)?
+            let preamble = preamble.as_ref().expect("assembled for plan");
+            Plan::run(context, &changeset, preamble.tokens)?
         }
     };
     context.stage_finished(
-        Stage::Triage,
-        Outcome::Triage {
+        Stage::Plan,
+        Outcome::Plan {
             chunks: plan.chunks.len(),
             skipped: plan.skipped.len(),
         },
@@ -571,7 +571,7 @@ fn run_stages(context: &mut StageContext<'_>, source: &Source) -> Result<RunResu
 struct Finished<'a> {
     meta: &'a Meta,
     merged: &'a MergeOutput,
-    plan: &'a TriagePlan,
+    plan: &'a PlanOutput,
     reviewed: &'a ReviewOutput,
     published: Vec<PublishedComment>,
     budget: &'a Budget,

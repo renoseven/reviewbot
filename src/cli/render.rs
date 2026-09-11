@@ -15,13 +15,13 @@ use reviewbot::{Error, RunResult};
 use super::Failure;
 use super::args::Format;
 
-/// Stages as a person reads them, in the order the run walks them.
-fn stage_list(stages: &[reviewbot::domain::Stage]) -> String {
+/// How far the run got. The stages before it are implied: they walk in
+/// order, so the last one is the whole answer.
+fn furthest_stage(stages: &[reviewbot::domain::Stage]) -> String {
     stages
-        .iter()
-        .map(|stage| stage.name())
-        .collect::<Vec<_>>()
-        .join(", ")
+        .last()
+        .map(|stage| stage.name().to_string())
+        .unwrap_or_default()
 }
 
 /// The widest label in a run summary. The live screen uses the same prefix,
@@ -270,7 +270,7 @@ pub fn config_info(settings: &Settings, format: Format) -> Result<String, Error>
             "platforms": platform_values(settings),
             "providers": provider_values(settings),
             "models": model_values(settings),
-            "triage": settings.config.triage,
+            "plan": settings.config.plan,
             "review": settings.config.review,
             "security": settings.config.security,
             "tools": tools,
@@ -311,7 +311,7 @@ pub fn run_list(runs_dir: &Path, format: Format) -> Result<String, Error> {
                     vec![
                         row.run_id.clone(),
                         truncate(&row.input, 40),
-                        stage_list(&row.completed_stages),
+                        furthest_stage(&row.completed_stages),
                         money(row.spent, &row.currency, 4),
                         format_unix_utc(row.updated_at),
                     ]
@@ -339,7 +339,7 @@ pub fn run_show(runs_dir: &Path, run_id: &str, format: Format) -> Result<String,
             out.push_str(&format!("model      {}\n", show.model));
             out.push_str(&format!(
                 "stages     {}\n",
-                stage_list(&show.completed_stages)
+                furthest_stage(&show.completed_stages)
             ));
             let bands = show
                 .comments

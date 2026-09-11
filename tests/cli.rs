@@ -311,8 +311,8 @@ fn a_config_change_leaves_a_line_in_the_run_log_saying_what_it_cost() {
         .path();
     let log = std::fs::read_to_string(run_dir.join("log")).expect("run log");
     assert!(
-        log.contains("the triage settings changed since this run was recorded")
-            && log.contains("running triage and every stage after it again"),
+        log.contains("the plan settings changed since this run was recorded")
+            && log.contains("running plan and every stage after it again"),
         "the log names the slice and where the rerun starts: {log}"
     );
     assert!(
@@ -441,7 +441,7 @@ fn run_list_text_aligns_spent_with_currency_and_utc() {
             },
             "model": "deepseek-v4-flash",
             "provider": "deepseek",
-            "fingerprint": {"input": "i", "triage": "t", "review": "r"},
+            "fingerprint": {"input": "i", "plan": "t", "review": "r"},
             "budget_limit": 10.0,
             "currency": "CNY",
             "price": {"input_per_1m_tokens": 3.0, "cached_input_per_1m_tokens": 0.1, "output_per_1m_tokens": 9.0},
@@ -470,9 +470,10 @@ fn run_list_text_aligns_spent_with_currency_and_utc() {
     assert!(header.contains("UPDATED"), "{header}");
     assert!(stdout.contains("0.0316 CNY"), "{stdout}");
     assert!(stdout.contains("2026-09-09 06:44:00 UTC"), "{stdout}");
+    assert!(stdout.contains("publish"), "{stdout}");
     assert!(
-        stdout.contains("input, triage, review, merge, report, publish"),
-        "{stdout}"
+        !stdout.contains("input, plan"),
+        "only the furthest stage: {stdout}"
     );
 }
 

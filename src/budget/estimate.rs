@@ -1,5 +1,5 @@
 //! Character based token estimate. DeepSeek ships no local tokenizer, so the
-//! same conservative function serves the chunk limit in `triage`, the context
+//! same conservative function serves the chunk limit in `plan`, the context
 //! check in the tool loop, and the pre-call budget check.
 
 /// Guessing low is the expensive direction, so every estimate carries this.

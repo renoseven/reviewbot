@@ -20,7 +20,7 @@ pub struct Config {
     #[serde(default)]
     pub review: ReviewSettings,
     #[serde(default)]
-    pub triage: TriageSettings,
+    pub plan: PlanSettings,
     #[serde(default)]
     pub security: SecuritySettings,
     /// Singular section names: one `[[provider]]` block declares one
@@ -133,7 +133,7 @@ impl ReviewSettings {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct TriageSettings {
+pub struct PlanSettings {
     /// The working size of one review turn. Clamped down to whatever the
     /// window still has room for, never up.
     #[serde(default)]
@@ -148,7 +148,7 @@ pub struct TriageSettings {
     pub skip_files_over_bytes: u64,
 }
 
-impl Default for TriageSettings {
+impl Default for PlanSettings {
     fn default() -> Self {
         Self {
             max_chunk_tokens: 0,
@@ -164,7 +164,7 @@ fn default_true() -> bool {
 }
 
 #[cfg(test)]
-impl TriageSettings {
+impl PlanSettings {
     /// The numbers have no defaults, so a fixture that filters files needs
     /// them spelled out. Kept in one place rather than per test.
     pub fn for_tests() -> Self {
@@ -189,7 +189,7 @@ pub struct SecuritySettings {
     /// The whitelist of extensions that may be reviewed or read. There is
     /// no builtin list: which extensions are safe depends on the repository,
     /// and a default would decide that for the config author silently.
-    /// `Config::validate` refuses an empty one. Triage skips anything
+    /// `Config::validate` refuses an empty one. `plan` skips anything
     /// outside it; the read-a-file tools refuse it again.
     #[serde(default)]
     pub allow_extensions: Vec<String>,

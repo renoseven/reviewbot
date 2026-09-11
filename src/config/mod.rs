@@ -21,7 +21,7 @@ pub use fingerprint::Fingerprint;
 
 pub use file::{
     Config, LogLevel, LogSettings, Model, ParamKind, ParamSpec, PlatformEntry, PlatformKind,
-    Provider, ReviewSettings, SecuritySettings, ToolEntry, TriageSettings,
+    Provider, ReviewSettings, SecuritySettings, ToolEntry, PlanSettings,
 };
 
 /// The shipped example, which is also what `config init` writes. Complete
@@ -57,7 +57,7 @@ pub const RESERVED_TOOL_NAMES: [&str; 11] = [
 
 /// What the startup check assumes the prompt body and the tool schemas
 /// occupy. It runs before there is a registry to measure, so it has to be a
-/// number; `triage` then measures the assembled instructions and the schemas
+/// number; `plan` then measures the assembled instructions and the schemas
 /// for real (`review::prompt_tokens`) and reserves the larger of the two.
 ///
 /// The larger, not the measured, because this is a promise already made: the
@@ -520,7 +520,7 @@ impl Config {
 
     fn check_globs(&self) -> Result<(), ConfigError> {
         let groups: [(&'static str, &Vec<String>); 2] = [
-            ("[triage].skip_paths", &self.triage.skip_paths),
+            ("[plan].skip_paths", &self.plan.skip_paths),
             ("[security].deny_paths", &self.security.deny_paths),
         ];
         for (field, patterns) in groups {
@@ -576,12 +576,12 @@ impl Config {
                 u64::from(self.review.max_files_per_fetch),
             ),
             (
-                "[triage].max_chunk_tokens",
-                u64::from(self.triage.max_chunk_tokens),
+                "[plan].max_chunk_tokens",
+                u64::from(self.plan.max_chunk_tokens),
             ),
             (
-                "[triage].skip_files_over_bytes",
-                self.triage.skip_files_over_bytes,
+                "[plan].skip_files_over_bytes",
+                self.plan.skip_files_over_bytes,
             ),
             ("[review].max_file_bytes", self.review.max_file_bytes),
             (
@@ -758,7 +758,7 @@ max_file_bytes = 262144
 max_tool_output_bytes = 32768
 max_rounds = 100
 
-[triage]
+[plan]
 max_chunk_tokens = 24000
 skip_files_over_bytes = 262144
 
@@ -990,9 +990,9 @@ api_token = "GITHUB_TOKEN"
             ),
             ("[review].max_hits_per_search", "max_hits_per_search = 50"),
             ("[review].max_files_per_fetch", "max_files_per_fetch = 20"),
-            ("[triage].max_chunk_tokens", "max_chunk_tokens = 24000"),
+            ("[plan].max_chunk_tokens", "max_chunk_tokens = 24000"),
             (
-                "[triage].skip_files_over_bytes",
+                "[plan].skip_files_over_bytes",
                 "skip_files_over_bytes = 262144",
             ),
             ("[review].max_file_bytes", "max_file_bytes = 262144"),

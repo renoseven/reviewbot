@@ -30,7 +30,7 @@ pub enum Outcome {
     Input {
         files: usize,
     },
-    Triage {
+    Plan {
         chunks: usize,
         skipped: usize,
     },
@@ -57,7 +57,7 @@ impl Outcome {
     pub fn sentence(&self) -> String {
         match self {
             Self::Input { files } => format!("{files} {}", count(*files, "file", "files")),
-            Self::Triage { chunks, skipped } => format!(
+            Self::Plan { chunks, skipped } => format!(
                 "{chunks} {}, {skipped} {} skipped",
                 count(*chunks, "chunk", "chunks"),
                 count(*skipped, "file", "files")
@@ -208,9 +208,9 @@ mod tests {
     }
 
     #[test]
-    fn triage_sentence_pluralizes_each_count() {
+    fn plan_sentence_pluralizes_each_count() {
         assert_eq!(
-            Outcome::Triage {
+            Outcome::Plan {
                 chunks: 4,
                 skipped: 1,
             }

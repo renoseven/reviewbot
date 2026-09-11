@@ -370,7 +370,7 @@ fn running_detail(state: &State, row: usize) -> String {
 ///
 /// The round count belongs here rather than on the line below. It counts this
 /// file's conversation and starts again at the next one, while the line below
-/// says what the run is waiting on this second — and it kept disappearing from
+/// says what the run is doing this second — and it kept disappearing from
 /// there whenever that was a tool rather than the model.
 fn path_line(state: &State, width: usize, color: bool) -> Line<'static> {
     let Some(path) = &state.path else {
@@ -405,20 +405,20 @@ fn path_line(state: &State, width: usize, color: bool) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The row that has to move. What it says is what the run is doing, and when
-/// that is waiting on somebody else, who.
+/// The row that has to move. What it says is what the run is doing this second.
 ///
-/// One shape for all of it: a phrase, an ellipsis because it has not finished,
-/// and — for the waits, where how long is the whole question — a clock. A stage
-/// working needs no clock here; the checklist above it keeps one.
+/// One shape for all of it: a verb, an ellipsis because it has not finished,
+/// and — when the verb is waiting on somebody else, where how long is the
+/// whole question — a clock. A stage working needs no clock here; the
+/// checklist above it keeps one.
 fn activity_line(state: &State, tick: usize, color: bool, now: Instant) -> Line<'static> {
     let (what, since) = match (&state.tool, state.waiting_since, state.opening) {
-        (Some((tool, since)), _, _) => (format!("waiting for {tool}"), Some(*since)),
+        (Some((tool, since)), _, _) => (format!("executing {tool}"), Some(*since)),
         (None, Some(since), _) => (
-            // The conclusion is one more thing to wait for, said the same way.
+            // The last turn of a file is the same wait, said as concluding.
             match state.concluding {
-                true => "waiting for conclusion".to_string(),
-                false => "waiting for model".to_string(),
+                true => "concluding".to_string(),
+                false => "thinking".to_string(),
             },
             Some(since),
         ),
@@ -459,12 +459,12 @@ fn activity_line(state: &State, tick: usize, color: bool, now: Instant) -> Line<
 /// "where are we" twice and "what is happening" not at all.
 fn doing(stage: Stage) -> &'static str {
     match stage {
-        Stage::Input => "reading changes",
-        Stage::Triage => "planning the review",
+        Stage::Input => "reading",
+        Stage::Plan => "planning",
         Stage::Review => "reviewing",
-        Stage::Merge => "merging findings",
-        Stage::Report => "writing the report",
-        Stage::Publish => "posting comments",
+        Stage::Merge => "merging",
+        Stage::Report => "reporting",
+        Stage::Publish => "publishing",
     }
 }
 
@@ -601,7 +601,7 @@ mod tests {
             rows[FIRST_STAGE]
         );
         assert!(
-            rows[FIRST_STAGE + 1].starts_with("✓ 2 triage    7 chunks, 2 files skipped"),
+            rows[FIRST_STAGE + 1].starts_with("✓ 2 plan      7 chunks, 2 files skipped"),
             "{:?}",
             rows[FIRST_STAGE + 1]
         );
@@ -701,22 +701,22 @@ mod tests {
         );
         assert_eq!(
             rows[rows.len() - 1],
-            "⠋ waiting for search_repo... (0.0s)",
-            "and the line below says only what is being waited on, and for how long"
+            "⠋ executing search_repo... (0.0s)",
+            "and the line below says only what is happening, and for how long"
         );
     }
 
-    /// Between tool calls the wait belongs to the model, and the row that says
-    /// so carries nothing but that and its clock.
+    /// Between tool calls the model is thinking, and the row that says so
+    /// carries nothing but that and its clock.
     #[test]
-    fn waiting_on_the_model_says_so_and_nothing_else() {
+    fn thinking_says_so_and_nothing_else() {
         let now = Instant::now();
         let mut state = crate::cli::status::tests::mid_review(now);
         state.apply(reviewbot::progress::Event::Round { round: 3, of: 12 }, now);
         let rows = rows(&state, 2, now);
 
         assert_eq!(rows[rows.len() - 2], "reviewing  src/foo.c  ·  round 3/12");
-        assert_eq!(rows[rows.len() - 1], "⠹ waiting for model... (0.0s)");
+        assert_eq!(rows[rows.len() - 1], "⠹ thinking... (0.0s)");
     }
 
     /// The last round is worth marking: reaching the ceiling ends the file
@@ -792,9 +792,9 @@ mod tests {
             now,
         );
         for (stage, said) in [
-            (reviewbot::domain::Stage::Merge, "⠋ merging findings..."),
-            (reviewbot::domain::Stage::Report, "⠋ writing the report..."),
-            (reviewbot::domain::Stage::Publish, "⠋ posting comments..."),
+            (reviewbot::domain::Stage::Merge, "⠋ merging..."),
+            (reviewbot::domain::Stage::Report, "⠋ reporting..."),
+            (reviewbot::domain::Stage::Publish, "⠋ publishing..."),
         ] {
             state.apply(reviewbot::progress::Event::StageStarted { stage }, now);
             assert_eq!(last(&rows(&state, 0, now)), said);
@@ -809,10 +809,9 @@ mod tests {
         }
     }
 
-    /// The conclusion is one more thing the run is waiting for, said the way the
-    /// other two waits are said.
+    /// The last turn of a file is the same kind of wait, said as concluding.
     #[test]
-    fn the_last_turn_is_a_wait_like_the_others() {
+    fn the_last_turn_says_concluding() {
         let now = Instant::now();
         let mut state = crate::cli::status::tests::mid_review(now);
         state.apply(
@@ -822,16 +821,13 @@ mod tests {
             now,
         );
 
-        assert_eq!(
-            last(&rows(&state, 0, now)),
-            "⠋ waiting for conclusion... (0.0s)"
-        );
+        assert_eq!(last(&rows(&state, 0, now)), "⠋ concluding... (0.0s)");
     }
 
-    /// The concluding wait is that file's. The next file's first model call
-    /// is an ordinary round again.
+    /// Concluding belongs to that file. The next file's first model call
+    /// is thinking again.
     #[test]
-    fn a_later_file_waits_for_the_model_again() {
+    fn a_later_file_is_thinking_again() {
         let now = Instant::now();
         let mut state = crate::cli::status::tests::mid_review(now);
         state.apply(
@@ -852,7 +848,7 @@ mod tests {
         );
         state.apply(reviewbot::progress::Event::Round { round: 1, of: 6 }, now);
 
-        assert_eq!(last(&rows(&state, 0, now)), "⠋ waiting for model... (0.0s)");
+        assert_eq!(last(&rows(&state, 0, now)), "⠋ thinking... (0.0s)");
     }
 
     /// A run that is over says nothing here: the summary that replaces this
