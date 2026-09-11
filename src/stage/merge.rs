@@ -55,6 +55,19 @@ pub struct MergeOutput {
     /// spent on the other chunks is not thrown away with them.
     #[serde(default)]
     pub unproduced: Vec<Unproduced>,
+    /// Each reviewed file, and whether any comment on it survived the checks.
+    /// reviewbot sets this from the model's conclusions; an error, an empty
+    /// document, or a document whose entries were all dropped is false.
+    pub files: Vec<ReviewedFile>,
+}
+
+/// One reviewed file as merge judged it. `has_valid_comments` is reviewbot's
+/// reading of the model's conclusions after the checks, never a field the
+/// model wrote.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ReviewedFile {
+    pub path: String,
+    pub has_valid_comments: bool,
 }
 
 /// A chunk that produced nothing, and why. Named in the report next to the
@@ -66,6 +79,14 @@ pub struct Unproduced {
 }
 
 impl MergeOutput {
+    /// Whether `publish` may post comments on this path. False when the file
+    /// was reviewed but nothing valid remained.
+    pub fn has_valid_comments(&self, path: &str) -> bool {
+        self.files
+            .iter()
+            .any(|file| file.path == path && file.has_valid_comments)
+    }
+
     /// The badge for the comment at `index`, if it earned one.
     pub fn badge(&self, index: usize) -> Option<&str> {
         self.badges.get(index).and_then(|badge| badge.as_deref())
@@ -330,6 +351,7 @@ impl<'c, 'a> Merge<'c, 'a> {
             Some(reason) => Err(reason),
             None => Self::score(self.context, &comments)?,
         };
+        let files = reviewed_files(review, &comments);
         let output = MergeOutput {
             comments,
             badges,
@@ -339,6 +361,7 @@ impl<'c, 'a> Merge<'c, 'a> {
             summary: scoring.as_ref().ok().map(|scored| scored.summary.clone()),
             unscored_reason: scoring.as_ref().err().map(Unscored::to_string),
             unproduced,
+            files,
         };
         tracing::info!(
             comments = output.comments.len(),
@@ -1134,6 +1157,28 @@ fn weight(finding: &Finding) -> (u8, u8) {
     )
 }
 
+/// One row per reviewed path, in the order the chunks were reviewed. A file
+/// cut into pieces is one row: any surviving comment on any piece makes it
+/// true. The model does not supply this list.
+fn reviewed_files(review: &ReviewOutput, comments: &[Comment]) -> Vec<ReviewedFile> {
+    let valid: BTreeSet<&str> = comments
+        .iter()
+        .map(|comment| comment.target.path.as_str())
+        .collect();
+    let mut seen = BTreeSet::new();
+    let mut files = Vec::new();
+    for chunk in &review.chunks {
+        if !seen.insert(chunk.path.as_str()) {
+            continue;
+        }
+        files.push(ReviewedFile {
+            path: chunk.path.clone(),
+            has_valid_comments: valid.contains(chunk.path.as_str()),
+        });
+    }
+    files
+}
+
 /// What the scoring call is given: the final list and nothing else. Not the
 /// diff, which was already paid for once, and not the dropped entries, which
 /// are not being published.
@@ -1355,6 +1400,11 @@ mod tests {
 
         assert_eq!(output.comments.len(), 1, "{:?}", output.comments);
         assert_eq!(output.comments[0].body, "on an added line");
+        assert!(
+            output.has_valid_comments("src/parse.c"),
+            "a kept comment is what makes the file publishable: {:?}",
+            output.files
+        );
         let checks = checks_of(&fixture, "review-src_parse.c");
         assert!(
             checks
@@ -1368,6 +1418,32 @@ mod tests {
                 .any(|check| check.contains("comment 2 dropped")
                     && check.contains("no evidence.lines")),
             "{checks:?}"
+        );
+    }
+
+    #[test]
+    fn a_file_whose_comments_were_all_dropped_is_not_publishable() {
+        let changeset = changeset(vec![file("src/parse.c", &[10, 11, 12, 13], &[11, 12])]);
+        let raw = document(&[
+            entry("src/parse.c", 10, "80", "[10,13]", "only context lines"),
+            entry("src/parse.c", 11, "80", "[]", "no lines at all"),
+        ]);
+        let mut fixture = scoring(vec![r#"{"overall_score":90,"summary":"nothing stood"}"#]);
+        write_trace(&fixture, "review-src_parse.c");
+
+        let output = merge(
+            &mut fixture,
+            &changeset,
+            &review(vec![chunk("src/parse.c", &raw)]),
+        );
+
+        assert!(output.comments.is_empty(), "{:?}", output.comments);
+        assert_eq!(
+            output.files,
+            vec![ReviewedFile {
+                path: "src/parse.c".to_string(),
+                has_valid_comments: false,
+            }]
         );
     }
 
@@ -1647,6 +1723,13 @@ mod tests {
 
         assert!(output.comments.is_empty());
         assert!(output.unproduced.is_empty());
+        assert_eq!(
+            output.files,
+            vec![ReviewedFile {
+                path: "src/parse.c".to_string(),
+                has_valid_comments: false,
+            }]
+        );
         assert_eq!(output.overall_score, Some(90));
         assert!(output.unscored_reason.is_none());
         assert_eq!(fixture.sent().len(), 1, "an empty list still gets a score");
@@ -1676,6 +1759,19 @@ mod tests {
 
         assert_eq!(output.comments.len(), 1);
         assert_eq!(output.comments[0].body, "the sibling");
+        assert_eq!(
+            output.files,
+            vec![
+                ReviewedFile {
+                    path: "src/parse.c".to_string(),
+                    has_valid_comments: false,
+                },
+                ReviewedFile {
+                    path: "src/other.c".to_string(),
+                    has_valid_comments: true,
+                },
+            ]
+        );
         assert_eq!(fixture.sent().len(), 1, "only the scoring call");
         assert_eq!(output.unproduced.len(), 1);
         assert_eq!(output.unproduced[0].path, "src/parse.c");

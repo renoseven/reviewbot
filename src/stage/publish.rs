@@ -8,7 +8,9 @@
 //! way left to finish posting, so it may not talk itself out of looking.
 //!
 //! The numbers in the summary comment are stage five's `Summary`, taken as
-//! input rather than counted again.
+//! input rather than counted again. Inline comments go out only for files
+//! merge marked as having valid comments; that mark is reviewbot's, not the
+//! model's.
 
 use serde::{Deserialize, Serialize};
 
@@ -98,6 +100,9 @@ impl<'c, 'a> Publish<'c, 'a> {
         let mut outgoing = Vec::new();
         let mut skipped = 0usize;
         for (index, comment) in input.merged.comments.iter().enumerate() {
+            if !input.merged.has_valid_comments(&comment.target.path) {
+                continue;
+            }
             let marker = marker(&run_id, &comment.trace_id);
             if !known.insert(marker.clone()) {
                 skipped += 1;
@@ -381,9 +386,19 @@ mod tests {
     use crate::record::{ContextFile, Trace};
     use crate::stage::StageError;
     use crate::stage::fixture::StageFixture;
-    use crate::stage::merge::MergeOutput;
+    use crate::stage::merge::{MergeOutput, ReviewedFile};
 
     const SECRET_BODY: &str = "static int callee(void) { return 1; }";
+
+    fn valid_files(paths: &[&str]) -> Vec<ReviewedFile> {
+        paths
+            .iter()
+            .map(|path| ReviewedFile {
+                path: path.to_string(),
+                has_valid_comments: true,
+            })
+            .collect()
+    }
 
     fn comment(trace_id: &str) -> Comment {
         Comment {
@@ -487,6 +502,7 @@ mod tests {
             comments: vec![comment("review-src_parse.c")],
             overall_score: Some(54),
             summary: Some("one finding".to_string()),
+            files: valid_files(&["src/parse.c"]),
             ..MergeOutput::default()
         };
         let summary = summary();
@@ -545,6 +561,50 @@ mod tests {
     }
 
     #[test]
+    fn comments_on_a_file_without_valid_comments_are_not_posted() {
+        let posts = Arc::new(Mutex::new(Vec::new()));
+        let mut fixture =
+            StageFixture::new(Vec::new()).with_platform(Box::new(RecordingPlatform {
+                existing: Vec::new(),
+                posts: Arc::clone(&posts),
+                fail_after: usize::MAX,
+                kind: PlatformKind::Gitlab,
+            }));
+        fixture.enable_publish();
+        fixture
+            .recorder()
+            .write_trace(&internal_trace("review-src_parse.c"))
+            .expect("trace");
+
+        let changeset = url_changeset();
+        let merged = MergeOutput {
+            comments: vec![comment("review-src_parse.c")],
+            overall_score: Some(54),
+            summary: Some("one finding".to_string()),
+            files: vec![ReviewedFile {
+                path: "src/parse.c".to_string(),
+                has_valid_comments: false,
+            }],
+            ..MergeOutput::default()
+        };
+        let summary = summary();
+        let input = PublishInput {
+            changeset: &changeset,
+            merged: &merged,
+            summary: &summary,
+        };
+        let mut context = fixture.context();
+        Publish::new(&mut context).run(&input).expect("posted");
+
+        let posted = posts.lock().expect("posts");
+        assert!(
+            posted.iter().all(|body| body.contains(":summary -->")),
+            "only the summary goes out when the file has no valid comment: {posted:?}"
+        );
+        assert_eq!(posted.len(), 1, "{posted:?}");
+    }
+
+    #[test]
     fn publish_fails_when_the_locator_is_missing() {
         let mut fixture =
             StageFixture::new(Vec::new()).with_platform(Box::new(RecordingPlatform {
@@ -598,6 +658,7 @@ mod tests {
             comments: vec![comment("review-src_parse.c")],
             overall_score: Some(54),
             summary: Some("one finding".to_string()),
+            files: valid_files(&["src/parse.c"]),
             ..MergeOutput::default()
         };
         let summary = summary();
@@ -626,6 +687,7 @@ mod tests {
         let merged = MergeOutput {
             comments: vec![comment("review-src_parse.c")],
             overall_score: Some(54),
+            files: valid_files(&["src/parse.c"]),
             ..MergeOutput::default()
         };
         let summary = summary();
@@ -695,6 +757,7 @@ mod tests {
             ],
             overall_score: Some(54),
             summary: Some("two findings".to_string()),
+            files: valid_files(&["src/parse.c", "src/other.c"]),
             ..MergeOutput::default()
         };
         let summary = summary();
