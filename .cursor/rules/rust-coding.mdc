@@ -1,84 +1,87 @@
 ---
-description: reviewbot 的 Rust 分层、类型归属、文件切分与硬约束写法
+description: reviewbot 的 Rust 编码形状：文件切分、封装、对象化与硬约束
 globs: **/*.rs
 alwaysApply: false
 ---
 
 # Rust 编码规范
 
-## 分层
-
-依赖单向向下，反向禁止：
-
-`stage::*` → 适配器（`platform` / `worktree` / `protocol` / `tool`）→ 设施（`config` / `security` / `budget` / `record`）→ `domain`
-
-- 五个阶段互不依赖，谁也不知道前后是谁。**顺序只出现在 `lib.rs` 的 `review()` / `resume()`**
-- 禁止 `pipeline` / `runner` / `orchestrator` 模块
-- `lib.rs`：那两个入口 + 模块声明 + 再导出。禁止往里塞编排以外的逻辑
-- `main.rs`：只做参数解析、加载配置、渲染输出，不写业务逻辑
-- 扩展点只有三个 trait：`platform`、`protocol`、`tool`。配置不是扩展点。`worktree` 不是扩展点
-
 ## 文件与模块
 
 - 一个文件一件事：**不是一个类型一个文件**。同一实现的类型放一起；同一份词汇的纯数据也放一起。不相干的才另起文件
-- 只作别人字段或变体载荷、自己没有独立行为面的，跟主类型同文件
+- 纯数据（只有字段、行为跟着别人走）不和实现混写。只作别人字段或变体载荷、自己没有独立行为面的，跟主类型同文件
+- 目录下禁止只有 `mod.rs`。`mod.rs` 只写模块文档、`mod` 声明与 `pub use` 再导出，不放类型与实现
+- 只有一个文件的模块就写成 `xxx.rs`，不要为它建目录
 
-## 类型跟主人走
+## 封装
 
-- `domain` 是共享词汇，不含逻辑。现在是 `ChangeSet` / `Comment` / `Confidence`；新类型先证明没有主人再放进去，不要为了「看起来像数据」往里堆
-- `Request` / `Response` → `protocol`；`Trace` → `record`；`RunResult` → `lib.rs`
-- 一次 run 只有一个 `Worktree`，是 enum 不是 trait（worktree 不是扩展点）：`Empty` 是纯 diff 且没有平台，连目录都没有，因为没有人会去读；`Local` 是命令行给的检出，评审 commit 上的整棵树，只读，有平台时仍带着 `Repo`；`Cache` 是这次 run 自己的目录，在 `<run_dir>/cache`，一定有后备库。同层仍然只许 `worktree` 认 `platform` 这一条依赖
-- `tool` 认这一个 `Worktree`，但按动作拆成本地与仓库两半，每个动作只出现一次。两半不是同一问的两个名字：列仓库与列本地问的不是同一件事。仓库那半没有「读」（先 `fetch_repo_file` 再 `read_local_file`），本地那半没有「拉」
-- 写盘要 root 与 repo 这一对，只有 `Cache` 同时握着；模块里唯一的 `fs::write` 落在 match 到 `Cache { root, repo }` 的那一臂。`Local` 与 `Empty` 凑不出这一对，所以往命令行给的检出里写在实现里没有地方发生
-- 核心禁止 `match tool_name`；走 registry 取 trait 对象。厂商 JSON 停在 `protocol`，不外泄
+- 除纯数据类型外，字段私有，外部走函数读；不给 setter，除非生命周期需要
+- `impl` 按用途分块，顺序：生命周期（构造 / 打开 / 结束）→ 数据访问（读字段）→ 功能（行为）→ 私有辅助
+- 跨模块不直接读写别人的字段
 
 ## 实体对象化
 
 数据与属于它的行为放在一起；模块之间只靠公开方法与 trait 说话，做到高内聚、低耦合。
 
-- 能找到主人的操作写成该类型的 `impl`，不要拆成 `utils` 里掏字段的自由函数
-- 变化点用 trait，调用方依赖接口、不依赖具体类型
-- 一个类型只为一件事存在：字段互相配合、方法共用同一组不变式。无关能力另起类型，禁止往现有 struct 上堆
-- 函数参数不超过 5 个（不含 `self`）。超出才收成 context：只装这一次调用用到的依赖，字段私有、默认只读。禁止把全局状态塞进一个 context
-- 跨模块不直接读写别人的字段
-- `domain` 的共享词汇是例外：它们不含逻辑，不实例化来干活；行为仍跟主人走
+- **独立实体必须实例化**：先构造出对象，再对实例调方法。禁止写成关联函数或模块级自由函数，让调用方带着字段到处传
+- 构造写在 `impl` 上：必有依赖一次注入，禁止空 `new` 再 `set`、禁止事后补绑、禁止从全局取。不变式在构造里立住，立不住就返回错误。几种合法形态用命名构造分开，不要丢布尔让调用方拼
+- 一个类型只为一件事：字段互相配合、方法共用同一组不变式。无关能力另起类型
+- 函数参数不超过 5 个（不含 `self`）。超出才收成 context：只装这一次用到的依赖，字段私有、默认只读，禁止塞全局状态
+- 共享词汇不是独立实体：不含逻辑，不实例化来干活；行为仍跟主人走
 
 ```rust
-// ❌ 对齐写在 ChangeSet 上（domain 不含逻辑）；或自由函数掏字段
+// ❌ 共享词汇自己做对齐
 impl ChangeSet {
     pub fn align(&self, line: u32) -> Option<u32> { ... }
 }
 
-// ✅ 行号集合是 ChangeSet 上的数据；对齐是 merge 的 impl
+// ✅ 行号是 ChangeSet 上的数据，对齐是 Merge 的方法
 impl Merge {
     pub fn align(&self, lines: &BTreeSet<u32>, line: u32) -> Option<u32> { ... }
 }
+
+// ❌ Tree 只是命名空间，根目录每次当参数传来传去
+impl Tree {
+    pub fn read(root: &Path, path: &str) -> Result<String, Error> { ... }
+}
+Tree::read(&root, path)?;
+
+// ✅ 先打开一棵树（根目录是它的状态），再问这棵树
+impl Tree {
+    pub fn open(root: PathBuf) -> Result<Self, Error> { ... }
+    pub fn read(&self, path: &str) -> Result<String, Error> { ... }
+}
+let tree = Tree::open(root)?;
+tree.read(path)?;
 ```
 
 ## 命名
 
 - 用常见英文词。禁止生僻词、口语化名字、自造缩写、为已有名字再造同义词
-- 模块名跟分层走：`stage` / `platform` / `worktree` / `protocol` / `tool` / `config` / `security` / `budget` / `record`，不要另起别名
 - 配置字段名说清量纲与主语：带单位的写进名字（`_bytes` / `_ms` / `_tokens`），布尔用肯定式，别用同一个词指两件事
 
 ```rust
-// ❌ orchestrator, provenance（生僻）；stuff, dump, grab, do_it, helper（口语）
-// ✅ review, merge, record, trace
+// ❌ provenance（生僻）；stuff, dump, grab, do_it, helper（口语）
+// ✅ align, retry, budget, limit
 ```
+
+## 依赖
+
+- 已有成熟库的事不要自己写。哈希用 `sha2`，时间用 `chrono`，同类照办
 
 ## 错误
 
 - 库内用 `thiserror` 定义可匹配的错误类型，调用方靠类型分支（退出码、是否重试）
-- **最外层**（`main.rs`）可以用 `anyhow` 收口、补上下文；`anyhow::Error` 不进 `lib`、不进阶段与适配器
+- **最外层**（`main.rs`）可以用 `anyhow` 收口、补上下文；`anyhow::Error` 不进 `lib`
+- **禁止 `unwrap` / `expect`**。失败用 `?` 或匹配 `Result` 往外传，不要藏进默认值、`ok()` 丢掉、或 `let _ =` 当没发生
+- 错误必须可见：能恢复的显式处理，不能恢复的原样上交。禁止把失败收成成功
 
 ## 硬约束的代码形状
 
-- **不改模型给的数**：`confidence_score` / `overall_score` 原样存、原样发；拿不到就 `None`，禁止填 `0`
-- **不静默降级**：禁止换便宜模型、超支后继续、401 改成只出报告、从 `base_url` 形状猜 `kind`
-- **全程串行**：阶段与分片都不并发（并发会让调用前预算检查失效）
-- prompt 用 `include_str!` 随二进制走，配置不得有改 prompt 的字段
-- 密钥只在内存；不写 checkpoint / trace / 指纹 / 日志；子进程环境剔除 `*_API_KEY` / `*_TOKEN`
-- 本地只写 run 目录（含它底下的 `cache/` 与 `checks/`）和 `--out-dir`；命令行给的检出只读。检查器的 cwd 是 `<run_dir>/checks`，不是 worktree 根。外部命令 argv 是数组，直接 `execve`，一个占位符一个元素，不经 shell
-- **安全靠实现保证，不靠类型强制**：`security` 只提供检查函数；每个内建 tool 在调用来源之前先过路径校验，拒绝理由回传模型
-- 瞬时故障才重试（超时 / 5xx / 429 / 空 body）；401/403/400/越界/预算不足首次即失败
-- checkpoint 原子写 JSON（tmp + rename）；损坏回退上一份完整快照，禁止 catch 之后整次重跑
+- **不改外来的数**：原样存、原样发；拿不到就 `None`，禁止填默认值凑
+- **不静默降级**：失败就失败，禁止换实现、超限后继续、把错误收成「还能跑」
+- **全程串行**：调用前要做额度或上限检查的，不要并发
+- 密钥只在内存，不写落盘产物或日志；子进程环境剔除凭据
+- 外部命令 argv 是数组，直接 `execve`，一个占位符一个元素，不经 shell
+- 瞬时故障才重试（超时 / 5xx / 429）；鉴权、客户端错误、额度不足首次即失败
+- 持久化原子写（tmp + rename）；损坏回退上一份完整快照，禁止 catch 之后整次重跑
