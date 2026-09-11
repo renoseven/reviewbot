@@ -22,9 +22,10 @@ pub const CACHE: &str = "cache";
 /// they must not write into the checkout or the cache.
 pub const CHECKS: &str = "checks";
 
-/// `stages/<n>-<stage>.json`, the name later milestones keep overwriting.
+/// `stages/<stage>.json`. The order lives on `Stage`; the file name is just
+/// the stage, so a later renumbering does not leave a file nobody reads.
 pub fn stage_file(stage: Stage) -> String {
-    format!("stages/{}-{stage}.json", stage.number())
+    format!("stages/{stage}.json")
 }
 
 pub fn trace_file(trace_id: &str) -> String {
@@ -39,4 +40,15 @@ pub fn exported_report(run_id: &str) -> String {
 
 pub fn exported_summary(run_id: &str) -> String {
     format!("summary-{run_id}.json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stage_file_is_named_for_the_stage() {
+        assert_eq!(stage_file(Stage::Input), "stages/input.json");
+        assert_eq!(stage_file(Stage::Publish), "stages/publish.json");
+    }
 }

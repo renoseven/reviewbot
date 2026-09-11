@@ -7,11 +7,12 @@ use serde::{Deserialize, Serialize};
 /// One of the six steps every run walks, in the order they are walked.
 ///
 /// One identity rather than a number travelling beside a name: the number
-/// orders the checkpoint files, the name is what a person reads, and while
-/// they were two arguments every call site could pair them wrongly and no
-/// reader would notice. The order is the declaration order, so a stage can be
-/// compared with another — which is what makes "finished up to here" sayable.
-/// Which step does what, and when, is still not decided here.
+/// is what a progress row prints, the name is the checkpoint file and what a
+/// person reads, and while they were two arguments every call site could pair
+/// them wrongly and no reader would notice. The order is the declaration
+/// order, so a stage can be compared with another — which is what makes
+/// "finished up to here" sayable. Which step does what, and when, is still
+/// not decided here.
 ///
 /// The serialized form is the name, so `meta.json` and the traces of runs
 /// recorded before this type existed still read back.
@@ -39,8 +40,8 @@ impl Stage {
         Self::Publish,
     ];
 
-    /// Its place in the run, counted from 1 for whoever reads a file name or a
-    /// progress row rather than from 0 for an array.
+    /// Its place in the run, counted from 1 for a progress row rather than
+    /// from 0 for an array. Checkpoint files use the name, not this.
     pub fn number(self) -> u8 {
         self as u8
     }
@@ -97,14 +98,14 @@ mod tests {
         );
     }
 
-    /// The numbers are the checkpoint file names, and the comparison is the
-    /// order a run walks them in. Both come from the declaration.
+    /// The comparison is the order a run walks them in. The numbers are what
+    /// a progress row prints; checkpoint files use the name.
     #[test]
     fn the_order_is_the_declaration_order() {
         assert_eq!(
             Stage::ALL.map(Stage::number),
             [1, 2, 3, 4, 5, 6],
-            "the numbers name the checkpoint files"
+            "the numbers are for progress rows"
         );
         assert!(Stage::Input < Stage::Publish);
         assert!(Stage::ALL.is_sorted());
